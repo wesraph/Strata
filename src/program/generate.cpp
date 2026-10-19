@@ -5308,6 +5308,12 @@ int main(int argc, char** argv) {
     // last-stage completion.  With it the groups resolve as if --batch-mtp were off.
     const char* pipe_mtp_env = std::getenv("STRATA_PIPE_MTP");
     const bool pipe_mtp = pipe_mtp_env != nullptr && pipe_mtp_env[0] != '\0' && pipe_mtp_env[0] != '0';
+    // STRATA_PIPE_MTP_DRAFTS=N: each pipelined slot's window carries N MTP proposals (chained drafts through the
+    // same drafter layer; N <= --spec - 1, and the group's rows GS * (N + 1) must fit the 8-row window)
+    const char* pipe_drafts_env = std::getenv("STRATA_PIPE_MTP_DRAFTS");
+    int pipe_drafts_n = pipe_drafts_env != nullptr ? std::atoi(pipe_drafts_env) : 1;
+    if (pipe_drafts_n < 1) pipe_drafts_n = 1;
+    if (pipe_drafts_n > o.spec - 1) pipe_drafts_n = (int) std::max<int64_t>(1, o.spec - 1);
     auto batch_groups_for = [&](bool mtp_on) {
         strata::program::batch_groups::Input bin;
         bin.set = o.batch_groups_set;
@@ -5559,7 +5565,7 @@ int main(int argc, char** argv) {
                                  vram_free_note().c_str());
                     return 1;
                 }
-                d->set_max_drafts(1);   // the first candidate verifies one proposal per slot
+                d->set_max_drafts((size_t) std::max(1, pipe_drafts_n));   // the window verifies this many proposals per slot
                 d->set_ple_session(bslot_ss[0][(size_t) b].get());
                 slot_mtp.push_back(std::move(d));
             }
@@ -9071,7 +9077,7 @@ int main(int argc, char** argv) {
             const int pipe_draft_rows = batch_mtp && pipe_mtp && o.batch_groups > 1 ? o.batch / o.batch_groups : 0;
             const int pipe_dbg4 = pipe_draft_rows > 0 && std::getenv("STRATA_PIPE_MTP_HOFF4") ? 4 : 0;
             const int hrows = !batch_mtp && o.batch_groups > 1 ? std::max<int>(strata::kernels::kVerifyMaxT, o.batch)
-                           : pipe_draft_rows > 0 ? 2 * o.batch + pipe_dbg4   // a drafted group's two rows per slot: disjoint per group
+                           : pipe_draft_rows > 0 ? (1 + pipe_drafts_n) * o.batch + pipe_dbg4   // a drafted group's rows per slot: disjoint per group
                            : strata::kernels::kVerifyMaxT;
             const size_t hb = (size_t) hrows * (size_t) strata::core::Verifier::handoff_floats(g) * sizeof(float);
             std::vector<float*> hand((size_t) n_stages - 1, nullptr);
@@ -11840,10 +11846,11 @@ int main(int argc, char** argv) {
                          (int) strata::kernels::kVerifyMaxT);
             return 1;
         }
-        if (piped && pipe_mtp && batch_mtp && GS * 2 > strata::kernels::kVerifyMaxT) {
-            // a drafted group window carries two rows per slot (its token and its proposal)
-            std::fprintf(stderr, "strata generate: STRATA_PIPE_MTP needs at most %d slots per group (has %d): use more "
-                                 "groups or fewer slots\n", (int) strata::kernels::kVerifyMaxT / 2, GS);
+        if (piped && pipe_mtp && batch_mtp && GS * (1 + pipe_drafts_n) > strata::kernels::kVerifyMaxT) {
+            // a drafted group window carries (1 + N) rows per slot
+            std::fprintf(stderr, "strata generate: STRATA_PIPE_MTP_DRAFTS=%d needs at most %d slots per group (has %d): "
+                                 "use more groups, fewer slots, or fewer drafts\n", pipe_drafts_n,
+                         (int) strata::kernels::kVerifyMaxT / (1 + pipe_drafts_n), GS);
             return 1;
         }
         if (piped && pipe_mtp && batch_mtp && o.batch_groups > 2) {
@@ -11997,12 +12004,24 @@ int main(int argc, char** argv) {
                     BSlot& sl = bs[(size_t) (gi * GS + t)];
                     if (!sl.active) continue;
                     const int i = G.first[t];
-                    const int32_t y0 = outb[i];
-                    const bool eos0 = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y0) != o.eos_ids.end();
-                    // STRATA_PIPE_MTP_KEEP1 (debug): never accept a proposal, one token per window
-                    static const bool pm_keep1 = [] { const char* v = std::getenv("STRATA_PIPE_MTP_KEEP1"); return v != nullptr && v[0] != '0' && v[0] != '\0'; }();
-                    keepb[t] = !pm_keep1 && G.drafted && y0 == G.tok[i + 1] && !eos0 && !sl.stop &&
-                               sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
+                    // the chained proposals are accepted while the target picks them: row i+j-1's pick must be
+                    // the draft at row i+j, as the serial path accepts its one proposal
+                    int kb = 1;
+                    if (G.drafted) {
+                        const int cnt = (t + 1 < G.S ? G.first[t + 1] : G.R) - i;   // this slot's rows in the window
+                        const int nprop = cnt - 1;
+                        for (int j = 1; j <= nprop; ++j) {
+                            const int32_t yj = outb[i + j - 1];
+                            if (yj != G.tok[i + j]) break;
+                            if (std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) yj) != o.eos_ids.end()) {
+                                kb = j + 1;   // accept it, then the slot ends
+                                break;
+                            }
+                            if (sl.stop || sl.produced + j + 1 > sl.max_new || sl.p + j + 2 > o.max_context) break;
+                            kb = j + 1;
+                        }
+                    }
+                    keepb[t] = kb;
                     bool nf = false;   // #879: a row of this slot held non-finite logits: the slot ends, nothing emitted
                     for (int r = i; r < i + (G.drafted ? 2 : 1); ++r) nf = nf || vk.nonfinite_in(r);
                     if (nf) {
@@ -12056,14 +12075,15 @@ int main(int argc, char** argv) {
                         BSlot& sl = bs[(size_t) (gi * GS + t)];
                         if (!sl.active) continue;
                         const int i = G.first[t];
+                        const int cnt = (t + 1 < G.S ? G.first[t + 1] : G.R) - i;   // this slot's rows
                         const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) (gi * GS + t)]->device());
                         const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
                         if (cudaMemcpyAsync(slot_mtp_rows[(size_t) (gi * GS + t)].get(),
                                             vk.final_R_all() + (size_t) i * stride,
-                                            2 * stride * sizeof(float), cudaMemcpyDeviceToDevice,
+                                            (size_t) cnt * stride * sizeof(float), cudaMemcpyDeviceToDevice,
                                             slot_mtp[(size_t) (gi * GS + t)]->stream()) != cudaSuccess ||
-                            !slot_mtp[(size_t) (gi * GS + t)]->draft(2, outb + i, G.pos[i], keepb[t] - 1,
-                                                                      sl.draft.data(), err)) {
+                            !slot_mtp[(size_t) (gi * GS + t)]->draft(cnt, outb + i, G.pos[i], keepb[t] - 1,
+                                                                       sl.draft.data(), err)) {
                             std::printf("ERR batch MTP slot %d: %s\n", gi * GS + t, err.c_str());
                             return false;
                         }
@@ -12111,7 +12131,7 @@ int main(int argc, char** argv) {
                     }
                     G.R = 0;
                     G.drafted = pipe_drafts;
-                    G.base = pipe_drafts ? pick * GS * 2 : pick * GS;
+                    G.base = pipe_drafts ? pick * GS * (1 + pipe_drafts_n) : pick * GS;
                     if (pipe_drafts && std::getenv("STRATA_PIPE_MTP_HOFF4")) G.base += 4;   // debug: no group at base 0
                     for (int t = 0; t < G.S; ++t) {
                         BSlot& sl = bs[(size_t) (pick * GS + t)];
@@ -12123,10 +12143,14 @@ int main(int argc, char** argv) {
                             ++G.R;
                             if (G.drafted) {
                                 if (!sl.draft_ready) { err = "batch MTP: a live slot has no draft"; return false; }
-                                G.rows[G.R] = pick * GS + t;
-                                G.tok[G.R] = sl.draft[0];
-                                G.pos[G.R] = sl.p + 1;
-                                ++G.R;
+                                const int nprop = std::min<int>(pipe_drafts_n,
+                                                               (int) std::max<int64_t>(0, o.max_context - 1 - sl.p));
+                                for (int j = 0; j < nprop; ++j) {
+                                    G.rows[G.R] = pick * GS + t;
+                                    G.tok[G.R] = sl.draft[(size_t) j];
+                                    G.pos[G.R] = sl.p + 1 + j;
+                                    ++G.R;
+                                }
                             }
                         } else {
                             G.tok[G.R] = 0;   // the pad row writes its state
