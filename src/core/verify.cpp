@@ -3528,6 +3528,18 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
     if (batch_self_commits(rows, S)) return true;   // the window keeps its rows: no commit graph
     cudaGraphExec_t& cex = commit_bm_[bkey(rows, S, hbase)];
     if (cex != nullptr) return true;
+    // STRATA_PIPE_MTP: a drafted group's commit reads its parity's scratch (its window's intermediates
+    // snapshotted at its completion on this stage), not the live per-window buffers another group's window
+    // has since overwritten.  cs_par_ is set before each launch; -1 (serial, one-row windows) keeps the live buffers.
+    CommitScratch sc = cs_par_ >= 0 ? cs_scr_[(size_t) cs_par_] : CommitScratch{};
+    float* const qkv_L = sc.qkv != nullptr ? sc.qkv : qkv_L_;
+    float* const h_L = sc.h != nullptr ? sc.h : h_L_;
+    float* const gate_L = sc.gate != nullptr ? sc.gate : gate_L_;
+    float* const beta_L = sc.beta != nullptr ? sc.beta : beta_L_;
+    float* const z_v = sc.z != nullptr ? sc.z : z_;
+    float* const idx_raw_L = sc.idx_raw != nullptr ? sc.idx_raw : idx_raw_L_;
+    float* const hist_snap = sc.hist != nullptr ? sc.hist : hist_snap_;
+    float* const tail_snap_b = sc.tail != nullptr ? sc.tail : tail_snap_b_;
     using namespace strata::kernels;
     const ModelGeometry& g = *g_;
     const QsaShapes s = shapes_of(g);
@@ -3569,7 +3581,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     const int32_t* keep = commitb_ + (size_t) rows[first] * CB;
                     float* state = sx.gdn_state + (size_t) (gdn_index - sx.gdn_ord0) * gdn_floats;
                     float* conv = state + (uint64_t) g.ssm_state_size * g.ssm_v_heads * g.ssm_state_size;
-                    gdn_conv_commit(conv, qkv_L_ + (size_t) gdn_index * MT * C + (size_t) first * C,
+                    gdn_conv_commit(conv, qkv_L + (size_t) gdn_index * MT * C + (size_t) first * C,
                                     (int) C, keep, cs_);
                     if (gdn_groups_on && one_row) {
                         gg.state[gg.n] = state;
@@ -3579,18 +3591,18 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                         ++gg.n;
                         continue;
                     }
-                    gdn_step_norm_multi(state, h_L_ + (size_t) gdn_index * MT * C + (size_t) first * C, (int) C,
-                                        gate_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
-                                        beta_L_ + (size_t) gdn_index * MT * HV + (size_t) first * HV,
-                                        z_ + (size_t) first * ZV, (const float*) wnm->data, EPS,
+                    gdn_step_norm_multi(state, h_L + (size_t) gdn_index * MT * C + (size_t) first * C, (int) C,
+                                        gate_L + (size_t) gdn_index * MT * HV + (size_t) first * HV,
+                                        beta_L + (size_t) gdn_index * MT * HV + (size_t) first * HV,
+                                        z_v + (size_t) first * ZV, (const float*) wnm->data, EPS,
                                         y_dummy_ + (size_t) first * ZV, (int) g.ssm_k_heads,
                                         (int) HV, t - first, keep, cs_,
                                         t - first > 1 ? t - first : 0);   // a 1-row group keeps the 0.1.39 kernel
                 }
                 if (gg.n > 0)
-                    gdn_step_norm_groups(gg, h_L_ + (size_t) gdn_index * MT * C, (int) C,
-                                         gate_L_ + (size_t) gdn_index * MT * HV, beta_L_ + (size_t) gdn_index * MT * HV,
-                                         z_, (const float*) wnm->data, EPS, y_dummy_, (int) g.ssm_k_heads, (int) HV, true,
+                    gdn_step_norm_groups(gg, h_L + (size_t) gdn_index * MT * C, (int) C,
+                                         gate_L + (size_t) gdn_index * MT * HV, beta_L + (size_t) gdn_index * MT * HV,
+                                         z_v, (const float*) wnm->data, EPS, y_dummy_, (int) g.ssm_k_heads, (int) HV, true,
                                          cs_);
                 ++gdn_index;
             } else {
@@ -3600,11 +3612,11 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
                     const int first = t;
                     while (t < S && rows[t] == rows[first]) ++t;
                     const QsaState& st = slots_[(size_t) rows[first]]->qsa_states[qsa_index];
-                    copy_from_mapped(st.idx_tail, tail_snap_b_ + ((size_t) rows[first] * nQ + qsa_index) * TS,
+                    copy_from_mapped(st.idx_tail, tail_snap_b + ((size_t) rows[first] * nQ + qsa_index) * TS,
                                      TS, cs_);
                     const QsaIndexerBuffers ib{st.idx_tail, st.idx_dead, st.idx_pooled, st.idx_block_pos};
                     for (int u = first; u < t; ++u)
-                        native_qsa_indexer_append(idx_raw_L_ + (size_t) (qsa_index * MT + u) * ID,
+                        native_qsa_indexer_append(idx_raw_L + (size_t) (qsa_index * MT + u) * ID,
                                                   commitb_ + (size_t) rows[first] * CB + 2 + (u - first),
                                                   0, (const float*) wikn->data, EPS, ib, s, st.max_cells,
                                                   rope_scaling(), cs_);
@@ -3616,7 +3628,7 @@ bool Verifier::capture_commit_batch(const int* rows, int S, int hbase, std::stri
             for (int t = 0; t < S;) {
                 const int first = t;
                 while (t < S && rows[t] == rows[first]) ++t;
-                copy_indexed(slots_[(size_t) rows[first]]->ple_hist, hist_snap_ + (size_t) first * HS,
+                copy_indexed(slots_[(size_t) rows[first]]->ple_hist, hist_snap + (size_t) first * HS,
                              HS, commitb_ + (size_t) rows[first] * CB + 1, HS, cs_);
             }
     } catch (const std::exception& e) {
@@ -3966,6 +3978,164 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     b_steps_ = le_ - lb_;
     ring_now();
     b_running_.store(true, std::memory_order_release);   // last: an external server reads the rest after it
+    return true;
+}
+
+bool Verifier::batch_launch_rows(const int* rows, int S, int base, const int32_t* tokens, const int64_t* pos,
+                                 std::string& err) {
+    const OnDevice on_device(device_);
+    if (b_running_) { err = "verify: batch_launch while this stage is busy"; return false; }
+    if (pre_launch_ && !pre_launch_(cs_, err)) return false;
+    if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
+    cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
+    // A window with a row per slot keeps every row: its commit goes right behind it, as in batch_launch.  A drafted
+    // window (two rows per slot) commits after the verdict, from commit_rows_async.
+    if (le == cudaSuccess && !batch_self_commits(rows, S) && one_row_per_slot(rows, S))
+        le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
+    if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
+    (void) cudaStreamQuery(cs_);
+    if (ple_stage())   // the host's side of the commit (the hash's last two tokens)
+        for (int t = 0; t < S; ++t) {
+            SessionState& sx = *slots_[(size_t) rows[t]];
+            sx.ple_prev[0] = sx.ple_prev[1];
+            sx.ple_prev[1] = tokens[t];
+        }
+    b_k_ = 0;
+    b_steps_ = le_ - lb_;
+    ring_now();
+    b_running_.store(true, std::memory_order_release);   // last: an external server reads the rest after it
+    return true;
+}
+
+bool Verifier::commit_rows_async(const int* rows, int S, int base, const int* keep, const int32_t* tokens,
+                                 const int64_t* pos, std::string& err) {
+    if (batch_self_commits(rows, S)) return true;   // the window kept its rows at launch
+    const OnDevice on_device(device_);
+    const int64_t CB = 2 + max_t_;
+    // One prefix per slot: rejected draft rows must not enter recurrent state.
+    for (int t = 0; t < S;) {
+        const int first = t;
+        while (t < S && rows[t] == rows[first]) ++t;
+        const int n = keep[rows[first]];
+        if (n < 1 || n > t - first) {
+            err = "verify: accepted prefix is outside its slot group";
+            return false;
+        }
+        int32_t* c = h_commitb_ + (size_t) rows[first] * CB;
+        c[0] = n;
+        c[1] = n - 1;
+        for (int j = 0; j < max_t_; ++j)
+            c[2 + j] = j < n ? (int32_t) pos[first + j] : -1;
+    }
+    std::atomic_thread_fence(std::memory_order_seq_cst);
+    const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // behind whatever the stream holds
+    if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
+    if (ple_stage())
+        for (int t = 0; t < S;) {
+            const int first = t;
+            while (t < S && rows[t] == rows[first]) ++t;
+            SessionState& sx = *slots_[(size_t) rows[first]];
+            for (int u = first; u < first + keep[rows[first]]; ++u) {
+                sx.ple_prev[0] = sx.ple_prev[1];
+                sx.ple_prev[1] = tokens[u];
+            }
+        }
+    return true;
+}
+
+bool Verifier::sync_batch_stream(std::string& err) {
+    const OnDevice on_device(device_);
+    const cudaError_t se = cudaStreamSynchronize(cs_);
+    if (se != cudaSuccess) { err = std::string("verify: batch stream sync: ") + cudaGetErrorString(se); return false; }
+    return true;
+}
+
+bool Verifier::alloc_commit_scratch(std::string& err) {
+    if (g_ == nullptr) { err = "verify: alloc_commit_scratch before init"; return false; }
+    if (cs_arena_ != nullptr) return true;
+    const ModelGeometry& g = *g_;
+    const int64_t nG = g.n_gdn_layers(), nQ = g.n_qsa_layers();   // model-wide: the live buffers hold every layer
+    const int64_t T = max_t_, C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim,
+                ID = g.idx_key_dim, HS = (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM,
+                TS = (shapes_of(g).idx_block - 1) * ID;
+    const int64_t n_slots = (int64_t) slots_.size();
+    const int64_t f_qkv = nG * T * C, f_gate = nG * T * HV, f_z = T * ZV, f_idx = nQ * T * ID,
+                  f_hist = T * HS, f_tail = n_slots * std::max<int64_t>(nQ, 1) * TS;
+    const int64_t floats = 2 * (f_qkv + f_qkv + 2 * f_gate + f_z + f_idx + f_hist + f_tail);
+    void* d = nullptr;
+    {
+        const OnDevice on_device(device_);
+        if (cudaMalloc(&d, (size_t) floats * sizeof(float)) != cudaSuccess) {
+            err = "verify: the commit scratch does not fit";
+            return false;
+        }
+    }
+    cs_arena_ = d;
+    for (int p = 0; p < 2; ++p) {
+        float* q = (float*) d + (size_t) p * (floats / 2);
+        CommitScratch& s = cs_scr_[p];
+        s.qkv = q; q += f_qkv;
+        s.h = q; q += f_qkv;
+        s.gate = q; q += f_gate;
+        s.beta = q; q += f_gate;
+        s.z = q; q += f_z;
+        s.idx_raw = q; q += f_idx;
+        s.hist = q; q += f_hist;
+        s.tail = q;
+    }
+    return true;
+}
+
+bool Verifier::snapshot_window_scratch(int parity, const int* rows, int S, std::string& err) {
+    const CommitScratch& s = cs_scr_[(size_t) parity];   // parity 0/1 (STRATA_PIPE_MTP runs at most 2 groups)
+    if (s.qkv == nullptr) { err = "verify: snapshot_window_scratch without alloc_commit_scratch"; return false; }
+    const OnDevice on_device(device_);
+    const ModelGeometry& g = *g_;
+    const int64_t nQ = g.n_qsa_layers();
+    int64_t nG_stage = 0, nQ_stage = 0;
+    for (int64_t l = lb_; l < le_; ++l) (is_qsa_layer(g, l) ? nQ_stage : nG_stage) += 1;
+    int64_t gdn0 = 0, qsa0 = 0;
+    for (int64_t l = 0; l < lb_; ++l) (is_qsa_layer(g, l) ? qsa0 : gdn0) += 1;   // the stage's first layer's index
+    const int64_t T = max_t_, C = g.ssm_conv_channels, HV = g.ssm_v_heads, ZV = g.ssm_value_dim,
+                ID = g.idx_key_dim, HS = (int64_t) strata::kernels::NG_HIST * strata::kernels::NG_HC_DIM,
+                TS2 = (shapes_of(g).idx_block - 1) * ID;
+    auto cp = [&](void* dst, const void* src, size_t bytes) {
+        return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, cs_) == cudaSuccess;
+    };
+    for (int t = 0; t < S;) {
+        const int first = t;
+        while (t < S && rows[t] == rows[first]) ++t;
+        const int64_t n = t - first;
+        for (int64_t li = 0; li < nG_stage; ++li) {
+            const int64_t gi = gdn0 + li;
+            if (!cp(s.qkv + ((size_t) gi * T + first) * C, qkv_L_ + ((size_t) gi * T + first) * C, (size_t) n * C * sizeof(float)) ||
+                !cp(s.h + ((size_t) gi * T + first) * C, h_L_ + ((size_t) gi * T + first) * C, (size_t) n * C * sizeof(float)) ||
+                !cp(s.gate + ((size_t) gi * T + first) * HV, gate_L_ + ((size_t) gi * T + first) * HV, (size_t) n * HV * sizeof(float)) ||
+                !cp(s.beta + ((size_t) gi * T + first) * HV, beta_L_ + ((size_t) gi * T + first) * HV, (size_t) n * HV * sizeof(float))) {
+                err = "verify: the commit scratch snapshot failed";
+                return false;
+            }
+        }
+        if (!cp(s.z + (size_t) first * ZV, z_ + (size_t) first * ZV, (size_t) n * ZV * sizeof(float))) {
+            err = "verify: the commit scratch snapshot failed";
+            return false;
+        }
+        for (int64_t qi = 0; qi < nQ_stage; ++qi) {
+            const int64_t qg = qsa0 + qi;
+            if (!cp(s.idx_raw + ((size_t) qg * T + first) * ID, idx_raw_L_ + ((size_t) qg * T + first) * ID,
+                    (size_t) n * ID * sizeof(float))) {
+                err = "verify: the commit scratch snapshot failed";
+                return false;
+            }
+        }
+        if (!cp(s.hist + (size_t) first * HS, hist_snap_ + (size_t) first * HS, (size_t) n * HS * sizeof(float)) ||
+            !cp(s.tail + (size_t) rows[first] * std::max<int64_t>(nQ, 1) * TS2,
+                tail_snap_b_ + (size_t) rows[first] * std::max<int64_t>(nQ, 1) * TS2,
+                (size_t) std::max<int64_t>(nQ, 1) * TS2 * sizeof(float))) {
+            err = "verify: the commit scratch snapshot failed";
+            return false;
+        }
+    }
     return true;
 }
 

@@ -231,6 +231,33 @@ public:
     // a window in flight from one thread (batch_poll does not block).  Stage k can then run group g while stage k+1
     // runs group g-1.  Rows of group `base` use hand-off rows [base, base + S), so groups never share a hand-off row.
     bool batch_launch(int base, int S, const int32_t* tokens, const int64_t* pos, std::string& err);
+    /// STRATA_PIPE_MTP: the same launch with an explicit row->slot map, so a drafted slot's window carries two
+    /// rows (its token and its MTP proposal at pos + 1).  A window with a row per slot commits at launch as
+    /// batch_launch does; a drafted window does not - its rows commit after the verdict (commit_rows_async).
+    bool batch_launch_rows(const int* rows, int S, int base, const int32_t* tokens, const int64_t* pos, std::string& err);
+    /// STRATA_PIPE_MTP: queue this stage's commit graph for a window launched with batch_launch_rows (its rows,
+    /// count and base), after the verdict chose each slot's kept prefix in `keep` (indexed by slot ID).  The graph
+    /// runs behind whatever the stage's stream holds, so another group's window may be in flight; the caller
+    /// launches the committed group's next window only after this returns, which orders it behind the commit.
+    /// `tokens` and `pos` are the window's rows (the PLE host words).  A window that kept its rows at launch
+    /// (one row per slot) has nothing left to do and returns true without launching anything.
+    bool commit_rows_async(const int* rows, int S, int base, const int* keep, const int32_t* tokens,
+                           const int64_t* pos, std::string& err);
+    /// Waits for everything queued on this stage's window stream (a deferred commit included).  The pipelined
+    /// caller flushes its queued commits with this before a slot's state is read or written from elsewhere
+    /// (an admission, a hand-back to the solo path, the end of a run).
+    bool sync_batch_stream(std::string& err);
+    // ---- STRATA_PIPE_MTP: the commit's input buffers, per pipelined-group parity.  A drafted group's commit
+    // runs after its verdict (the last stage), by which time other groups' windows have overwritten the live
+    // per-window buffers the commit graph reads; each group's completion snapshots its rows into its parity's
+    /// scratch and the commit graph (captured for that group's layout) reads the scratch instead.
+    bool alloc_commit_scratch(std::string& err);
+    /// Which parity's scratch the next batch_launch_rows captures its commit graph against (-1: the live buffers,
+    /// as before; set before every launch, the first one captures).
+    void set_commit_scratch(int parity) { cs_par_ = parity; }
+    /// Enqueue the copies of a finishing window's commit inputs into parity's scratch, on the window stream
+    /// (the stage is idle at a completion; the next window on the stream follows the copies).
+    bool snapshot_window_scratch(int parity, const int* rows, int S, std::string& err);
     /// 1 = this stage's window and commit are done (the last stage's picks are in batch_out), 0 = still running,
     /// -1 = an error (err).  Serves every layer that has rung so far.
     int batch_poll(PoolMultiFn pool, void* user, std::string& err);
@@ -479,6 +506,14 @@ private:
     unsigned long long* slot_off_d_ = nullptr;   ///< E-6: the slot offsets on the device
     int64_t lb_ = 0, le_ = -1;           ///< set_stage: the layers this verifier runs (-1: to the last)
     int handoff_rows_ = 0;               ///< set_handoff_rows (0: kVerifyMaxT)
+    // STRATA_PIPE_MTP: the commit scratch, per group parity (see alloc_commit_scratch)
+    struct CommitScratch {
+        float* qkv = nullptr; float* h = nullptr; float* gate = nullptr; float* beta = nullptr;
+        float* z = nullptr; float* idx_raw = nullptr; float* hist = nullptr; float* tail = nullptr;
+    };
+    CommitScratch cs_scr_[2];
+    int cs_par_ = -1;
+    void* cs_arena_ = nullptr;
     const float* hand_in_ = nullptr;
     float* hand_out_ = nullptr;
     uint32_t* hflag_in_h_ = nullptr;     ///< set_handoff_flags: the incoming hand-off's ready word (host / device)
