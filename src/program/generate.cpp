@@ -5308,6 +5308,14 @@ int main(int argc, char** argv) {
     // last-stage completion.  With it the groups resolve as if --batch-mtp were off.
     const char* pipe_mtp_env = std::getenv("STRATA_PIPE_MTP");
     const bool pipe_mtp = pipe_mtp_env != nullptr && pipe_mtp_env[0] != '\0' && pipe_mtp_env[0] != '0';
+    // The pipelined groups' slot drafts run as chains (MtpDrafter::draft_launch) and are collected when the slot's next
+    // window is built, so the last stage launches its next group while they run.  STRATA_PIPE_MTP_SYNC=1: the drafts
+    // run to completion at the group's verdict, before the next group starts (the A/B arm).  Off with one group
+    // (below, once the groups are resolved): the serial windows draft with draft().
+    bool pipe_mtp_async = pipe_mtp && [] {
+        const char* v = std::getenv("STRATA_PIPE_MTP_SYNC");
+        return v == nullptr || v[0] == '\0' || v[0] == '0';
+    }();
     // STRATA_PIPE_MTP_DRAFTS=N: each pipelined slot's window carries N MTP proposals (chained drafts through the
     // same drafter layer; N <= --spec - 1, and the group's rows GS * (N + 1) must fit the 8-row window)
     const char* pipe_drafts_env = std::getenv("STRATA_PIPE_MTP_DRAFTS");
@@ -5551,6 +5559,7 @@ int main(int argc, char** argv) {
             }
         }
 #endif
+        pipe_mtp_async = pipe_mtp_async && o.batch_groups > 1;   // (the groups are resolved by now)
         if (batch_mtp) {
             // Slot b's drafter lives where the solo drafter does (the guard above: the last stage's GPU), carved from the
             // LAST stage's slot-b session (bslot_ss.back(): stage 0's on one GPU): it borrows that session's context
@@ -5560,6 +5569,7 @@ int main(int argc, char** argv) {
                 auto d = std::make_unique<strata::core::MtpDrafter>();
                 // (mtp_first: the solo drafter is on the first stage's card, so slot b's is carved from its first-stage session)
                 strata::core::SessionState& slot_s = mtp_first ? *bslot_ss[0][(size_t) b] : *bslot_ss.back()[(size_t) b];
+                if (pipe_mtp_async) d->set_force_capture(true);   // the slot's round as a chain (draft_launch)
                 if (!d->load(o.mtp, draft_geometry, slot_s, o.spec, err, o.mtp_window, &mtp)) {
                     std::fprintf(stderr, "strata generate: batch MTP slot %d: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
@@ -9254,7 +9264,8 @@ int main(int argc, char** argv) {
                 }
                 slot_mtp_rows.emplace_back(r, free_slot_mtp_rows);
                 if (!slot_mtp[(size_t) b]->bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head, r, err,
-                                                &mtp)) {
+                                                &mtp) ||
+                    (pipe_mtp_async && !slot_mtp[(size_t) b]->prepare_chain(err))) {
                     std::fprintf(stderr, "strata serve: batch MTP slot %d: %s%s\n", b, err.c_str(),
                                  vram_free_note().c_str());
                     return 1;
@@ -11423,6 +11434,13 @@ int main(int argc, char** argv) {
         double bt_wait0 = 0, bt_pool0 = 0;
         int64_t bt_miss0 = 0, bt_hits0 = 0, bt_pcie0 = 0;
         int64_t bt_windows = 0, bt_rows = 0, bt_tokens = 0, bt_accepted = 0;   // bt_accepted: --batch-mtp proposals taken
+        double bt_draft_ms = 0.0;   // the pipelined groups' host time launching (or, STRATA_PIPE_MTP_SYNC=1, running) the slot drafts
+        std::vector<double> bt_stage_busy_ms;   // per stage: window launch to its completed poll, summed (the stage's share of the run)
+        std::vector<Clock::time_point> bt_stage_launch;
+        // per stage, a window's launch-to-poll time by company: [0] the other stages idle at its launch, [1] another busy
+        std::vector<std::array<double, 2>> bt_stage_win_ms;
+        std::vector<std::array<int64_t, 2>> bt_stage_win_n;
+        std::vector<bool> bt_stage_launched_beside;
         int64_t pipe_rows = 0;   // the pipelined groups' rows, never reset (bt_rows restarts when the slots go idle)
         // per stage (0 = CUDA0's verifier): the GPU-reach wait and pool time when the timed windows began; and the routed
         // (token, expert) entries the CPU and the PCIe share had served by then (bt_hits0 holds the VRAM entries)
@@ -11968,6 +11986,13 @@ int main(int argc, char** argv) {
                 if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
                 if (r == 0) continue;
                 if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
+                {
+                    const double win_ms = std::chrono::duration<double, std::milli>(Clock::now() - bt_stage_launch[(size_t) k]).count();
+                    const size_t company = bt_stage_launched_beside[(size_t) k] ? 1 : 0;
+                    bt_stage_busy_ms[(size_t) k] += win_ms;
+                    bt_stage_win_ms[(size_t) k][company] += win_ms;
+                    ++bt_stage_win_n[(size_t) k][company];
+                }
                 stage_group[(size_t) k] = -1;
                 PGroup& G = pg[(size_t) gi];
                 // the finishing group's commit inputs go to its parity's scratch now, while this stage is idle
@@ -12069,26 +12094,37 @@ int main(int argc, char** argv) {
                 if (G.drafted) {
                     // the next draft per still-active slot: the two residual rows (the final residuals of the last
                     // stage: final_R_all() is this stage's, where the drafters are), copied on the drafter's own
-                    // stream - this stage's stream is idle here (batch_poll synchronised it) and the next window
-                    // on it is only launched after, so the rows are not clobbered mid-copy
+                    // stream - this stage's stream is idle here (batch_poll synchronised it).  Synchronous drafts: the
+                    // next window on it is only launched after, so the rows are not clobbered mid-copy.  Chains
+                    // (pipe_mtp_async): this stage's stream waits for the copy (wait_rows_copied: free, it is idle),
+                    // so whatever runs on it next is ordered after; the chain's drafts are read when the slot's next
+                    // window is built.
+                    const Clock::time_point td = Clock::now();
                     for (int t = 0; t < G.S; ++t) {
                         BSlot& sl = bs[(size_t) (gi * GS + t)];
                         if (!sl.active) continue;
+                        const int b = gi * GS + t;
                         const int i = G.first[t];
                         const int cnt = (t + 1 < G.S ? G.first[t + 1] : G.R) - i;   // this slot's rows
-                        const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) (gi * GS + t)]->device());
+                        const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) b]->device());
                         const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
-                        if (cudaMemcpyAsync(slot_mtp_rows[(size_t) (gi * GS + t)].get(),
-                                            vk.final_R_all() + (size_t) i * stride,
-                                            (size_t) cnt * stride * sizeof(float), cudaMemcpyDeviceToDevice,
-                                            slot_mtp[(size_t) (gi * GS + t)]->stream()) != cudaSuccess ||
-                            !slot_mtp[(size_t) (gi * GS + t)]->draft(cnt, outb + i, G.pos[i], keepb[t] - 1,
-                                                                       sl.draft.data(), err)) {
-                            std::printf("ERR batch MTP slot %d: %s\n", gi * GS + t, err.c_str());
+                        const float* rows = vk.final_R_all() + (size_t) i * stride;
+                        bool ok_d;
+                        if (pipe_mtp_async) {
+                            ok_d = slot_mtp[(size_t) b]->draft_launch(cnt, rows, outb + i, G.pos[i], keepb[t] - 1, err) &&
+                                   slot_mtp[(size_t) b]->wait_rows_copied(vk.stream(), err);
+                        } else {
+                            ok_d = cudaMemcpyAsync(slot_mtp_rows[(size_t) b].get(), rows, (size_t) cnt * stride * sizeof(float),
+                                                   cudaMemcpyDeviceToDevice, slot_mtp[(size_t) b]->stream()) == cudaSuccess &&
+                                   slot_mtp[(size_t) b]->draft(cnt, outb + i, G.pos[i], keepb[t] - 1, sl.draft.data(), err);
+                        }
+                        if (!ok_d) {
+                            std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
                             return false;
                         }
                         sl.draft_ready = true;
                     }
+                    bt_draft_ms += std::chrono::duration<double, std::milli>(Clock::now() - td).count();
                     // the accepted prefix per slot: queued for every stage, run before that stage's next launch
                     PipeCommit pc;
                     std::memcpy(pc.rows, G.rows, sizeof pc.rows);
@@ -12143,6 +12179,10 @@ int main(int argc, char** argv) {
                             ++G.R;
                             if (G.drafted) {
                                 if (!sl.draft_ready) { err = "batch MTP: a live slot has no draft"; return false; }
+                                if (pipe_mtp_async && !slot_mtp[(size_t) (pick * GS + t)]->draft_collect(sl.draft.data(), err)) {
+                                    std::printf("ERR batch MTP slot %d: %s\n", pick * GS + t, err.c_str());
+                                    return false;
+                                }
                                 const int nprop = std::min<int>(pipe_drafts_n,
                                                                (int) std::max<int64_t>(0, o.max_context - 1 - sl.p));
                                 for (int j = 0; j < nprop; ++j) {
@@ -12182,6 +12222,17 @@ int main(int argc, char** argv) {
                 stage_verifier(k).set_commit_scratch(G.drafted ? (pm_flip ? 1 - pick : pick) : -1);   // the commit captures/reads this parity's scratch
                 strata::core::progress().busy.store(true);
                 if (batch_telemetry_enabled) stage_in_flight.launch(k, Clock::now());
+                if (bt_stage_busy_ms.empty()) {
+                    bt_stage_busy_ms.assign((size_t) n_pipe, 0.0);
+                    bt_stage_launch.assign((size_t) n_pipe, Clock::time_point{});
+                    bt_stage_win_ms.assign((size_t) n_pipe, {0.0, 0.0});
+                    bt_stage_win_n.assign((size_t) n_pipe, {0, 0});
+                    bt_stage_launched_beside.assign((size_t) n_pipe, false);
+                }
+                bt_stage_launch[(size_t) k] = Clock::now();
+                bt_stage_launched_beside[(size_t) k] = false;
+                for (int k2 = 0; k2 < n_pipe; ++k2)
+                    if (k2 != k && stage_group[(size_t) k2] >= 0) bt_stage_launched_beside[(size_t) k] = true;
                 if (!stage_verifier(k).batch_launch_rows(G.rows, G.R, G.base, G.tok, G.pos, err)) {
                     std::printf("ERR %s\n", err.c_str());
                     return false;
@@ -12208,8 +12259,22 @@ int main(int argc, char** argv) {
             if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
                 const double w = (double) bt_windows, wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
                 std::fprintf(stderr, "strata batch (pipelined, %d groups of %d): %lld group-steps, %lld rows in %.0f ms = "
-                                     "%.1f rows/s (admissions included)\n", o.batch_groups, GS, (long long) bt_windows,
-                             (long long) bt_rows, wall, 1000.0 * bt_rows / std::max(wall, 1e-9));
+                                     "%.1f rows/s (admissions included); slot drafts %.2f ms/step on the host%s\n",
+                             o.batch_groups, GS, (long long) bt_windows, (long long) bt_rows, wall,
+                             1000.0 * bt_rows / std::max(wall, 1e-9), bt_draft_ms / w, pipe_mtp_async ? " (chains)" : "");
+                std::fprintf(stderr, "strata batch (pipelined): stage busy share of the run:");
+                for (size_t k = 0; k < bt_stage_busy_ms.size(); ++k)
+                    std::fprintf(stderr, " %.0f%%", 100.0 * bt_stage_busy_ms[k] / std::max(wall, 1e-9));
+                std::fprintf(stderr, "; ms/window alone | beside another stage:");
+                for (size_t k = 0; k < bt_stage_win_ms.size(); ++k)
+                    std::fprintf(stderr, " stage %zu %.1f (%lld) | %.1f (%lld)", k,
+                                 bt_stage_win_ms[k][0] / std::max<int64_t>(1, bt_stage_win_n[k][0]), (long long) bt_stage_win_n[k][0],
+                                 bt_stage_win_ms[k][1] / std::max<int64_t>(1, bt_stage_win_n[k][1]), (long long) bt_stage_win_n[k][1]);
+                std::fprintf(stderr, "\n");
+                std::fill(bt_stage_busy_ms.begin(), bt_stage_busy_ms.end(), 0.0);
+                std::fill(bt_stage_win_ms.begin(), bt_stage_win_ms.end(), std::array<double, 2>{0.0, 0.0});
+                std::fill(bt_stage_win_n.begin(), bt_stage_win_n.end(), std::array<int64_t, 2>{0, 0});
+                bt_draft_ms = 0.0;
                 for (int k = 0; k < n_pipe; ++k) {
                     const std::string pr = stage_verifier(k).profile_report();
                     if (!pr.empty()) std::fprintf(stderr, "strata batch GPU stages, stage %d (ms/window):%s\n", k + 1, pr.c_str());

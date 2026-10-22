@@ -162,6 +162,7 @@ MtpDrafter::~MtpDrafter() {
     if (owns_draft_head_ && dhead_) { strata::kernels::native_q6_k_unpack(dhead_); cudaFree(dhead_); }
     if (owns_draft_head_ && dvocab_) cudaFree(dvocab_);
     if (ev_chain_) cudaEventDestroy(ev_chain_);
+    if (ev_rows_) cudaEventDestroy(ev_rows_);
     for (cudaEvent_t e : ev_step_) if (e) cudaEventDestroy(e);
     void* hosts[] = {h_tok_, h_step_, h_pos_, h_row_, h_out_, h_prob_, h_force_};
     for (void* h : hosts) if (h) cudaFreeHost(h);
@@ -1612,11 +1613,7 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
         if (!do_ple || tok < 0) return;
         const Clock::time_point tp = Clock::now();
         struct PleT { bool on; double& acc; Clock::time_point t; ~PleT() { if (on) acc += std::chrono::duration<double, std::milli>(Clock::now() - t).count(); } } ple_t{dth, g_dt.ple_ms, tp};
-        uint32_t rows16[strata::kernels::PLE_N_HEADS];
-        strata::kernels::ngram_rows(&tok, ple_prev, 1, pss->ple.consts, rows16);
-        ple_prev[0] = ple_prev[1];
-        ple_prev[1] = tok;
-        pss->ple.table->prefetch_rows(rows16);
+        this->prefetch_ple(tok, ple_prev);
     };
 
     int n = 0;
@@ -1735,6 +1732,69 @@ bool MtpDrafter::draft(int T, const int32_t* tokens, int64_t p, int a, int32_t* 
     if (n_drafts) *n_drafts = n;
     ms_draft += ms_since(t0);
     ++rounds;
+    return true;
+}
+
+void MtpDrafter::prefetch_ple(int32_t tok, int32_t prev[2]) {
+    SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
+    if (pss == nullptr || !pss->ple.ready() || pss->ple.table == nullptr || tok < 0) return;
+    uint32_t rows16[strata::kernels::PLE_N_HEADS];
+    strata::kernels::ngram_rows(&tok, prev, 1, pss->ple.consts, rows16);
+    prev[0] = prev[1];
+    prev[1] = tok;
+    pss->ple.table->prefetch_rows(rows16);
+}
+
+bool MtpDrafter::draft_launch(int T, const float* rows, const int32_t* tokens, int64_t p, int a, std::string& err) {
+    const OnDevice on_device(device_);
+    if (chain_live_ && !draft_collect(nullptr, err)) return false;
+    if (T < 1 || T > max_t_ || a < 0 || a >= T) { err = "mtp: draft arguments out of range"; return false; }
+    if (!mtp_catchup_all()) T = a + 1;   // as draft(): the rejected rows' K/V is not caught up
+    if (ev_rows_ == nullptr && cudaEventCreateWithFlags(&ev_rows_, cudaEventDisableTiming) != cudaSuccess) {
+        err = "mtp: event creation failed";
+        return false;
+    }
+    const size_t row_bytes = (size_t) g_->hc * (size_t) g_->n_embd * sizeof(float);
+    if (cudaMemcpyAsync((void*) window_R_, rows, (size_t) T * row_bytes, cudaMemcpyDeviceToDevice, cs_) != cudaSuccess ||
+        cudaEventRecord(ev_rows_, cs_) != cudaSuccess) {
+        err = "mtp: staging the slot's residual rows failed";
+        return false;
+    }
+    SessionState* const pss = ple_ss_ ? ple_ss_ : ss_;
+    slot_ple_prev_[0] = pss != nullptr ? pss->ple_prev[0] : 0;
+    slot_ple_prev_[1] = pss != nullptr ? pss->ple_prev[1] : 0;
+    prefetch_ple(tokens[a], slot_ple_prev_);
+    // as draft(): only the cells that exist near the context's end
+    const int n_out = (int) std::min<int64_t>(std::min(max_t_ - 1, max_drafts_), st_.max_cells - (p + a));
+    chain_n_ = 0;
+    slot_launched_ = true;
+    if (n_out < 1) return true;   // nothing to draft: draft_collect gives zeros
+    return chain_launch(T, tokens, p, a, nullptr, 0, n_out, 0, err);
+}
+
+bool MtpDrafter::wait_rows_copied(cudaStream_t stream, std::string& err) {
+    if (ev_rows_ == nullptr) return true;
+    const OnDevice on_device(device_);
+    if (cudaStreamWaitEvent(stream, ev_rows_, 0) != cudaSuccess) { err = "mtp: the rows copy wait failed"; return false; }
+    return true;
+}
+
+bool MtpDrafter::draft_collect(int32_t* drafts, std::string& err) {
+    int r = chain_poll(err);
+    if (r == 0) progress_at("mtp draft: waiting for the GPU");
+    while (r == 0) {
+#if defined(_WIN32) || defined(__x86_64__)
+        _mm_pause();
+#endif
+        r = chain_poll(err);
+    }
+    if (r < 0) return false;
+    if (!slot_launched_) return true;   // no draft_launch since the last collect (draft_first's drafts stand)
+    for (int j = 0; j < chain_n_; ++j) prefetch_ple(chain_tok_[j], slot_ple_prev_);
+    if (drafts != nullptr)
+        for (int j = 0; j < max_t_ - 1; ++j) drafts[j] = j < chain_n_ ? chain_tok_[j] : 0;
+    chain_n_ = 0;
+    slot_launched_ = false;
     return true;
 }
 
@@ -1861,6 +1921,7 @@ bool MtpDrafter::draft_first(int T, const float* R_row, int32_t token, int64_t c
     }
 #endif
     const OnDevice on_device(device_);
+    if (!draft_collect(nullptr, err)) return false;   // a draft_launch not collected (none, usually): drafts of this round stand
     // row 0 is the real pair; rows 1.. repeat it and only write cells the next round overwrites
     const int64_t HCN = g_->hc * g_->n_embd;
     for (int t = 0; t < T; ++t)

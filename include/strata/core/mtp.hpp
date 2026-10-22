@@ -155,6 +155,18 @@ public:
     const int32_t* chain_tok() const { return chain_tok_; }
     const float* chain_prob() const { return chain_prob_; }
 
+    // ---- a pipelined batch slot's round (STRATA_PIPE_MTP) as a chain: launched when its group leaves the last stage,
+    // collected when the slot's next window is built, so that stage launches its next group meanwhile.
+    /// As draft(T, tokens, p, a) up to the launch: `rows` (T residual rows the drafter's stream can read) are copied
+    /// into the bound buffer on that stream and the chain follows them.  A chain still in flight is collected first.
+    /// Needs set_force_capture before load and prepare_chain.
+    bool draft_launch(int T, const float* rows, const int32_t* tokens, int64_t p, int a, std::string& err);
+    /// `stream` waits for the rows copy of the last draft_launch (before a window overwrites the rows it read).
+    bool wait_rows_copied(cudaStream_t stream, std::string& err);
+    /// The launched chain's drafts as draft() gives them (max_t-1 tokens, 0 past the chain's end); waits for the chain.
+    /// Without a draft_launch since the last collect, `drafts` is left as it is.
+    bool draft_collect(int32_t* drafts, std::string& err);
+
     double ms_draft = 0, ms_prefill = 0;
     double ms_src = 0;      ///< the host time spent staging the source rows (a cross-card copy when the drafter is on another card)
     int64_t n_src = 0;
@@ -236,6 +248,11 @@ private:
     int steps_seen_ = 0, chain_n_ = 0, chain_early_ = 0;
     int32_t chain_tok_[8] = {};
     float chain_prob_[8] = {};
+    // draft_launch / draft_collect
+    cudaEvent_t ev_rows_ = nullptr;      ///< after the rows copy of draft_launch
+    bool slot_launched_ = false;         ///< a draft_launch not yet collected
+    int32_t slot_ple_prev_[2] = {};      ///< the PLE history the collected drafts' prefetch continues from
+    void prefetch_ple(int32_t tok, int32_t prev[2]);   ///< warm the PLE table rows of `tok` after `prev` (perf only)
     int64_t n_vocab_ = 0;
     uint64_t vram_ = 0;
     cudaStream_t cs_ = nullptr;
