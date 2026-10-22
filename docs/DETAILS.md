@@ -649,6 +649,16 @@ stage. Parked snapshots are not kept across restarts; session files are. `STRATA
 retention for diagnostics. The Monitor tab's **Conversation cache** card shows parked, restored and evicted counts and the
 prompt tokens the cache gave back; `/metrics` has the same under `"conversation_cache"`.
 
+**Slot copies on a layer split:** the copies that move a conversation between the sessions
+and the batch slots, and the capture into the conversation cache, run per stage. With a
+layer split they run one stage at a time unless `STRATA_STAGE_COPY_PARALLEL` is `0`: a
+small pool runs one worker per GPU, so the cards copy at the same time instead of queuing
+(measured by the series author on a 4-way layer split: a ~110K-token capture 880 -> 268 ms
+per 100K tokens, the slot shuttle's p90 658 -> 73 ms). On one card the pool is not created.
+Each slot copy also reuses one host image per stage and layer instead of allocating a fresh
+16 MiB segment per transfer (`STRATA_SLOT_SHUTTLE=0` allocates a fresh one each time, as
+before; on Linux the images are advised `MADV_HUGEPAGE`).
+
 ### Session files (disk)
 
 The conversation the engine holds can be saved to a file and restored later, also after a restart of the same engine version,

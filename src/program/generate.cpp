@@ -11554,6 +11554,9 @@ int main(int argc, char** argv) {
             return v != nullptr && v[0] == '0';
         }();
         std::vector<std::vector<strata::core::ConversationKv>> slot_shuttle;
+        // (one thread per GPU) the stage workers call shuttle_kv at the same time: the outer vector is
+        // pre-sized here, on the orchestration thread, so a worker never resizes (or moves) it.
+        slot_shuttle.resize(bslot_ss.size());
         strata::core::ConversationKv mtp_shuttle;
         auto shuttle_kv = [&](size_t stage, int64_t layer) -> strata::core::ConversationKv& {
             if (slot_shuttle.size() <= stage) slot_shuttle.resize(stage + 1);
