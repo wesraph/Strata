@@ -5814,6 +5814,30 @@ class PromptProgressBatch(unittest.TestCase):
         self.assertIsNone(prompt_progress(svc))
 
 
+class ReadingPromptLine(unittest.TestCase):
+    """The server-window line while a prompt is read carries the PP line's mean tokens/s (the engine's own figure)."""
+
+    def line(self, **kw):
+        from serve.server import Service
+        engine = SimpleNamespace(progress=kw.get("progress"), prefill_tok_s_mean=kw.get("rate"))
+        s = {"started": time.time() - 3.0, "prompt_tokens": 1000, "first_token": None, "generated": 0}
+        svc = SimpleNamespace(status_lock=threading.Lock(), status=s, engine=engine)
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            self.assertGreater(Service._progress(svc, 0.0, st=s), 0.0)   # returns the time it printed at
+        return out.getvalue().strip()
+
+    def test_the_pp_lines_rate_is_shown(self):
+        self.assertRegex(self.line(progress=(2048, 8192), rate=940.0),
+                         r"^\[strata\] reading the prompt: 2,048 of 8,192 tokens, 940 tok/s, \d+ s so far$")
+
+    def test_no_pp_line_yet_no_rate(self):
+        self.assertRegex(self.line(), r"^\[strata\] reading the prompt: 1,000 tokens, \d+ s so far$")
+
+    def test_a_zero_rate_is_not_shown(self):
+        self.assertRegex(self.line(rate=0.0), r"^\[strata\] reading the prompt: 1,000 tokens, \d+ s so far$")
+
+
 class VisionArgs(unittest.TestCase):
     """#767: vision.min_tokens reaches the encoder as --min-tokens (mtmd's image_min_tokens)."""
 
