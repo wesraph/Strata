@@ -12091,10 +12091,6 @@ int main(int argc, char** argv) {
             pipe_commit_q[(size_t) k].clear();
             return true;
         };
-        auto pipe_commits_pending = [&] {
-            for (const auto& q : pipe_commit_q) if (!q.empty()) return true;
-            return false;
-        };
         auto flush_pipe_commits = [&]() -> bool {
             for (int k = 0; k < n_pipe; ++k)
                 if (!run_pipe_commits(k)) return false;
