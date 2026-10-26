@@ -9689,15 +9689,21 @@ int main(int argc, char** argv) {
         // cached prefix never reaches past it - a page the conversation writes is never shared), `cells`
         // the whole need.  Walks the chained keys, maps the cached prefix, allocates the rest.  false: the
         // pool cannot hold it even after eviction (the caller refuses the request; the old mapping stays).
+        // The walk is bounded by `resume` - the first cell the conversation READS - because a mapped page
+        // must never be one the conversation writes (it would rewrite shared bytes).  A brand-new
+        // conversation (resume 0) therefore re-prefills even a fully cached prefix: the GDN layers are
+        // recurrent, so the running state at the branch point exists only through a checkpoint (the
+        // conversation cache's) or a full read; the K/V pages alone cannot reconstruct it.
         auto kvsh_admit = [&](size_t si, const auto& ids, int64_t resume, int64_t cells) -> bool {
             if (!kvsh) return true;
             kvsh_release(si);
             KvShareState::Session& s = kvshs.sess[si];
             const int64_t limit = std::min<int64_t>({resume, (int64_t) ids.size(), cells}) / kvsh_ps;
             uint64_t key = 0;
-            std::array<int32_t, 4> toks{};   // the page's tokens (ids may be int64; the keys are int32)
+            std::array<int32_t, strata::core::PageCache::page_cells> toks{};   // one page's ids (ids may be int64)
             for (int64_t p = 0; p < limit; ++p) {
-                for (int i = 0; i < kvsh_ps; ++i) toks[(size_t) i] = (int32_t) ids[(size_t) p * kvsh_ps + (size_t) i];
+                for (int i = 0; i < kvsh_ps && i < (int) toks.size(); ++i)
+                    toks[(size_t) i] = (int32_t) ids[(size_t) p * kvsh_ps + (size_t) i];
                 key = strata::core::PageCache::page_key(key, toks.data(), (int) kvsh_ps);
                 const int32_t page = kv_pages.lookup(key, toks.data(), (int) kvsh_ps);
                 if (page < 0) break;   // the first miss ends the prefix: later pages cannot match either
@@ -9725,9 +9731,10 @@ int main(int argc, char** argv) {
             KvShareState::Session& s = kvshs.sess[si];
             const int64_t pages_filled = (int64_t) (s.cached.size() + s.own.size());
             uint64_t key = 0;
-            std::array<int32_t, 4> toks{};
+            std::array<int32_t, strata::core::PageCache::page_cells> toks{};
             for (int64_t p = 0; p < pages_filled && (p + 1) * kvsh_ps <= (int64_t) ids.size(); ++p) {
-                for (int i = 0; i < kvsh_ps; ++i) toks[(size_t) i] = (int32_t) ids[(size_t) p * kvsh_ps + (size_t) i];
+                for (int i = 0; i < kvsh_ps && i < (int) toks.size(); ++i)
+                    toks[(size_t) i] = (int32_t) ids[(size_t) p * kvsh_ps + (size_t) i];
                 key = strata::core::PageCache::page_key(key, toks.data(), (int) kvsh_ps);
                 if (p < (int64_t) s.cached.size()) continue;   // already keyed by whoever filled it
                 kv_pages.register_page(s.own[(size_t) (p - (int64_t) s.cached.size())], key, toks.data(), (int) kvsh_ps);
@@ -13524,7 +13531,11 @@ int main(int argc, char** argv) {
                 // --kv-share: the mapping this REQUEST's conversation will carry, decided once here - the
                 // restores below and the read that follows must never disagree about it (a donor prefix that
                 // tokenizes differently at its boundary is read privately, correctly)
-                kvsh_decide_main(ids, parked.tokens, n);
+                if (!kvsh_decide_main(ids, parked.tokens, n)) {
+                    std::printf("ERR the K/V pool has no room for this conversation (%lld of %lld pages free)\n",
+                                (long long) kv_pages.free_count(), (long long) kv_pages.total());
+                    continue;
+                }
                 const int64_t kvsh_skip = (int64_t) kvshs.sess[0].cached.size();
                 if (donor == nullptr ||
                     strata::core::conversation_snapshot_restore_prefix(*donor, parked.tokens, ss, g,
@@ -13554,7 +13565,11 @@ int main(int argc, char** argv) {
             }
             if (incoming) {
                 const auto t0 = Clock::now();
-                kvsh_decide_main(ids, parked.tokens, n);
+                if (!kvsh_decide_main(ids, parked.tokens, n)) {
+                    std::printf("ERR the K/V pool has no room for this conversation (%lld of %lld pages free)\n",
+                                (long long) kv_pages.free_count(), (long long) kv_pages.total());
+                    continue;
+                }
                 const int64_t kvsh_skip = (int64_t) kvshs.sess[0].cached.size();
                 if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
                         use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err,
@@ -14744,7 +14759,7 @@ int main(int argc, char** argv) {
                     std::printf("ERR the K/V pool has no room for this conversation: %lld of %lld pages free "
                                 "(shorten it, or raise --kv-share)\n", (long long) kv_pages.free_count(),
                                 (long long) kv_pages.total());
-                    return 1;
+                    continue;   // this request only, as the context-window refusal above
                 }
                 if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr) {
                     const auto& st0 = ss.qsa_states[ss.qsa_primary()];

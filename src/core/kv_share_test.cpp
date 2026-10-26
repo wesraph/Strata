@@ -101,6 +101,18 @@ int main() {
         wrong[3] = -1;
         uint64_t forged = PageCache::page_key(chain_key(4), wrong.data(), 4);
         check(cache.lookup(forged, wrong.data(), 4) == -1, "a key with other tokens is a miss");
+        {
+            // the collision itself: the map HOLDS a key whose stored tokens differ from the query's -
+            // verification (not the hash) must refuse it
+            PageCache cc(2);
+            std::vector<int32_t> one, t1 = {1, 2, 3, 4}, t2 = {9, 9, 9, 9};
+            if (cc.take(1, one)) {
+                const uint64_t k1 = PageCache::page_key(0, t1.data(), 4);
+                check(cc.register_page(one[0], k1, t1.data(), 4), "register the honest page");
+                check(cc.lookup(k1, t1.data(), 4) == one[0], "the honest key hits");
+                check(cc.lookup(k1, t2.data(), 4) == -1, "the same key with other tokens is refused");
+            }
+        }
         // pins protect against eviction; unpin lets LRU take it
         cache.pin(got[0]);
         std::vector<int32_t> more;
