@@ -77,6 +77,41 @@ int main() {
         check(alloc.take(600, again) && again == a_ids, "the released run comes back");
     }
 
+    // ---- the prefix cache: chained keys, verification, pins, LRU eviction ----
+    {
+        PageCache cache(10);
+        std::vector<int32_t> tok;
+        for (int i = 0; i < 10 * 4; ++i) tok.push_back(100 + i);   // 10 pages of tokens
+        auto chain_key = [&](int pages) {
+            uint64_t k = 0;
+            for (int p = 0; p < pages; ++p) k = PageCache::page_key(k, &tok[(size_t) p * 4], 4);
+            return k;
+        };
+        std::vector<int32_t> got;
+        check(cache.take(6, got), "fill six pages of a conversation");
+        for (int p = 0; p < 6; ++p)
+            check(cache.register_page(got[(size_t) p], chain_key(p + 1), &tok[(size_t) p * 4], 4), "register a page");
+        check(cache.cached_count() == 6, "six pages carry keys");
+        // a second conversation with the same first four pages: pages 0-3 hit, page 4 misses
+        int32_t hit = cache.lookup(chain_key(4), &tok[3 * 4], 4);
+        check(hit == got[3], "the chained key of page 3 finds its page");
+        check(cache.lookup(chain_key(5), &tok[4 * 4], 4) == got[4], "page 5's key finds its own page");
+        // token verification: the right key but wrong tokens is a miss
+        std::vector<int32_t> wrong(&tok[4 * 4], &tok[4 * 4] + 4);
+        wrong[3] = -1;
+        uint64_t forged = PageCache::page_key(chain_key(4), wrong.data(), 4);
+        check(cache.lookup(forged, wrong.data(), 4) == -1, "a key with other tokens is a miss");
+        // pins protect against eviction; unpin lets LRU take it
+        cache.pin(got[0]);
+        std::vector<int32_t> more;
+        while (cache.take(1, more)) {}   // exhaust the pool: evicts everything unpinned
+        check(cache.free_count() == 0 && cache.cached_count() >= 1, "the pinned page survived");
+        check(cache.lookup(chain_key(1), &tok[0], 4) == got[0], "the pinned page is still a hit");
+        cache.unpin(got[0]);
+        std::vector<int32_t> last;
+        check(cache.take(1, last) && last[0] == got[0], "unpinned, the page is evictable again");
+    }
+
     // ---- the carve: one flat pool, two sessions ----
     qsa_set_kv_share(2048 * page_cells);   // the pool in tokens: 2048 pages, one conversation's whole context
     const int64_t pool_pages = 2048;

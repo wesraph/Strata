@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <unordered_map>
 #include <set>
 #include <vector>
 
@@ -59,6 +60,133 @@ public:
 private:
     std::set<int32_t> free_;
     int64_t total_ = 0;
+};
+
+/// THE PREFIX CACHE over the pool - vLLM's hash-chained blocks, in pages.  A page's key is the chained
+/// hash of every token up to and including it, so a key hit means the WHOLE PREFIX to that page matches.
+/// Keys are verified against the tokens on every hit (a hash collision is impossible to act on), pages a
+/// session maps are pinned (refcounted), and pressure evicts the least recently used cached pages first.
+/// A page enters the cache when a conversation that filled it releases it; it leaves by eviction.
+class PageCache {
+public:
+    static constexpr int page_cells = 4;   // the QSA page granule (qsa_real_shapes().page_size)
+    PageCache() = default;
+    explicit PageCache(int64_t pages) { init(pages); }
+
+    void init(int64_t pages) {
+        alloc_.init(pages);
+        key_to_page_.clear();
+        page_key_.assign((size_t) pages, 0);
+        page_tokens_.assign((size_t) pages * page_cells, 0);
+        page_refs_.assign((size_t) pages, 0);
+        page_stamp_.assign((size_t) pages, 0);
+        stamp_ = 0;
+    }
+
+    /// The chained key of page p over the tokens: fnv(parent-key, the page's tokens).  `tokens` holds at
+    /// least p*page_size + page_size entries (the caller full-pages only).
+    static uint64_t page_key(uint64_t parent, const int32_t* tokens, int page_size) {
+        uint64_t h = parent == 0 ? 1469598103934665603ull : parent;
+        for (int i = 0; i < page_size; ++i) {
+            h ^= (uint64_t) (uint32_t) tokens[i];
+            h *= 1099511628211ull;
+        }
+        return h ? h : 1;   // 0 marks "no key" on a page
+    }
+
+    /// A cached page for `key`, when its tokens really match (`tokens` = that page's ids).  Pinned on a
+    /// hit: the page cannot be evicted until `unpin` (the mapping session releases it).
+    int32_t lookup(uint64_t key, const int32_t* tokens, int page_size) {
+        auto it = key_to_page_.find(key);
+        if (it == key_to_page_.end()) return -1;
+        const int32_t page = it->second;
+        if (page < 0 || (size_t) page >= page_key_.size()) return -1;
+        for (int i = 0; i < page_cells; ++i)
+            if (page_tokens_[(size_t) page * page_cells + (size_t) i] != tokens[i]) return -1;   // collision or stale: a miss
+        page_stamp_[(size_t) page] = ++stamp_;
+        return page;
+    }
+
+    void pin(int32_t id) {
+        if (id >= 0 && (size_t) id < page_key_.size()) page_refs_[(size_t) id] += 1;
+    }
+
+    void unpin(int32_t id) {
+        if (id >= 0 && (size_t) id < page_key_.size() && page_refs_[(size_t) id] > 0) page_refs_[(size_t) id] -= 1;
+    }
+
+    /// Remember page `id` as holding the tokens whose chained key is `key` (a conversation filled it).
+    /// The tokens are kept for verification on every later hit.  Returns false when the page is already
+    /// registered under another key (one key per page: the older registration stands).
+    bool register_page(int32_t id, uint64_t key, const int32_t* tokens, int page_size) {
+        if (id < 0 || (size_t) id >= page_key_.size() || key == 0) return false;
+        if (page_key_[(size_t) id] != 0 && page_key_[(size_t) id] != key) return false;
+        if (page_key_[(size_t) id] != 0) key_to_page_.erase(page_key_[(size_t) id]);
+        page_key_[(size_t) id] = key;
+        for (int i = 0; i < page_cells; ++i)
+            page_tokens_[(size_t) page_cells * (size_t) id + (size_t) i] = tokens[i];
+        key_to_page_[key] = id;
+        page_stamp_[(size_t) id] = ++stamp_;
+        return true;
+    }
+
+    /// Pages nobody maps go back to the cache (their keys survive); the caller keeps ownership semantics.
+    void touch(int32_t id) {
+        if (id >= 0 && (size_t) id < page_key_.size()) page_stamp_[(size_t) id] = ++stamp_;
+    }
+
+    bool take(int64_t n, std::vector<int32_t>& out) {
+        while (alloc_.free_count() < n && evict_one()) {}
+        return alloc_.take(n, out);
+    }
+
+    /// A session's page goes back: pinned pages lose their pin, hashed pages stay cached (evictable),
+    /// the rest free outright.
+    void release_page(int32_t id) {
+        if (id < 0 || (size_t) id >= page_key_.size()) { alloc_.release({id}); return; }
+        unpin(id);
+        if (page_key_[(size_t) id] == 0 || page_refs_[(size_t) id] > 0) {
+            if (page_key_[(size_t) id] == 0) alloc_.release({id});
+            return;   // still pinned elsewhere, or cached: stays resident
+        }
+        // hashed and unreferenced: the page stays resident with its key - reusable, and evictable
+    }
+
+    /// Drop a page's key and free it (the content is gone or being rewritten).
+    void forget_page(int32_t id) {
+        if (id < 0 || (size_t) id >= page_key_.size()) return;
+        if (page_key_[(size_t) id] != 0) key_to_page_.erase(page_key_[(size_t) id]);
+        page_key_[(size_t) id] = 0;
+        page_refs_[(size_t) id] = 0;
+        alloc_.release({id});
+    }
+
+    /// Evict the least recently used cached page nobody maps.  false: nothing evictable.
+    bool evict_one() {
+        int64_t best = -1;
+        for (int32_t id = 0; (size_t) id < page_key_.size(); ++id) {
+            if (page_key_[(size_t) id] == 0 || page_refs_[(size_t) id] > 0) continue;
+            if (best < 0 || page_stamp_[(size_t) id] < page_stamp_[(size_t) best]) best = id;
+        }
+        if (best < 0) return false;
+        key_to_page_.erase(page_key_[(size_t) best]);
+        page_key_[(size_t) best] = 0;
+        alloc_.release({(int32_t) best});
+        return true;
+    }
+
+    int64_t free_count() const { return alloc_.free_count(); }
+    int64_t total() const { return alloc_.total(); }
+    int64_t cached_count() const { return (int64_t) key_to_page_.size(); }
+
+private:
+    PageAlloc alloc_;
+    std::unordered_map<uint64_t, int32_t> key_to_page_;
+    std::vector<uint64_t> page_key_;
+    std::vector<int32_t> page_tokens_;   // 4 ids per page: what every hit is verified against
+    std::vector<int32_t> page_refs_;
+    std::vector<int64_t> page_stamp_;
+    int64_t stamp_ = 0;
 };
 
 }  // namespace strata::core
