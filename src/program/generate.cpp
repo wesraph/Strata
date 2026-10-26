@@ -14732,13 +14732,26 @@ int main(int argc, char** argv) {
                     const auto& st0 = ss.qsa_states[ss.qsa_primary()];
                     std::vector<int32_t> tb((size_t) st0.n_pages);
                     cudaMemcpy(tb.data(), st0.page_table, tb.size() * 4, cudaMemcpyDeviceToHost);
-                    std::fprintf(stderr, "kvshare-dbg: req n=%lld resume=%lld entry=%lldpages ready=%d match=%d "
-                                         "pfx=%lld table[0]=%d table[31]=%d table[32]=%d table[33]=%d share_first=%lld\n",
+                std::fprintf(stderr, "kvshare-dbg: req n=%lld resume=%lld entry=%lldpages ready=%d match=%d "
+                                     "pfx=%lld table[0]=%d table[31]=%d table[32]=%d table[33]=%d share_first=%lld\n",
                                  (long long) n, (long long) read_from, (long long) kvshs.pages, kvshs.ready ? 1 : 0,
                                  kvsh_entry_match(ids) ? 1 : 0, (long long) (kvshs.mapped ? kvshs.pages : 0),
                                  tb.empty() ? -99 : tb[0], tb.size() > 31 ? tb[31] : -99,
                                  tb.size() > 32 ? tb[32] : -99, tb.size() > 33 ? tb[33] : -99,
                                  (long long) st0.share_first);
+                if (kvshs.ready) {   // the pre-read state of the branch pages, to pair with kvshare-hash below
+                    const size_t pk = (size_t) strata::core::qsa_shapes(g).n_head_kv * 4 *
+                                      strata::core::qsa_shapes(g).head_dim;
+                    std::vector<int8_t> buf(pk);
+                    unsigned long long h = 1469598103934665603ull;
+                    if (tb.size() > 31 && tb[31] >= 0 &&
+                        cudaMemcpy(buf.data(), st0.k_q + (size_t) tb[31] * pk, pk, cudaMemcpyDeviceToHost) == cudaSuccess)
+                        for (int8_t b : buf) { h ^= (unsigned long long) (uint8_t) b; h *= 1099511628211ull; }
+                    else h = 0xc0daULL;
+                    std::fprintf(stderr, "kvshare-pre: n=%lld dev_t31=%d host_t31=%d p31=%llx\n",
+                                 (long long) n, tb.size() > 31 ? tb[31] : -99,
+                                 tb.size() > 31 ? kvshs.table[31] : -99, h);
+                }
                 }
                 const int64_t kvsh_cap = strata::core::qsa_state_share_capacity(
                     ss.qsa_states[ss.qsa_primary()], g, kvshs.mapped ? kvshs.pages : 0);
@@ -14849,6 +14862,35 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata serve: --kv-share: a %lld-token prefix is ready to share "
                                      "(%lld pages per layer)\n", (long long) kvshs.tokens.size(),
                              (long long) kvshs.pages);
+            }
+            if (kvsh && kvshs.ready && std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr) {
+                // per-page K-code hashes through the CURRENT mapping, plus the indexer rows: shared pages must
+                // hash identically for every request (nobody rewrites them), and the good and the bad branch
+                // must agree on both the shared pages and the pooled rows of the shared prefix
+                const auto& st0 = ss.qsa_states[ss.qsa_primary()];
+                const auto ssh = strata::core::qsa_shapes(g);
+                const size_t page_k = (size_t) ssh.n_head_kv * ssh.page_size * ssh.head_dim;
+                auto page_hash = [&](int64_t p) -> unsigned long long {
+                    if (p < 0 || p >= (int64_t) kvshs.table.size()) return 0xdeadbeefULL;
+                    const int64_t phys = kvshs.table[(size_t) p];
+                    if (phys < 0) return 0xffffULL;
+                    std::vector<int8_t> buf(page_k);
+                    if (cudaMemcpy(buf.data(), st0.k_q + (size_t) phys * page_k, page_k,
+                                   cudaMemcpyDeviceToHost) != cudaSuccess) return 0xc0daULL;
+                    unsigned long long h = 1469598103934665603ull;
+                    for (int8_t b : buf) { h ^= (unsigned long long) (uint8_t) b; h *= 1099511628211ull; }
+                    return h;
+                };
+                const int64_t rows = kvshs.pages + 1;
+                std::vector<float> pooled((size_t) rows * ssh.idx_dim);
+                unsigned long long ph = 1469598103934665603ull;
+                if (cudaMemcpy(pooled.data(), st0.idx_pooled, pooled.size() * 4,
+                               cudaMemcpyDeviceToHost) == cudaSuccess)
+                    for (float f : pooled) { uint32_t u; std::memcpy(&u, &f, 4); ph ^= u; ph *= 1099511628211ull; }
+                else ph = 0xc0daULL;
+                std::fprintf(stderr, "kvshare-hash: n=%lld p0=%llx p1=%llx p30=%llx p31=%llx p32=%llx pooled=%llx\n",
+                             (long long) n, page_hash(0), page_hash(1), page_hash(30), page_hash(31),
+                             page_hash(32), ph);
             }
             if (!refill(err)) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
