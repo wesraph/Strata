@@ -812,6 +812,8 @@ SharePoolLayout qsa_share_pool_layout(const ModelGeometry& g, int64_t pool_pages
         out.arr_bytes[(size_t) i] = (out.arr_tight[(size_t) i] + a - 1) / a * a;
         out.stride += out.arr_bytes[(size_t) i];
     }
+    out.pool_pages_ = pool_pages;
+    out.pool_pages_ = pool_pages;
     out.pages_per_extent = a > 256 && total_per_page > 0 ? (int64_t) (a / total_per_page) : 0;
     out.chunks_per_layer = a > 256 ? (int64_t) (out.stride / a) : 0;
     if (out.pages_per_extent == 0 && a > 256) out.pages_per_extent = 1;   // an array page too big for a chunk: degenerate

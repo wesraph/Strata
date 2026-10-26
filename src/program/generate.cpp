@@ -5289,9 +5289,11 @@ int main(int argc, char** argv) {
             // conversations need it and leaves when extents empty - the expert cache opens into the VRAM
             // the pool no longer takes upfront.  Without VMM (HIP, or the driver refuses) the pool is one
             // plain allocation, as before.
-            // STRATA_KV_ELASTIC=1 opts in: the extent-chunk mapping is not yet proven (an illegal access in
-            // prefill under the live rig, three times, root cause not yet isolated); the plain always-mapped
-            // pool is the default until the mapping lives in core behind a unit test
+            // The mapping lives in SharePoolLayout::extent_span behind a unit test that reproduces the
+            // fault class, and the carve's stride bug is fixed and mutant-proven - yet the LIVE engine
+            // still faults in prefill with elastic on, so it stays opt-in until the remaining live-only
+            // ingredient (layer split, the floor's chunk refcounts, or the callback interplay) is isolated
+            // the same way.  STRATA_KV_ELASTIC=1 opts in; the plain always-mapped pool is the default.
             const bool kvsh_vmm = strata::core::vmm_available() && std::getenv("STRATA_KV_ELASTIC") != nullptr;
             const uint64_t G = kvsh_vmm ? strata::core::vmm_granularity() : 0;
             kvsh_align = kvsh_vmm ? G : 256;

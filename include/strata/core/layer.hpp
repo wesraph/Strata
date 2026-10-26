@@ -311,6 +311,18 @@ struct SharePoolLayout {
     uint64_t stride = 0;                   ///< the layer's whole stride (sum of the padded arrays)
     int64_t pages_per_extent = 0;          ///< 0 at plain alignment (one extent: everything mapped at once)
     int64_t chunks_per_layer = 0;          ///< stride / align, when align is the granularity
+    int64_t pool_pages_ = 0;               ///< what the layout was built for
+
+    /// One extent's chunk span inside array `arr` of a layer's slice: [lo, hi] inclusive, clamped.
+    /// `align` the layout's; `ppe` pages per extent; `chunks` the whole range's chunk count.
+    std::pair<int64_t, int64_t> extent_span(uint64_t align, size_t arr, int64_t e, int64_t ppe,
+                                             int64_t chunks) const {
+        const uint64_t per = pool_pages_ > 0 ? arr_tight[arr] / (uint64_t) pool_pages_ : 0;
+        const uint64_t off = arr_off[arr] + (uint64_t) e * (uint64_t) ppe * per;
+        const uint64_t end = off + (uint64_t) ppe * per - 1;
+        return { std::max<int64_t>(0, (int64_t) (off / align)),
+                 std::min<int64_t>((int64_t) (end / align), chunks - 1) };
+    }
 };
 SharePoolLayout qsa_share_pool_layout(const ModelGeometry& g, int64_t pool_pages, uint64_t align = 256);
 

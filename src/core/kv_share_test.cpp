@@ -312,6 +312,62 @@ int main() {
     sync();
     check(page_is(b.k_pool, (int64_t) tb[0], k_page, 0xEE), "zero left the pools alone");
 
+    // ---- the elastic arena: whole layers carved over extents of on-demand physical memory ----
+    if (!strata::core::vmm_available()) {
+        std::fprintf(stderr, "kv-share: elastic arena section skipped (no VMM)\n");
+    } else {
+        // the hybrid K8V4 layout: three arrays, a stride no power of two aligns - the geometry whose
+        // 256-aligned carve diverges from the G-aligned one (f16's 16 MiB stride hides the difference)
+        strata::core::qsa_set_kv_hybrid(true);
+        const uint64_t G = strata::core::vmm_granularity();
+        const int64_t epool = 2048;
+        const strata::core::SharePoolLayout lay = strata::core::qsa_share_pool_layout(g, epool, G);
+        const int64_t ppe = lay.pages_per_extent;
+        const int64_t q_n = g.n_qsa_layers();
+        strata::core::VmmRange range;
+        check(range.reserve(strata::core::qsa_share_arena_bytes(g, epool, q_n, G)), "the elastic arena reserves");
+        const int64_t chunks = range.chunks();
+        // map extent 0 only: the rest of every layer's slice is a hole, and a carve at the wrong
+        // stride shifts a layer's pools into it - the probe below faults where a contiguous map could not tell
+        const int64_t cpl = lay.chunks_per_layer;
+        for (int64_t e : {0})
+            for (int64_t j = 0; j < q_n; ++j)
+                for (int64_t a = 0; a < lay.arrays; ++a) {
+                    const auto [lo, hi] = lay.extent_span(G, (size_t) a, e, ppe, cpl);
+                    check(range.map_range(j * cpl + lo, j * cpl + hi + 1, [] { return (strata::core::VmmChunk) 0; }),
+                          "an extent's chunks map");
+                }
+        // the WHOLE session carve over the range - the stride this uses must match the layout's
+        strata::core::SessionState es;
+        const uint64_t esb = strata::core::session_bytes(g, max_cells, 8, 0, -1, true);
+        void* ebuf = nullptr;
+        cuda_check(cudaMalloc(&ebuf, esb));
+        strata::core::QsaShareArena eshare{range.base(), epool, G};
+        check(strata::core::session_init(g, max_cells, 8, ebuf, es, 0, -1, &eshare) > 0, "the elastic session carves");
+        sync();
+        // write and read back through every layer's pools, at pages that straddle extent boundaries:
+        // a layer carved at the wrong stride points outside its slice's mapped chunks
+        const size_t pk2 = (size_t) s.n_head_kv * page_cells * s.head_dim;   // the hybrid K codes: one page, int8
+        const int64_t probe_pages[] = { 0, ppe - 1 };   // extent 0 only: everything past it is the hole
+        bool all_ok = true;
+        for (int64_t j = 0; j < es.qsa_alloc; ++j) {
+            const auto& st = es.qsa_states[es.qsa_ord0 + j];
+            if (st.k_q == nullptr) continue;   // the hybrid K codes are the probe target
+            for (int64_t p : probe_pages)
+                cuda_check(cudaMemset((uint8_t*) st.k_q + (size_t) p * pk2, (uint8_t) (j * 8 + p), pk2));
+        }
+        sync();
+        for (int64_t j = 0; j < es.qsa_alloc && all_ok; ++j) {
+            const auto& st = es.qsa_states[es.qsa_ord0 + j];
+            if (st.k_q == nullptr) continue;
+            for (int64_t p : probe_pages)
+                if (!page_is(st.k_q, p, pk2, (uint8_t) (j * 8 + p))) all_ok = false;
+        }
+        check(all_ok, "every layer's pool writes and reads back across its extents");
+        cudaFree(ebuf);
+        strata::core::qsa_set_kv_hybrid(false);
+    }
+
     // ---- off: byte-identical plain carve, identity table ----
     QsaState e{};
     check(qsa_state_init(g, max_cells, buf(plain_state_bytes), e, nullptr, 0, nullptr) > 0, "plain init");
