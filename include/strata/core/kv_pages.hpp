@@ -12,7 +12,9 @@
 
 #include <cstdint>
 #include <unordered_map>
+#include <queue>
 #include <set>
+#include <utility>
 #include <vector>
 
 namespace strata::core {
@@ -96,7 +98,7 @@ public:
 
     /// A cached page for `key`, when its tokens really match (`tokens` = that page's ids).  Pinned on a
     /// hit: the page cannot be evicted until `unpin` (the mapping session releases it).
-    int32_t lookup(uint64_t key, const int32_t* tokens, int page_size) {
+    int32_t lookup(uint64_t key, const int32_t* tokens) {
         auto it = key_to_page_.find(key);
         if (it == key_to_page_.end()) return -1;
         const int32_t page = it->second;
@@ -112,13 +114,15 @@ public:
     }
 
     void unpin(int32_t id) {
-        if (id >= 0 && (size_t) id < page_key_.size() && page_refs_[(size_t) id] > 0) page_refs_[(size_t) id] -= 1;
+        if (id < 0 || (size_t) id >= page_key_.size() || page_refs_[(size_t) id] <= 0) return;
+        if (--page_refs_[(size_t) id] == 0 && page_key_[(size_t) id] != 0)
+            touch(id);   // its heap entries were skipped while pinned: re-enter the eviction order
     }
 
     /// Remember page `id` as holding the tokens whose chained key is `key` (a conversation filled it).
     /// The tokens are kept for verification on every later hit.  Returns false when the page is already
     /// registered under another key (one key per page: the older registration stands).
-    bool register_page(int32_t id, uint64_t key, const int32_t* tokens, int page_size) {
+    bool register_page(int32_t id, uint64_t key, const int32_t* tokens) {
         if (id < 0 || (size_t) id >= page_key_.size() || key == 0) return false;
         if (page_key_[(size_t) id] != 0 && page_key_[(size_t) id] != key) return false;
         if (page_key_[(size_t) id] != 0) key_to_page_.erase(page_key_[(size_t) id]);
@@ -126,13 +130,15 @@ public:
         for (int i = 0; i < page_cells; ++i)
             page_tokens_[(size_t) page_cells * (size_t) id + (size_t) i] = tokens[i];
         key_to_page_[key] = id;
-        page_stamp_[(size_t) id] = ++stamp_;
+        touch(id);
         return true;
     }
 
-    /// Pages nobody maps go back to the cache (their keys survive); the caller keeps ownership semantics.
+    /// Refresh recency (every hit and re-registration); the eviction heap reads the stamp lazily.
     void touch(int32_t id) {
-        if (id >= 0 && (size_t) id < page_key_.size()) page_stamp_[(size_t) id] = ++stamp_;
+        if (id < 0 || (size_t) id >= page_key_.size()) return;
+        page_stamp_[(size_t) id] = ++stamp_;
+        heap_.emplace(page_stamp_[(size_t) id], id);
     }
 
     bool take(int64_t n, std::vector<int32_t>& out) {
@@ -161,18 +167,21 @@ public:
         alloc_.release({id});
     }
 
-    /// Evict the least recently used cached page nobody maps.  false: nothing evictable.
+    /// Evict the least recently used cached page nobody maps.  false: nothing evictable.  The heap is
+    /// lazy: stale entries (touched, re-keyed, freed since) are skipped until a live one surfaces.
     bool evict_one() {
-        int64_t best = -1;
-        for (int32_t id = 0; (size_t) id < page_key_.size(); ++id) {
-            if (page_key_[(size_t) id] == 0 || page_refs_[(size_t) id] > 0) continue;
-            if (best < 0 || page_stamp_[(size_t) id] < page_stamp_[(size_t) best]) best = id;
+        while (!heap_.empty()) {
+            const auto [stamp, id] = heap_.top();
+            heap_.pop();
+            if (id < 0 || (size_t) id >= page_key_.size()) continue;
+            if (page_key_[(size_t) id] == 0 || page_refs_[(size_t) id] > 0) continue;   // freed or pinned: stale
+            if (page_stamp_[(size_t) id] != stamp) continue;   // touched later: a fresher entry is in the heap
+            key_to_page_.erase(page_key_[(size_t) id]);
+            page_key_[(size_t) id] = 0;
+            alloc_.release({id});
+            return true;
         }
-        if (best < 0) return false;
-        key_to_page_.erase(page_key_[(size_t) best]);
-        page_key_[(size_t) best] = 0;
-        alloc_.release({(int32_t) best});
-        return true;
+        return false;
     }
 
     int64_t free_count() const { return alloc_.free_count(); }
@@ -186,6 +195,8 @@ private:
     std::vector<int32_t> page_tokens_;   // 4 ids per page: what every hit is verified against
     std::vector<int32_t> page_refs_;
     std::vector<int64_t> page_stamp_;
+    using HeapEntry = std::pair<int64_t, int32_t>;   // (stamp, page), min-stamp first
+    std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap_;
     int64_t stamp_ = 0;
 };
 
