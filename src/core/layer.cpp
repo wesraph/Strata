@@ -774,37 +774,24 @@ int64_t qsa_kv_resident() { return g_kv_resident; }
 int64_t qsa_kv_resident_min() { return 20480; }
 uint64_t qsa_kv_host_bytes() { return g_kv_host_bytes; }
 
+/// The configured POOL in pages (0: off).  The pool is the whole per-layer allocation every session draws
+/// from; it is not a reserved region, so there is no shared-prefix cap - only the free-page count.
 int64_t qsa_kv_share_pages(const ModelGeometry& g, int64_t max_cells) {
     if (g_kv_share <= 0) return 0;
     const QsaShapes s = qsa_shapes(g);
-    const int64_t pages = (max_cells + s.page_size - 1) / s.page_size;
-    // the private run must still hold the great majority of the context: at least one page, and the shared
-    // front at most half the pool (a shared prefix longer than that buys nothing - the slots it serves each
-    // need room for their own suffixes beside it)
-    const int64_t shared = (g_kv_share + s.page_size - 1) / s.page_size;
-    if (shared >= pages || shared * 2 > pages) return 0;
-    return shared;
+    (void) max_cells;
+    return (g_kv_share + s.page_size - 1) / s.page_size;
 }
 
-uint64_t qsa_share_layer_stride(const ModelGeometry& g, int64_t max_cells, int64_t n_sessions) {
+uint64_t qsa_share_layer_stride(const ModelGeometry& g, int64_t pool_pages) {
     const QsaShapes s = qsa_shapes(g);
-    const int64_t shared = qsa_kv_share_pages(g, max_cells);
-    const int64_t priv = (max_cells + s.page_size - 1) / s.page_size - shared;
-    return kv_pool_bytes(s, shared + n_sessions * priv, g_kv_hybrid, g_kv_int8 || g_kv_hybrid);
+    return kv_pool_bytes(s, pool_pages, g_kv_hybrid, g_kv_int8 || g_kv_hybrid);
 }
 
-uint64_t qsa_share_arena_bytes(const ModelGeometry& g, int64_t max_cells, int64_t n_qsa_layers, int64_t n_sessions) {
-    const uint64_t stride = qsa_share_layer_stride(g, max_cells, n_sessions);
+uint64_t qsa_share_arena_bytes(const ModelGeometry& g, int64_t pool_pages, int64_t n_qsa_layers) {
+    const uint64_t stride = qsa_share_layer_stride(g, pool_pages);
     // aligned per layer so a state's pools never straddle another layer's run
     return ((stride + 255ull) / 256ull * 256ull) * (uint64_t) n_qsa_layers;
-}
-
-int64_t qsa_state_share_capacity(const QsaState& st, const ModelGeometry& g, int64_t pfx_pages) {
-    const QsaShapes s = qsa_shapes(g);
-    if (st.share_first < 0 || st.share_pages <= 0) return st.max_cells;
-    const int64_t priv = st.n_pages - st.share_pages;
-    const int64_t pfx = pfx_pages < 0 ? 0 : (pfx_pages > st.share_pages ? st.share_pages : pfx_pages);
-    return (pfx + priv) * s.page_size;
 }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
@@ -845,21 +832,18 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.kv_rot = st.kv_q4 || (st.kv_int8 && g_kv_int8_rot);   // K8V4 rotates only V (below)
     st.kv_mode = p.mode;
     st.n_slots = p.slots;
-    // --kv-share: this state's pools come from the shared arena.  The arena's layout for the layer is the
-    // same run sequence an unshared carve takes (the Cursor below mirrors it byte for byte), over
-    // `shared + n_sessions * private` pages instead of `pages`, and the page table starts as the PRIVATE
-    // mapping (the shared front at its own ids only once a conversation branches from it).
+    // --kv-share: this state's pools come from the shared arena - a FLAT pool of `pool_pages` pages with
+    // no internal structure.  The page table starts EMPTY (-1: nothing mapped); the serve loop's allocator
+    // fills it as the conversation grows, so the mapping is entirely the caller's.
     Cursor pool{(uint8_t*) nullptr};
     int64_t pool_pages = p.slots;
     if (share != nullptr) {
-        const int64_t shared = qsa_kv_share_pages(g, max_cells);
-        if (p.mode != 0 || g_kv_elastic || shared <= 0 || share->base == nullptr || share->n_sessions <= 0 ||
-            share->session < 0 || share->session >= share->n_sessions)
-            return 0;   // the caller sizes with the same globals; a mismatch here is a bug, not a fallback
-        const int64_t priv = pages - shared;
-        pool_pages = shared + share->n_sessions * priv;
-        st.share_pages = shared;
-        st.share_first = shared + share->session * priv;
+        const int64_t pages_of_context = pages;
+        if (p.mode != 0 || g_kv_elastic || share->base == nullptr || share->pool_pages < pages_of_context)
+            return 0;   // one conversation's whole context must fit the pool; the caller sizes with these globals
+        pool_pages = share->pool_pages;
+        st.share_pages = 0;
+        st.share_first = 0;   // >= 0 marks the dynamic carve (zero skips the pools; pages are reused as-is)
         st.n_slots = pool_pages;
         pool = Cursor{(uint8_t*) share->base};
     }
@@ -1011,9 +995,10 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     }
     // the page table starts as the IDENTITY, which is the simplest legal mapping and what a caller that does
     // not page at all wants; a streamed state starts with nothing resident, a ring at `block % n_slots`.
-    // A shared state starts as the PRIVATE mapping - no shared prefix in use yet, its own cells at its own run.
+    // A shared state starts EMPTY (-1 everywhere): the allocator maps pages in as the conversation grows.
     if (p.mode == 0 && share != nullptr) {
-        qsa_state_share_table(st, g, 0, nullptr, nullptr);
+        std::vector<int32_t> tab((size_t) pages, -1);
+        cudaMemcpy(st.page_table, tab.data(), tab.size() * 4, cudaMemcpyHostToDevice);
     } else if (p.mode == 0) {
         std::vector<int32_t> tab((size_t) pages);
         for (int64_t i = 0; i < pages; ++i) tab[(size_t) i] = (int32_t) i;
@@ -1027,51 +1012,19 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     return c.used;
 }
 
-void qsa_state_share_table(const QsaState& st, const ModelGeometry& g, int64_t pfx_pages,
-                           int32_t* host_table, void* stream) {
-    if (st.share_first < 0 || st.share_pages <= 0) return;   // not a shared state; the table is the caller's
-    const int64_t priv = st.n_pages - st.share_pages;
-    const int64_t pfx = pfx_pages < 0 ? 0 : (pfx_pages > st.share_pages ? st.share_pages : pfx_pages);
-    std::vector<int32_t> tab((size_t) st.n_pages);
-    for (int64_t p = 0; p < st.n_pages; ++p) {
-        int32_t id = -1;   // past this mapping's capacity: a page the conversation can never reach
-        if (p < pfx) id = (int32_t) p;   // the shared prefix, at its own ids in every layer and session
-        else if (p - pfx < priv) id = (int32_t) (st.share_first + (p - pfx));
-        tab[(size_t) p] = id;
-    }
-    if (host_table != nullptr) std::copy(tab.begin(), tab.end(), host_table);
-    cudaMemcpyAsync(st.page_table, tab.data(), tab.size() * sizeof(int32_t), cudaMemcpyHostToDevice,
+void qsa_state_set_table(const QsaState& st, const ModelGeometry& g, const int32_t* host_table, void* stream) {
+    (void) g;
+    cudaMemcpyAsync(st.page_table, host_table, (size_t) st.n_pages * sizeof(int32_t), cudaMemcpyHostToDevice,
                     (cudaStream_t) stream);
 }
 
 void qsa_state_zero(const QsaState& st, const ModelGeometry& g, void* stream) {
     const QsaShapes s = qsa_shapes(g);
     cudaStream_t cs = (cudaStream_t) stream;
-    // --kv-share: zero ONLY this session's private run.  The shared front holds the live pinned prefix (zeroed
-    // once at arena allocation), and the OTHER sessions' private runs are not this state's to clear.
+    // --kv-share (dynamic): the pools are NOT zeroed.  A reused page's stale bytes are never attended:
+    // every cell a conversation reads was appended by that conversation, and cells past its length are
+    // never selected (the selection returns exactly n_kv cells).  The indexer rows stay per-session state.
     if (st.share_first >= 0) {
-        const int64_t priv = st.n_pages - st.share_pages;
-        const int64_t page_rows = s.n_head_kv * s.page_size;
-        const uint64_t first = (uint64_t) st.share_first * page_rows;
-        const uint64_t rows = (uint64_t) priv * page_rows;
-        const uint64_t scale_row = (uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2;
-        const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
-        if (st.kv_hybrid) {
-            cudaMemsetAsync(st.k_q + first * s.head_dim, 0, rows * s.head_dim, cs);
-            cudaMemsetAsync(st.k_scale + first * scale_row, 0, rows * scale_row, cs);
-            cudaMemsetAsync(st.v_q4 + first * q4_row, 0, rows * q4_row, cs);
-        } else if (st.kv_q4) {
-            cudaMemsetAsync(st.k_q4 + first * q4_row, 0, rows * q4_row, cs);
-            cudaMemsetAsync(st.v_q4 + first * q4_row, 0, rows * q4_row, cs);
-        } else if (st.kv_int8) {
-            cudaMemsetAsync(st.k_q + first * s.head_dim, 0, rows * s.head_dim, cs);
-            cudaMemsetAsync(st.v_q + first * s.head_dim, 0, rows * s.head_dim, cs);
-            cudaMemsetAsync(st.k_scale + first * scale_row, 0, rows * scale_row, cs);
-            cudaMemsetAsync(st.v_scale + first * scale_row, 0, rows * scale_row, cs);
-        } else {
-            cudaMemsetAsync(st.k_pool + first * s.head_dim, 0, rows * s.head_dim * 2, cs);
-            cudaMemsetAsync(st.v_pool + first * s.head_dim, 0, rows * s.head_dim * 2, cs);
-        }
         cudaMemsetAsync(st.idx_tail, 0, (size_t) (s.idx_block - 1) * s.idx_dim * 4, cs);
         cudaMemsetAsync(st.idx_dead, 0, (size_t) s.idx_dim * 4, cs);
         cudaMemsetAsync(st.idx_pooled, 0, (size_t) st.idx_pooled_rows * s.idx_dim * 4, cs);

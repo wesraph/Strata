@@ -117,13 +117,12 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // a layer whose pinned RAM could not be had (KV streaming's host copy) is half-built: going on would have the
     // attention read null host pointers at the first request ("illegal memory access"), so the session fails here.
     // A shared carve walks the arena in step with it: layer j's pools at `j` aligned strides in.
-    const uint64_t share_stride = (qsa_share_layer_stride(g, max_cells, share ? share->n_sessions : 1) + 255) / 256 * 256;
+    const uint64_t share_stride = (qsa_share_layer_stride(g, share ? share->pool_pages : 0) + 255) / 256 * 256;
     for (int64_t j = 0; j < s.qsa_alloc; ++j) {
         QsaShareArena layer{};
         if (share != nullptr) {
             layer.base = (uint8_t*) share->base + (uint64_t) j * share_stride;
-            layer.n_sessions = share->n_sessions;
-            layer.session = share->session;
+            layer.pool_pages = share->pool_pages;
         }
         if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
                            s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0], 0,

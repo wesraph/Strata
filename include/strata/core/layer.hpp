@@ -283,33 +283,29 @@ struct QsaState {
 /// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
 /// instead of building a copy (the session builds it once, in the first QSA layer).
-/// THE SHARED K/V ARENA (--kv-share N).  One device allocation per layer range holds every session's K/V
-/// pools for those layers: `share_pages` pages at the front are the shared prefix, then one private run of
-/// pages per session (the main session's first, then each batch slot's).  Every session's QsaState points at
-/// the SAME pool base for the layer, so a page id means the same bytes to all of them, and each session's
-/// page table picks its own logical -> physical mapping: the shared prefix's pages at their own ids, the
-/// conversation's own cells at its private run.  Two sessions whose conversations share the pinned prefix
-/// then read the SAME K/V pages with no copy, and a page a session never appends to is never written.
+/// THE SHARED K/V ARENA (--kv-share N), DYNAMIC PAGING.  One device allocation per layer range holds
+/// `pool_pages` pages with NO internal structure: pages are handed out by the serve loop's page allocator
+/// (kv_pages.hpp) as conversations need them, and every session's page table says where its logical pages
+/// live.  A pinned prefix is simply pages the entry owns; sessions branching from it map those pages - the
+/// same physical bytes, no copy - and allocate their own pages for everything past it.  There is no shared
+/// capacity: any prefix fits while pages are free (a conversation is admitted only if its whole page need
+/// fits beside what is already allocated, vLLM's conservative full-sequence fit).
 struct QsaShareArena {
-    void* base = nullptr;        ///< the arena (device memory), `qsa_share_arena_bytes` sized
-    int64_t n_sessions = 0;      ///< sessions sharing it (the main session plus every batch slot)
-    int64_t session = 0;         ///< THIS session's private run (0: the main session, b+1: batch slot b)
+    void* base = nullptr;        ///< the arena (device memory), `pool_pages` per layer, 256-byte aligned each
+    int64_t pool_pages = 0;      ///< the layer's whole pool in pages (every session draws from it)
 };
 
-/// The shared prefix's capacity in pages (0: --kv-share off, or too large for the context).
+/// The shared prefix's capacity in pages (0: --kv-share off).  Kept for sizing and diagnostics; the pool
+/// itself no longer reserves it.
 int64_t qsa_kv_share_pages(const ModelGeometry& g, int64_t max_cells);
-/// One layer's share of the arena: `qsa_share_pages` shared pages plus `n_sessions` private runs, each
-/// `pages(max_cells) - shared` pages.
-uint64_t qsa_share_layer_stride(const ModelGeometry& g, int64_t max_cells, int64_t n_sessions);
+/// One layer's share of the arena: `pool_pages` pages.
+uint64_t qsa_share_layer_stride(const ModelGeometry& g, int64_t pool_pages);
 /// The whole arena for `n_qsa_layers` layers.
-uint64_t qsa_share_arena_bytes(const ModelGeometry& g, int64_t max_cells, int64_t n_qsa_layers, int64_t n_sessions);
-/// A session branching with `pfx_pages` pages of shared prefix (0: private only).  Writes `n_pages` entries:
-/// the prefix at its own ids, the rest at this state's private run, -1 past its capacity.  `host_table`, when
-/// not null, receives the same mapping for the host-side copy the table-aware K/V moves need.
-void qsa_state_share_table(const QsaState& st, const ModelGeometry& g, int64_t pfx_pages,
-                           int32_t* host_table, void* stream);
-/// The cells a conversation in this state may hold: `pfx_pages` shared pages plus the private run.
-int64_t qsa_state_share_capacity(const QsaState& st, const ModelGeometry& g, int64_t pfx_pages);
+uint64_t qsa_share_arena_bytes(const ModelGeometry& g, int64_t pool_pages, int64_t n_qsa_layers);
+/// Upload a session's page table (n_pages entries, logical -> physical, -1 unmapped) to every... no: to
+/// THIS state's device table, and mirror it into `host_table` when not null.  The mapping is entirely the
+/// caller's (the allocator's); the state applies it verbatim.
+void qsa_state_set_table(const QsaState& st, const ModelGeometry& g, const int32_t* host_table, void* stream);
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
                          bool external_pools = false);
