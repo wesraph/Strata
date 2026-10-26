@@ -139,6 +139,8 @@ public:
         if (id < 0 || (size_t) id >= page_key_.size()) return;
         page_stamp_[(size_t) id] = ++stamp_;
         heap_.emplace(page_stamp_[(size_t) id], id);
+        if (heap_.size() > (size_t) (4 * (alloc_.total() + 1)))
+            rebuild_heap_();   // lazy entries from repeated touches would grow forever
     }
 
     bool take(int64_t n, std::vector<int32_t>& out) {
@@ -198,6 +200,12 @@ private:
     using HeapEntry = std::pair<int64_t, int32_t>;   // (stamp, page), min-stamp first
     std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap_;
     int64_t stamp_ = 0;
+
+    void rebuild_heap_() {
+        heap_ = {};
+        for (size_t id = 0; id < page_key_.size(); ++id)
+            if (page_key_[id] != 0) heap_.emplace(page_stamp_[id], (int32_t) id);
+    }
 };
 
 }  // namespace strata::core

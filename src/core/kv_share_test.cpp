@@ -122,6 +122,20 @@ int main() {
         cache.unpin(got[0]);
         std::vector<int32_t> last;
         check(cache.take(1, last) && last[0] == got[0], "unpinned, the page is evictable again");
+        // many touches force the heap's rebuild: eviction must keep working after it
+        {
+            PageCache big(64);
+            std::vector<int32_t> ids;
+            check(big.take(64, ids), "fill the small pool");
+            for (int round = 0; round < 40; ++round)
+                for (int32_t id : ids) big.touch(id);   // 2560 touches: several rebuilds at 4x
+            for (int p = 0; p < 64; ++p)
+                check(big.register_page(ids[(size_t) p], (uint64_t) (0x1000 + p), &tok[(size_t) (p % 8) * 4]),
+                      "register after rebuilds");
+            std::vector<int32_t> again;
+            check(big.take(64, again), "the whole pool re-takes after rebuilds");
+            check(big.cached_count() == 0, "every cached page was evictable after the rebuilds");
+        }
     }
 
     // ---- the carve: one flat pool, two sessions ----
@@ -219,10 +233,13 @@ int main() {
             check(page_is(r2.k_pool, p, k_page, want), "the carried pages land at their logical places");
         }
         check(!page_is(r2.k_pool, 0, k_page, (uint8_t) 1) || true, "the skipped prefix was not written from the image");
-        // validation accepts the skip; a restore asking for MORE than was carried would be the serve's guard
+        // validation accepts the skip; a prefix restore without the table is refused loudly (the serve
+        // always carries one; a linear prefix restore of a skipped image would misland)
         ConversationKv check2;
         check(conversation_kv_save(check2, a, g, upto_cells, true, serr, 0, nullptr, ta.data(), 0) && check2.k.size() == image.k.size(),
               "a zero-skip save carries everything");
+        check(!conversation_kv_restore_prefix(skipped, r2, g, 600 * 4, 600 * 4, true, serr, nullptr, 600),
+              "a linear prefix restore of a skipped image is refused");   // upto inside the skip: sizes pass, only the guard refuses
     }
 
     // ---- zero: the pools are untouched (stale pages are never attended) ----

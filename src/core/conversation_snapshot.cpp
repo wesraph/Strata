@@ -423,6 +423,10 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
     if (!conversation_kv_validate(image, st, g, captured, index, error)) return false;
     Layout l{};   // the prefix's extent; validation above checked the image against the captured one
     if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
+    if (image.pool_skip > 0 && table == nullptr) {
+        error = "conversation snapshot: a pool-skipped image restores only through its session's table";
+        return false;
+    }
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     for (size_t i = 0; i < src.size(); ++i)

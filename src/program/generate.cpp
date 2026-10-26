@@ -14806,7 +14806,11 @@ int main(int argc, char** argv) {
                         strata::core::SavedConversation image;
                         std::string perr;
                         size_t estimate = 0;
-                        if (strata::core::conversation_snapshot_capture_bytes({}, view, *bslot_ss[0][(size_t) b], g,
+                        // single GPU only: a layer split's conversation spans every stage's slot session, and
+                        // capturing all of them here is the park machinery's stage_parts dance - on a split the
+                        // pages are freed and the conversation simply reads again when it returns
+                        if (stages.empty() &&
+                            strata::core::conversation_snapshot_capture_bytes({}, view, *bslot_ss[0][(size_t) b], g,
                                                                               nullptr, estimate, perr) &&
                             conversations.make_room(estimate, 0) &&
                             strata::core::conversation_snapshot_save(image, view, *bslot_ss[0][(size_t) b], g, nullptr,
