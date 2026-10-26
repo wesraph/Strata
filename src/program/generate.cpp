@@ -2493,7 +2493,10 @@ int main(int argc, char** argv) {
         else if (a == "--ple-sync-submit") o.ple_sync_submit = true;
         else if (a == "--kv") o.kv = next("--kv");
         else if (a == "--kv-resident") o.kv_resident = std::atoll(next("--kv-resident"));
-        else if (a == "--kv-share") o.kv_share = std::atoll(next("--kv-share"));
+        else if (a == "--kv-share") {
+            const char* v = next("--kv-share");
+            o.kv_share = std::strcmp(v, "auto") == 0 ? -1 : std::atoll(v);
+        }
         else if (a == "--kv-grow") o.kv_grow = true;
         else if (a == "--no-kv-grow") o.kv_grow = false;
         else if (a == "--stream-token") o.stream_token = true;
@@ -3220,8 +3223,8 @@ int main(int argc, char** argv) {
     if (o.kv_share == 0) {
         if (const char* se = std::getenv("STRATA_KV_SHARE")) o.kv_share = std::atoll(se);
     }
-    if (o.kv_share < 0) {
-        std::fprintf(stderr, "strata generate: --kv-share must be >= 0\n");
+    if (o.kv_share < -1) {
+        std::fprintf(stderr, "strata generate: --kv-share must be a number of tokens or \"auto\"\n");
         return 2;
     }
     if (o.kv_share > 0 && (!o.serve || o.kv_resident > 0 || o.kv_grow)) {
@@ -3229,7 +3232,10 @@ int main(int argc, char** argv) {
                              "(no --kv-resident, no --kv-grow)\n", (long long) o.kv_share);
         o.kv_share = 0;
     }
-    strata::core::qsa_set_kv_share(o.kv_share);
+    if (o.kv_share == 0 && !o.serve) {
+        // generate mode never shares; the sentinel stays for --serve
+    }
+    strata::core::qsa_set_kv_share(o.kv_share > 0 ? o.kv_share : 0);
     // Prompt lookup (the suffix drafter, on by default): the MTP keeps its --spec windows and a lookup window may be
     // up to 2 tokens longer; the draft policy (strata/spec/draft_policy.hpp) takes one only where it pays. Code
     // edits +6-11%, ordinary text unchanged (bench/results/2026-09-27-spec). --suffix-draft 0 turns it off.
@@ -5275,6 +5281,31 @@ int main(int argc, char** argv) {
         // The pool covers one conversation's whole context at the very least; the default is what the
         // sessions would have carved separately (sessions x the whole context), so the reservation matches
         // the stock engine while the usage inside it is dynamic.
+        // --kv-share auto: the pool takes a fixed share of the VRAM the weights left free (the expert
+        // cache opens after the pool and sizes itself into the rest).  One number per rig, the tightest
+        // device decides - vLLM's profiling step in miniature.
+        if (o.kv_share < 0) {
+            constexpr double auto_share = 0.35;
+            const int64_t per_page = strata::kernels::kv_block_bytes(
+                strata::core::qsa_shapes(g), strata::core::qsa_kv_format(strata::core::QsaState{}));
+            const int64_t q_n_all = std::max<int64_t>(g.n_layers / std::max<int64_t>(g.qsa_interval, 1),
+                                                      g.n_qsa_layers() > 0 ? 1 : 0);
+            int64_t tokens = INT64_MAX;
+            const int n_dev = multi_gpu ? 2 : 1;   // a split uses one pool per card; measure every card
+            for (int d = 0; d < n_dev; ++d) {
+                const strata::core::OnDevice on_d(d);
+                size_t free_b = 0, total_b = 0;
+                if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) continue;
+                const int64_t here = (int64_t) ((double) free_b * auto_share) /
+                                     std::max<int64_t>(per_page * q_n_all, 1) * 4;
+                tokens = std::min<int64_t>(tokens, here);
+            }
+            if (tokens == INT64_MAX || tokens < 1) tokens = 4 * 1024;   // measurement failed: a small floor
+            strata::core::qsa_set_kv_share(tokens);
+            std::fprintf(stderr, "strata generate: --kv-share auto: %lld tokens of K/V pool "
+                                 "(%.2f GiB of the free VRAM per card)\n", (long long) tokens,
+                         (double) (tokens / 4 * per_page) / 1073741824.0);
+        }
         kvsh = strata::core::qsa_kv_share_tokens() > 0;
         const int64_t kvsh_pages_of_context =
             (o.max_context + strata::kernels::qsa_real_shapes().page_size - 1) /
