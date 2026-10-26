@@ -783,15 +783,47 @@ int64_t qsa_kv_share_pages(const ModelGeometry& g, int64_t max_cells) {
     return (g_kv_share + s.page_size - 1) / s.page_size;
 }
 
-uint64_t qsa_share_layer_stride(const ModelGeometry& g, int64_t pool_pages) {
+SharePoolLayout qsa_share_pool_layout(const ModelGeometry& g, int64_t pool_pages, uint64_t align) {
+    // the carve order of qsa_state_init's shared branch: hybrid (K codes, K scales, V q4), q4 (K, V),
+    // int8 (K, V, K scales, V scales), f16 (K, V).  Bytes per PAGE of each array, then padded sizes.
     const QsaShapes s = qsa_shapes(g);
-    return kv_pool_bytes(s, pool_pages, g_kv_hybrid, g_kv_int8 || g_kv_hybrid);
+    const int64_t rows_per_page = s.n_head_kv * s.page_size;   // rows one page occupies
+    const uint64_t q4_row = strata::kernels::kv_q4_bytes_per_head((int) s.head_dim);
+    std::array<uint64_t, 4> per{};   // bytes per page per array
+    int64_t n = 2;
+    if (g_kv_hybrid) { per = {(uint64_t) rows_per_page * s.head_dim,
+                              (uint64_t) rows_per_page * ((uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2),
+                              (uint64_t) rows_per_page * q4_row, 0}; n = 3; }
+    else if (g_kv_q4) { per = {(uint64_t) rows_per_page * q4_row, (uint64_t) rows_per_page * q4_row, 0, 0}; }
+    else if (g_kv_int8) {
+        per = {(uint64_t) rows_per_page * s.head_dim, (uint64_t) rows_per_page * s.head_dim,
+               (uint64_t) rows_per_page * ((uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2),
+               (uint64_t) rows_per_page * ((uint64_t) (s.head_dim / strata::kernels::KV_Q8_GROUP) * 2)};
+        n = 4;
+    } else { per = {(uint64_t) rows_per_page * s.head_dim * 2, (uint64_t) rows_per_page * s.head_dim * 2, 0, 0}; }
+    const uint64_t a = align < 1 ? 1 : align;
+    const uint64_t total_per_page = per[0] + per[1] + per[2] + per[3];
+    SharePoolLayout out;
+    out.arrays = n;
+    out.stride = 0;
+    for (int64_t i = 0; i < n; ++i) {
+        out.arr_off[(size_t) i] = out.stride;
+        out.arr_tight[(size_t) i] = (uint64_t) pool_pages * per[(size_t) i];
+        out.arr_bytes[(size_t) i] = (out.arr_tight[(size_t) i] + a - 1) / a * a;
+        out.stride += out.arr_bytes[(size_t) i];
+    }
+    out.pages_per_extent = a > 256 && total_per_page > 0 ? (int64_t) (a / total_per_page) : 0;
+    out.chunks_per_layer = a > 256 ? (int64_t) (out.stride / a) : 0;
+    if (out.pages_per_extent == 0 && a > 256) out.pages_per_extent = 1;   // an array page too big for a chunk: degenerate
+    return out;
 }
 
-uint64_t qsa_share_arena_bytes(const ModelGeometry& g, int64_t pool_pages, int64_t n_qsa_layers) {
-    const uint64_t stride = qsa_share_layer_stride(g, pool_pages);
-    // aligned per layer so a state's pools never straddle another layer's run
-    return ((stride + 255ull) / 256ull * 256ull) * (uint64_t) n_qsa_layers;
+uint64_t qsa_share_layer_stride(const ModelGeometry& g, int64_t pool_pages, uint64_t align) {
+    return qsa_share_pool_layout(g, pool_pages, align).stride;
+}
+
+uint64_t qsa_share_arena_bytes(const ModelGeometry& g, int64_t pool_pages, int64_t n_qsa_layers, uint64_t align) {
+    return qsa_share_layer_stride(g, pool_pages, align) * (uint64_t) n_qsa_layers;
 }
 
 uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope, int64_t ring_cells,
@@ -837,6 +869,12 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     // fills it as the conversation grows, so the mapping is entirely the caller's.
     Cursor pool{(uint8_t*) nullptr};
     int64_t pool_pages = p.slots;
+    const SharePoolLayout lay = share != nullptr
+        ? qsa_share_pool_layout(g, share->pool_pages, share->pool_align)
+        : SharePoolLayout{};
+    // every array sits at its LAYOUT offset (padded): the carve skips to it before taking, so the VMM
+    // chunk math and the pointers on the device always agree
+    auto pool_at = [&](size_t arr) { pool.take_bytes((uint64_t) lay.arr_off[arr] - pool.used); };
     if (share != nullptr) {
         const int64_t pages_of_context = pages;
         if (p.mode != 0 || g_kv_elastic || share->base == nullptr || share->pool_pages < pages_of_context)
@@ -889,20 +927,28 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
         // an unshared state carves its pools from the session arena; a shared one from the arena cursor set
         // above - the same run sequence, byte for byte, over the layer's whole shared pool
         Cursor& pools = share != nullptr ? pool : c;
+        if (share != nullptr) pool_at(0);
         if (st.kv_hybrid) {
             st.k_q = pools.take<int8_t>(rows * s.head_dim);
+            if (share != nullptr) pool_at(1);
             st.k_scale = pools.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+            if (share != nullptr) pool_at(2);
             st.v_q4 = pools.take<uint8_t>(rows * q4_row);
         } else if (st.kv_q4) {
             st.k_q4 = pools.take<uint8_t>(rows * q4_row);
+            if (share != nullptr) pool_at(1);
             st.v_q4 = pools.take<uint8_t>(rows * q4_row);
         } else if (st.kv_int8) {   // st, not the global: the drafter's ring is INT8 under --kv k8v4 too
             st.k_q = pools.take<int8_t>(rows * s.head_dim);
+            if (share != nullptr) pool_at(1);
             st.v_q = pools.take<int8_t>(rows * s.head_dim);
+            if (share != nullptr) pool_at(2);
             st.k_scale = pools.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
+            if (share != nullptr) pool_at(3);
             st.v_scale = pools.take<uint16_t>(rows * (s.head_dim / strata::kernels::KV_Q8_GROUP));
         } else {
             st.k_pool = pools.take<uint16_t>(rows * s.head_dim);
+            if (share != nullptr) pool_at(1);
             st.v_pool = pools.take<uint16_t>(rows * s.head_dim);
         }
     }

@@ -11,6 +11,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <unordered_map>
 #include <queue>
 #include <set>
@@ -27,6 +28,12 @@ public:
     void init(int64_t pages) {
         free_.clear();
         for (int64_t p = 0; p < pages; ++p) free_.insert(p);
+        total_ = pages;
+    }
+
+    /// The pool's page count with none free yet (an extent-mapped cache hands pages in as extents map).
+    void init_empty(int64_t pages) {
+        free_.clear();
         total_ = pages;
     }
 
@@ -56,6 +63,11 @@ public:
             if (id >= 0 && id < total_) free_.insert(id);
     }
 
+    /// Pages leaving availability entirely (their extent's memory dropped): out of the free set.
+    void erase(const std::vector<int32_t>& ids) {
+        for (int32_t id : ids) free_.erase(id);
+    }
+
     int64_t free_count() const { return (int64_t) free_.size(); }
     int64_t total() const { return total_; }
 
@@ -72,17 +84,33 @@ private:
 class PageCache {
 public:
     static constexpr int page_cells = 4;   // the QSA page granule (qsa_real_shapes().page_size)
+    /// Map/unmap an EXTENT of pages (the VMM chunk granularity, pages_per_extent at init): the elastic pool
+    /// backs extents with physical memory only while they hold something.  Returning false from map fails
+    /// the allocation (out of VRAM); the callbacks run on a synchronized device.
+    using MapExtent = std::function<bool(int64_t)>;
+    using UnmapExtent = std::function<void(int64_t)>;
     PageCache() = default;
     explicit PageCache(int64_t pages) { init(pages); }
 
-    void init(int64_t pages) {
-        alloc_.init(pages);
+    void init(int64_t pages) { init(pages, 0, nullptr, nullptr); }
+
+    /// `pages_per_extent` 0 or > pages: one extent (a plain always-mapped pool).
+    void init(int64_t pages, int64_t pages_per_extent, MapExtent map_extent, UnmapExtent unmap_extent) {
+        alloc_.init_empty(pages);
+        total_pages_ = pages;
+        per_extent_ = pages_per_extent > 0 && pages_per_extent <= pages ? pages_per_extent : pages;
+        extents_ = (pages + per_extent_ - 1) / per_extent_;
+        extent_mapped_.assign((size_t) extents_, extents_ == 1);   // a single extent is the plain pool: mapped
+        map_extent_ = std::move(map_extent);
+        unmap_extent_ = std::move(unmap_extent);
         key_to_page_.clear();
         page_key_.assign((size_t) pages, 0);
         page_tokens_.assign((size_t) pages * page_cells, 0);
         page_refs_.assign((size_t) pages, 0);
         page_stamp_.assign((size_t) pages, 0);
+        heap_ = {};
         stamp_ = 0;
+        if (extents_ == 1) alloc_.init(pages);
     }
 
     /// The chained key of page p over the tokens: fnv(parent-key, the page's tokens).  `tokens` holds at
@@ -117,6 +145,7 @@ public:
         if (id < 0 || (size_t) id >= page_key_.size() || page_refs_[(size_t) id] <= 0) return;
         if (--page_refs_[(size_t) id] == 0 && page_key_[(size_t) id] != 0)
             touch(id);   // its heap entries were skipped while pinned: re-enter the eviction order
+        extent_release(id);
     }
 
     /// Remember page `id` as holding the tokens whose chained key is `key` (a conversation filled it).
@@ -143,8 +172,16 @@ public:
             rebuild_heap_();   // lazy entries from repeated touches would grow forever
     }
 
+    /// n pages: mapped-free first, then a freshly mapped extent while the device has memory for one
+    /// (a cached prefix is worth more than idle VRAM is), then evicted cached pages, then failure.
+    /// Each step repeats until enough or impossible, so a pool with no unmapped extent still evicts.
     bool take(int64_t n, std::vector<int32_t>& out) {
-        while (alloc_.free_count() < n && evict_one()) {}
+        while (alloc_.free_count() < n) {
+            int64_t before = alloc_.free_count();
+            if (map_one_more() && alloc_.free_count() > before) continue;
+            if (evict_one()) continue;
+            break;
+        }
         return alloc_.take(n, out);
     }
 
@@ -154,8 +191,11 @@ public:
         if (id < 0 || (size_t) id >= page_key_.size()) { alloc_.release({id}); return; }
         unpin(id);
         if (page_key_[(size_t) id] == 0 || page_refs_[(size_t) id] > 0) {
-            if (page_key_[(size_t) id] == 0) alloc_.release({id});
-            return;   // still pinned elsewhere, or cached: stays resident
+            if (page_key_[(size_t) id] == 0 && extent_mapped_[(size_t) (id / per_extent_)]) {
+                alloc_.release({id});
+                extent_release(id);   // an uncached page leaving may empty its extent
+            }
+            return;   // unmapped (nowhere to free), still pinned elsewhere, or cached: stays resident
         }
         // hashed and unreferenced: the page stays resident with its key - reusable, and evictable
     }
@@ -181,16 +221,54 @@ public:
             key_to_page_.erase(page_key_[(size_t) id]);
             page_key_[(size_t) id] = 0;
             alloc_.release({id});
+            extent_release(id);
             return true;
         }
         return false;
     }
 
     int64_t free_count() const { return alloc_.free_count(); }
-    int64_t total() const { return alloc_.total(); }
+    int64_t total() const { return total_pages_; }
     int64_t cached_count() const { return (int64_t) key_to_page_.size(); }
+    int64_t mapped_extents() const {
+        int64_t m = 0;
+        for (bool b : extent_mapped_)
+            if (b) ++m;
+        return m;
+    }
+    int64_t extents() const { return extents_; }
 
-private:
+    /// After a page stopped being pinned/cached: an extent whose every page is free of keys and pins
+    /// holds nothing - its pages go back and its physical memory drops.  (Counting only pins was wrong:
+    /// a cached page's extent must stay mapped or a later hit would read unmapped memory.)
+    void extent_release(int32_t id) {
+        const int64_t e = id / per_extent_;
+        if (e < 0 || e >= extents_ || !extent_mapped_[(size_t) e] || !unmap_extent_) return;
+        for (int64_t p = e * per_extent_; p < (e + 1) * per_extent_ && p < total_pages_; ++p)
+            if (page_key_[(size_t) p] != 0 || page_refs_[(size_t) p] > 0) return;   // someone lives there
+        std::vector<int32_t> drop;
+        for (int64_t p = e * per_extent_; p < (e + 1) * per_extent_ && p < total_pages_; ++p)
+            drop.push_back((int32_t) p);
+        alloc_.erase(drop);   // the extent's pages leave availability: their memory is gone
+        extent_mapped_[(size_t) e] = false;
+        unmap_extent_(e);
+    }
+
+    /// Map the next unmapped extent (lowest first) into physical memory; its pages become free.
+    bool map_one_more() {
+        for (int64_t e = 0; e < extents_; ++e) {
+            if (extent_mapped_[(size_t) e]) continue;
+            if (map_extent_ && !map_extent_(e)) return false;
+            extent_mapped_[(size_t) e] = true;
+            std::vector<int32_t> add;
+            for (int64_t p = e * per_extent_; p < (e + 1) * per_extent_ && p < total_pages_; ++p)
+                add.push_back((int32_t) p);
+            alloc_.release(add);
+            return true;
+        }
+        return false;   // every extent is mapped already
+    }
+
     PageAlloc alloc_;
     std::unordered_map<uint64_t, int32_t> key_to_page_;
     std::vector<uint64_t> page_key_;
@@ -200,6 +278,10 @@ private:
     using HeapEntry = std::pair<int64_t, int32_t>;   // (stamp, page), min-stamp first
     std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap_;
     int64_t stamp_ = 0;
+    int64_t total_pages_ = 0, per_extent_ = 1, extents_ = 1;
+    std::vector<char> extent_mapped_;
+    MapExtent map_extent_;
+    UnmapExtent unmap_extent_;
 
     void rebuild_heap_() {
         heap_ = {};

@@ -293,15 +293,32 @@ struct QsaState {
 struct QsaShareArena {
     void* base = nullptr;        ///< the arena (device memory), `pool_pages` per layer, 256-byte aligned each
     int64_t pool_pages = 0;      ///< the layer's whole pool in pages (every session draws from it)
+    uint64_t pool_align = 256;   ///< the arrays' stride alignment inside a layer (the VMM granularity when elastic)
 };
 
 /// The shared prefix's capacity in pages (0: --kv-share off).  Kept for sizing and diagnostics; the pool
 /// itself no longer reserves it.
 int64_t qsa_kv_share_pages(const ModelGeometry& g, int64_t max_cells);
-/// One layer's share of the arena: `pool_pages` pages.
-uint64_t qsa_share_layer_stride(const ModelGeometry& g, int64_t pool_pages);
-/// The whole arena for `n_qsa_layers` layers.
-uint64_t qsa_share_arena_bytes(const ModelGeometry& g, int64_t pool_pages, int64_t n_qsa_layers);
+/// The pool's array layout inside one layer's stride: every K/V array (K codes, scales, V) at its own
+/// offset, each padded to `align` bytes.  At align=256 this is the tight carve; at the VMM granularity
+/// every extent of pages (qsa_share_pages_per_extent) is exactly ONE chunk inside EVERY array - the
+/// elastic pool maps and drops extents whole.
+struct SharePoolLayout {
+    std::array<uint64_t, 4> arr_tight{};   ///< per array: its byte size UNPADDED (pages x per-page bytes)
+    std::array<uint64_t, 4> arr_bytes{};   ///< per array: its byte size, padded
+    std::array<uint64_t, 4> arr_off{};     ///< per array: its offset inside the layer's stride
+    int64_t arrays = 0;                    ///< how many of the four are used
+    uint64_t stride = 0;                   ///< the layer's whole stride (sum of the padded arrays)
+    int64_t pages_per_extent = 0;          ///< 0 at plain alignment (one extent: everything mapped at once)
+    int64_t chunks_per_layer = 0;          ///< stride / align, when align is the granularity
+};
+SharePoolLayout qsa_share_pool_layout(const ModelGeometry& g, int64_t pool_pages, uint64_t align = 256);
+
+/// One layer's share of the arena: `pool_pages` pages, the stride aligned up (256, or the VMM granularity
+/// so a layer's slice is whole chunks and every extent of pages is exactly one chunk inside it).
+uint64_t qsa_share_layer_stride(const ModelGeometry& g, int64_t pool_pages, uint64_t align = 256);
+/// The whole arena for `n_qsa_layers` layers (each layer at the same aligned stride).
+uint64_t qsa_share_arena_bytes(const ModelGeometry& g, int64_t pool_pages, int64_t n_qsa_layers, uint64_t align = 256);
 /// Upload a session's page table (n_pages entries, logical -> physical, -1 unmapped) to every... no: to
 /// THIS state's device table, and mirror it into `host_table` when not null.  The mapping is entirely the
 /// caller's (the allocator's); the state applies it verbatim.

@@ -138,6 +138,52 @@ int main() {
         }
     }
 
+    // ---- extents: physical memory only while something lives on it ----
+    {
+        int64_t unmapped = 0, map_fail_at = -1;
+        std::vector<int32_t> tok{1, 2, 3, 4};   // one page of tokens for the cache's verification
+        auto cache_ext = PageCache{};
+        cache_ext.init(12, 4,   // 3 extents of 4 pages; map_fail_at >= 0 blocks every further mapping
+                       [&](int64_t) { return map_fail_at < 0; },
+                       [&](int64_t) { ++unmapped; });
+        std::vector<int32_t> got;
+        check(cache_ext.extents() == 3, "twelve pages split into three extents");
+        check(cache_ext.free_count() == 0, "nothing mapped yet: nothing free");
+        check(cache_ext.take(3, got) && got[0] == 0 && cache_ext.mapped_extents() == 1,
+              "the first take maps exactly one extent");
+        check(cache_ext.take(1, got) && got.back() == 3 && cache_ext.mapped_extents() == 1,
+              "spare room in the mapped extent first");
+        check(cache_ext.take(4, got) && cache_ext.mapped_extents() == 2, "crossing an extent maps the next");
+        // everything released: the extents empty and unmap
+        for (int32_t id = 0; id < 12; ++id) cache_ext.release_page(id);
+        check(cache_ext.mapped_extents() == 0 && unmapped >= 2, "empty extents drop their memory");
+        // a cached page holds its extent: evicting it is what empties it
+        std::vector<int32_t> again;
+        check(cache_ext.take(4, again), "remap after the drop");
+        check(cache_ext.register_page(again[0], 0xdeadbeef, &tok[0]), "register a page");
+        cache_ext.release_page(again[0]);
+        check(cache_ext.mapped_extents() == 1, "a cached page keeps its extent mapped");
+        map_fail_at = 0;   // no further mapping: eviction is the only room left, and evicting the one
+                           // cached page empties its extent - the memory drops, the page does not become takeable
+        std::vector<int32_t> third;
+        check(!cache_ext.take(1, third) && cache_ext.mapped_extents() == 0 && cache_ext.cached_count() == 0,
+              "evicting the only content empties the extent and refuses the take");
+        map_fail_at = -1;
+        std::vector<int32_t> held;
+        check(cache_ext.take(3, held), "three pages in one extent");
+        for (int i = 0; i < 3; ++i)
+            check(cache_ext.register_page(held[(size_t) i], (uint64_t) (0xfeedface + i), &tok[0]), "key each");
+        for (int i = 0; i < 3; ++i) cache_ext.release_page(held[(size_t) i]);   // cached, unpinned: evictable
+        map_fail_at = 0;
+        std::vector<int32_t> four;
+        check(cache_ext.take(2, four) && cache_ext.mapped_extents() == 1 && cache_ext.cached_count() <= 2,
+              "a failed map evicts cached pages of the mapped extent instead");
+        while (cache_ext.cached_count() > 0 || cache_ext.free_count() > 0)
+            if (!cache_ext.take(1, four)) break;   // evict-and-take until the extent is bare
+        check(!cache_ext.take(1, four), "drained: nothing more to take or evict");
+        map_fail_at = -1;
+    }
+
     // ---- the carve: one flat pool, two sessions ----
     qsa_set_kv_share(2048 * page_cells);   // the pool in tokens: 2048 pages, one conversation's whole context
     const int64_t pool_pages = 2048;
