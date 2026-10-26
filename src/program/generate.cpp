@@ -5340,7 +5340,8 @@ int main(int argc, char** argv) {
             for (size_t k = 0; k < kvsh_base.size(); ++k) {
                 const int dev = k == 0 ? 0 : stages[k - 1]->dev;
                 const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
-                const int64_t hi = k == 0 ? hi0 : stages[k - 1]->le;
+                const int64_t hi_raw = k == 0 ? hi0 : stages[k - 1]->le;
+                const int64_t hi = hi_raw < 0 ? g.n_layers : hi_raw;   // -1 = the whole model (no split)
                 const int64_t q_n = std::max<int64_t>(hi / I - lo / I, g.n_qsa_layers() > 0 ? 1 : 0);
                 const strata::core::OnDevice on_k(dev);
                 const uint64_t bytes = stride * (uint64_t) q_n;
@@ -5373,6 +5374,16 @@ int main(int argc, char** argv) {
             }
             kvsh_map_extent = kvsh_map_extent_impl;
             kvsh_unmap_extent = kvsh_unmap_extent_impl;
+            if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr)
+                std::fprintf(stderr, "kvshare-layout: pages=%lld ppe=%lld arrays=%d cpl=%lld stride=%.1f MiB "
+                                     "tight=[%lld,%lld,%lld,%lld] off=[%lld,%lld,%lld,%lld] ranges=%zu chunks0=%lld\n",
+                             (long long) kvsh_pool_pages, (long long) kvsh_pages_per_extent, (int) lay.arrays,
+                             (long long) lay.chunks_per_layer, (double) lay.stride / 1048576.0,
+                             (long long) lay.arr_tight[0], (long long) lay.arr_tight[1],
+                             (long long) lay.arr_tight[2], (long long) lay.arr_tight[3],
+                             (long long) lay.arr_off[0], (long long) lay.arr_off[1],
+                             (long long) lay.arr_off[2], (long long) lay.arr_off[3],
+                             kvsh_range.size(), kvsh_range.empty() ? 0LL : (long long) kvsh_range[0]->chunks());
             if (kvsh_vmm && kvsh_pages_per_extent > 0) {
                 // THE FLOOR: one conversation's whole context, mapped BEFORE the expert cache sizes itself -
                 // otherwise the cache eats every byte of free VRAM and the first long request cannot fit.  What
