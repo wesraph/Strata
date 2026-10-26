@@ -336,22 +336,44 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
         // A page both sides map to the SAME physical id is already there - the shared prefix, moved nowhere.
         const auto pb = page_bytes(lf);
         const int64_t pages = lf.page_size > 0 ? lf.cells / lf.page_size : 0;
+        // RUN-COALESCED: consecutive pages whose physical ids advance by one on BOTH sides move in a
+        // single copy.  The allocator hands out contiguous runs and the cached prefix is one, so a whole
+        // conversation is a handful of copies instead of one per page (per-page was ~26k driver calls for
+        // a 17k-token shuttle - hundreds of milliseconds, per admission, on the concurrent path).
         for (size_t i = 0; i < 4; ++i) {
             if (!pb[i]) continue;
-            for (int64_t p = 0; p < pages; ++p) {
-                const int64_t pf = phys_page(table_from, p), pt = phys_page(table_to, p);
-                if (pf == pt) continue;
-                if (pf < 0 || pt < 0) {
-                    error = "conversation snapshot: direct K/V copy over an unmapped page";
-                    return false;
+            int64_t p = 0;
+            while (p < pages) {
+                const int64_t pf0 = phys_page(table_from, p), pt0 = phys_page(table_to, p);
+                int64_t run = 0;
+                if (pf0 >= 0 && pt0 >= 0 && pf0 != pt0) {
+                    while (p + run < pages) {
+                        const int64_t pf = phys_page(table_from, p + run), pt = phys_page(table_to, p + run);
+                        if (pf < 0 || pt < 0) break;
+                        if (pf == pt) break;
+                        if (run > 0 && (pf != phys_page(table_from, p + run - 1) + 1 ||
+                                        pt != phys_page(table_to, p + run - 1) + 1)) break;
+                        ++run;
+                    }
+                }
+                if (run == 0) {
+                    if (pf0 < 0 && pt0 < 0) { ++p; continue; }   // unmapped on both sides: nothing to move
+                    if (pf0 < 0 || pt0 < 0) {
+                        error = "conversation snapshot: direct K/V copy over an unmapped page";
+                        return false;
+                    }
+                    ++p;   // pf0 == pt0: already there
+                    continue;
                 }
                 const cudaError_t e = conversation_detail::copy_nonblocking(
-                    static_cast<uint8_t*>(dst[i]) + (size_t) pt * pb[i],
-                    static_cast<const uint8_t*>(src[i]) + (size_t) pf * pb[i], pb[i], queued);
+                    static_cast<uint8_t*>(dst[i]) + (size_t) phys_page(table_to, p) * pb[i],
+                    static_cast<const uint8_t*>(src[i]) + (size_t) phys_page(table_from, p) * pb[i],
+                    (size_t) run * pb[i], queued);
                 if (e != cudaSuccess) {
                     error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e);
                     return false;
                 }
+                p += run;
             }
         }
         const size_t pooled = sizes[4];
