@@ -230,6 +230,13 @@ struct QsaState {
     int64_t n_pages = 0;
     int64_t max_cells = 0;
 
+    /// --kv-share: this state's K/V pools come from the one per-layer pool every session shares (see
+    /// `QsaShareArena`).  `share_pages` pages at the front hold the pinned shared prefix (the same physical
+    /// pages for every session that branches from it); this session's private pages start at `share_first`.
+    /// -1: the state owns its pools carved from its session's arena, as before.
+    int64_t share_pages = 0;
+    int64_t share_first = -1;
+
     /// KV STREAMING (docs/kv-streaming-design.md, `kv_stream.hpp`). `kv_mode` 0: every page in VRAM, identity
     /// table (n_slots == n_pages, no host copy). 1: streamed - the authoritative K/V in `host`, `n_slots` pages
     /// in VRAM, `map` resolves the selection's blocks on device. 2: a ring (the MTP drafter's window) - `n_slots`
@@ -276,12 +283,47 @@ struct QsaState {
 /// Plan v0.3 P7: the RoPE cos/sin table (max_cells x n_rot/2 x 2 floats, 64 MiB at 262K) is identical in every
 /// QSA layer. `with_rope = false` sizes a state that borrows it; `share_rope` points `st` at another state's table
 /// instead of building a copy (the session builds it once, in the first QSA layer).
-uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0);
+/// THE SHARED K/V ARENA (--kv-share N).  One device allocation per layer range holds every session's K/V
+/// pools for those layers: `share_pages` pages at the front are the shared prefix, then one private run of
+/// pages per session (the main session's first, then each batch slot's).  Every session's QsaState points at
+/// the SAME pool base for the layer, so a page id means the same bytes to all of them, and each session's
+/// page table picks its own logical -> physical mapping: the shared prefix's pages at their own ids, the
+/// conversation's own cells at its private run.  Two sessions whose conversations share the pinned prefix
+/// then read the SAME K/V pages with no copy, and a page a session never appends to is never written.
+struct QsaShareArena {
+    void* base = nullptr;        ///< the arena (device memory), `qsa_share_arena_bytes` sized
+    int64_t n_sessions = 0;      ///< sessions sharing it (the main session plus every batch slot)
+    int64_t session = 0;         ///< THIS session's private run (0: the main session, b+1: batch slot b)
+};
+
+/// The shared prefix's capacity in pages (0: --kv-share off, or too large for the context).
+int64_t qsa_kv_share_pages(const ModelGeometry& g, int64_t max_cells);
+/// One layer's share of the arena: `qsa_share_pages` shared pages plus `n_sessions` private runs, each
+/// `pages(max_cells) - shared` pages.
+uint64_t qsa_share_layer_stride(const ModelGeometry& g, int64_t max_cells, int64_t n_sessions);
+/// The whole arena for `n_qsa_layers` layers.
+uint64_t qsa_share_arena_bytes(const ModelGeometry& g, int64_t max_cells, int64_t n_qsa_layers, int64_t n_sessions);
+/// A session branching with `pfx_pages` pages of shared prefix (0: private only).  Writes `n_pages` entries:
+/// the prefix at its own ids, the rest at this state's private run, -1 past its capacity.  `host_table`, when
+/// not null, receives the same mapping for the host-side copy the table-aware K/V moves need.
+void qsa_state_share_table(const QsaState& st, const ModelGeometry& g, int64_t pfx_pages,
+                           int32_t* host_table, void* stream);
+/// The cells a conversation in this state may hold: `pfx_pages` shared pages plus the private run.
+int64_t qsa_state_share_capacity(const QsaState& st, const ModelGeometry& g, int64_t pfx_pages);
+
+uint64_t qsa_state_bytes(const ModelGeometry& g, int64_t max_cells, bool with_rope = true, int64_t ring_cells = 0,
+                         bool external_pools = false);
 /// KV streaming: keep `cells` cells of each QSA layer in VRAM and the rest in pinned host memory (0: all in VRAM,
 /// the default). Set before sizing and initializing the session; a context that fits in `cells` is not streamed.
 /// Also puts the MTP drafter's K/V in a ring of its window (`ring_cells` of qsa_state_bytes/init; -1 forces a fully
 /// resident state).
 void qsa_set_kv_resident(int64_t cells);
+/// --kv-share N (0: off, the default).  The shared-prefix capacity in TOKENS: with it on, the sessions' QSA
+/// K/V pools come from one shared arena per layer (`QsaShareArena`) whose front pages hold the pinned shared
+/// prefix.  Must be set before sizing and initializing the sessions; it needs fully resident K/V (no
+/// --kv-resident, no --kv-grow) and applies to the main layers, never the MTP drafter's ring.
+void qsa_set_kv_share(int64_t tokens);
+int64_t qsa_kv_share_tokens();
 /// THE ELASTIC K/V (--kv-grow; vmm.hpp).  A mode-0 state's K/V pools get addresses for every cell of the context but
 /// physical memory only for the first `init_cells`; `qsa_kv_elastic_grow` maps more as the context grows (from
 /// chunks the expert cache gives up) and `qsa_kv_elastic_shrink` hands them back.  The addresses never move, so the
@@ -324,7 +366,8 @@ inline int qsa_kv_format(const QsaState& st) {
     return st.kv_q4 ? strata::kernels::kKvQ4 : st.kv_int8 ? strata::kernels::kKvInt8 : strata::kernels::kKvF16;
 }
 uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, QsaState& st,
-                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0);
+                        const QsaState* share_rope = nullptr, int64_t ring_cells = 0,
+                        const QsaShareArena* share = nullptr);
 /// KV streaming: the pools a reader sees (the VRAM slots) and, when streamed, make the selection's blocks resident.
 strata::kernels::QsaAttnPools qsa_attn_pools(const QsaState& st);
 void qsa_kv_resolve(const QsaState& st, const ModelGeometry& g, const int32_t* ids, const int32_t* steps, int64_t n_q,

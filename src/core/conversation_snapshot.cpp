@@ -119,6 +119,57 @@ bool transfer(void* dst, const void* src, size_t n, std::string& error) {
     error = std::string("conversation snapshot copy: ") + cudaGetErrorString(e);
     return false;
 }
+
+// --kv-share: one LOGICAL page's bytes of K/V part i (0..3), or 0 for the pooled indexer rows (part 4), which
+// are per-session state in the logical layout and never translate.  `cells` is a whole number of pages.
+std::array<size_t, 5> page_bytes(const Layout& l) {
+    const int64_t pages = l.page_size > 0 ? l.cells / l.page_size : 0;
+    const auto one = [&](size_t part) { return pages > 0 && part > 0 ? part / (size_t) pages : 0; };
+    return {one(l.data), one(l.value_data), one(l.scales), one(l.value_scales), 0};
+}
+
+// A page-mapped state's logical page -> its physical page (identity when `table` is null; -1 past capacity).
+int64_t phys_page(const int32_t* table, int64_t page) {
+    return table == nullptr ? page : (int64_t) table[(size_t) page];
+}
+
+// One LOGICAL page `p` of K/V part i between a state's pool (at physical page `phys`) and the image buffer
+// (at logical page `p`; the buffer may be segmented, so its side goes through `visit`).  `to_pool`: buffer ->
+// pool (restore); else pool -> buffer (save).  A `phys` of -1 has no page behind it: the buffer side is zeroed
+// (to_pool) or skipped, so the logical image always holds something defined for that page.
+bool page_part(ConversationBuffer& buf, void* const pool_i, bool to_pool, int64_t p, int64_t phys,
+               size_t pb, std::string& error) {
+    const size_t at0 = (size_t) p * pb;
+    if (phys < 0) {
+        if (to_pool) return true;
+        return buf.visit(at0, pb, [&](uint8_t* q, size_t n, size_t) {
+            std::memset(q, 0, n);
+            return true;
+        });
+    }
+    uint8_t* const base = static_cast<uint8_t*>(pool_i) + (size_t) phys * pb;
+    if (to_pool)
+        return const_cast<const ConversationBuffer&>(buf).visit(at0, pb,
+            [&](const uint8_t* q, size_t n, size_t at) {
+                return transfer(base + (at - at0), q, n, error);
+            });
+    return buf.visit(at0, pb, [&](uint8_t* q, size_t n, size_t at) {
+        return transfer(q, base + (at - at0), n, error);
+    });
+}
+
+// The K/V parts (0..3) of a table-mapped state, moved page by page through `page_part`.  `keep_page` pages at
+// the front are skipped (the unchanged-prefix reuse of the linear path), `pages` is the logical page count.
+bool paged_parts(const std::array<ConversationBuffer*, 5>& buf, const std::array<void*, 5>& pool,
+                 bool to_pool, int64_t keep_page, int64_t pages, const int32_t* table,
+                 const std::array<size_t, 5>& pb, std::string& error) {
+    for (size_t i = 0; i < 4; ++i) {
+        if (!pb[i]) continue;
+        for (int64_t p = keep_page; p < pages; ++p)
+            if (!page_part(*buf[i], pool[i], to_pool, p, phys_page(table, p), pb[i], error)) return false;
+    }
+    return true;
+}
 } // namespace
 
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
@@ -146,7 +197,7 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
 
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
-                          int64_t unchanged_tokens, size_t* reused_bytes) {
+                          int64_t unchanged_tokens, size_t* reused_bytes, const int32_t* table) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
@@ -165,7 +216,15 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     const auto src = pools(st);
     const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
-    for (size_t i = 0; i < dst.size(); ++i) {
+    for (size_t i = 0; i < dst.size(); ++i) dst[i]->resize(sizes[i]);
+    if (table != nullptr) {
+        // a mapped state: each logical K/V page to or from its own physical page; the pooled rows never map
+        const int64_t pages = l.page_size > 0 ? l.cells / l.page_size : 0;
+        if (!paged_parts(dst, src, false, whole_cells / l.page_size, pages, table, page_bytes(l), error))
+            return false;
+        if (reused_bytes)
+            for (size_t i = 0; i < 4; ++i) *reused_bytes += (size_t) (whole_cells / l.page_size) * page_bytes(l)[i];
+    } else for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
         const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
@@ -174,6 +233,16 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         dst[i]->resize(sizes[i]);
         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
                 return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+            })) return false;
+        if (reused_bytes) *reused_bytes += keep;
+    }
+    if (table == nullptr) return true;
+    // the pooled rows of the mapped path, the same keep rule as the linear one
+    if (index) {
+        const size_t keep = size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4;
+        if (keep > image.pooled.size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
+        if (!image.pooled.visit(keep, sizes[4] - keep, [&](uint8_t* p, size_t n, size_t at) {
+                return transfer(p, static_cast<const uint8_t*>(src[4]) + at, n, error);
             })) return false;
         if (reused_bytes) *reused_bytes += keep;
     }
@@ -221,7 +290,8 @@ bool refresh_residency(const QsaState& st, const ModelGeometry& g, int64_t upto,
 } // namespace
 
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
-                          int64_t upto, bool index, std::string& error, bool queued) {
+                          int64_t upto, bool index, std::string& error, bool queued,
+                          const int32_t* table_from, const int32_t* table_to) {
     Layout lf{}, lt{};
     if (!layout(from, g, upto, index, lf, error) || !valid(from, lf, upto, error) ||
         !layout(to, g, upto, index, lt, error) || !valid(to, lt, upto, error)) return false;
@@ -238,6 +308,41 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
     const auto src = pools(from);
     const auto dst = pools(to);
     const std::array<size_t,5> sizes = {lf.data, lf.value_data, lf.scales, lf.value_scales, lf.pooled};
+    if (table_from != nullptr || table_to != nullptr) {
+        // a mapped pair (at least one side pages): each logical page from its own physical page to its own.
+        // A page both sides map to the SAME physical id is already there - the shared prefix, moved nowhere.
+        const auto pb = page_bytes(lf);
+        const int64_t pages = lf.page_size > 0 ? lf.cells / lf.page_size : 0;
+        for (size_t i = 0; i < 4; ++i) {
+            if (!pb[i]) continue;
+            for (int64_t p = 0; p < pages; ++p) {
+                const int64_t pf = phys_page(table_from, p), pt = phys_page(table_to, p);
+                if (pf == pt) continue;
+                if (pf < 0 || pt < 0) {
+                    error = "conversation snapshot: direct K/V copy over an unmapped page";
+                    return false;
+                }
+                const cudaError_t e = conversation_detail::copy_nonblocking(
+                    static_cast<uint8_t*>(dst[i]) + (size_t) pt * pb[i],
+                    static_cast<const uint8_t*>(src[i]) + (size_t) pf * pb[i], pb[i], queued);
+                if (e != cudaSuccess) {
+                    error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e);
+                    return false;
+                }
+            }
+        }
+        const size_t pooled = sizes[4];
+        if (pooled && (!src[4] || !dst[4])) { error = "conversation snapshot: missing state buffer"; return false; }
+        if (pooled) {
+            const cudaError_t e = conversation_detail::copy_nonblocking(dst[4], src[4], pooled, queued);
+            if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
+        }
+        if (queued && to.kv_mode != 0) {
+            const cudaError_t e = conversation_detail::order_after_queued();
+            if (e != cudaSuccess) { error = std::string("conversation snapshot direct copy: ") + cudaGetErrorString(e); return false; }
+        }
+        return refresh_residency(to, g, upto, error);
+    }
     for (size_t i = 0; i < sizes.size(); ++i) {
         if (!sizes[i]) continue;
         if (!src[i] || !dst[i]) { error = "conversation snapshot: missing state buffer"; return false; }
@@ -252,10 +357,25 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
 }
 
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                             int64_t upto, bool index, std::string& error) {
+                             int64_t upto, bool index, std::string& error, const int32_t* table,
+                             int64_t skip_pages) {
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     const auto dst = pools(st);
+    if (table != nullptr) {   // a mapped state: the K/V pages land at their own physical pages.  `skip_pages`:
+        // pages already where they belong (the shared prefix a branch reads), restored by nobody.
+        Layout l{};
+        if (!layout(st, g, upto, index, l, error)) return false;
+        std::array<ConversationBuffer*, 5> mut = {const_cast<ConversationBuffer*>(src[0]), const_cast<ConversationBuffer*>(src[1]),
+                                                  const_cast<ConversationBuffer*>(src[2]), const_cast<ConversationBuffer*>(src[3]), nullptr};
+        if (skip_pages < 0) skip_pages = 0;
+        if (!paged_parts(mut, dst, true, skip_pages, l.page_size > 0 ? l.cells / l.page_size : 0, table, page_bytes(l), error))
+            return false;
+        if (src[4]->size() && !src[4]->visit(0, src[4]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+                return transfer(static_cast<uint8_t*>(dst[4]) + at, p, n, error);
+            })) return false;
+        return refresh_residency(st, g, upto, error);
+    }
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
@@ -264,7 +384,8 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
 }
 
 bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                                    int64_t captured, int64_t upto, bool index, std::string& error) {
+                                    int64_t captured, int64_t upto, bool index, std::string& error,
+                                    const int32_t* table, int64_t skip_pages) {
     if (upto < 0 || upto > captured) {
         error = "conversation snapshot: prefix beyond the captured K/V";
         return false;
@@ -277,6 +398,17 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
     for (size_t i = 0; i < src.size(); ++i)
         if (sizes[i] > src[i]->size()) { error = "conversation snapshot: prefix beyond the K/V payload"; return false; }
     const auto dst = pools(st);
+    if (table != nullptr) {   // a mapped state: the prefix's pages land at their own physical pages
+        std::array<ConversationBuffer*, 5> mut = {const_cast<ConversationBuffer*>(src[0]), const_cast<ConversationBuffer*>(src[1]),
+                                                  const_cast<ConversationBuffer*>(src[2]), const_cast<ConversationBuffer*>(src[3]), nullptr};
+        if (skip_pages < 0) skip_pages = 0;
+        if (!paged_parts(mut, dst, true, skip_pages, l.page_size > 0 ? l.cells / l.page_size : 0, table, page_bytes(l), error))
+            return false;
+        if (sizes[4] && !src[4]->visit(0, sizes[4], [&](const uint8_t* p, size_t n, size_t at) {
+                return transfer(static_cast<uint8_t*>(dst[4]) + at, p, n, error);
+            })) return false;
+        return refresh_residency(st, g, upto, error);
+    }
     for (size_t i = 0; i < src.size(); ++i)
         if (!src[i]->visit(0, sizes[i], [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
@@ -293,7 +425,7 @@ bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int6
 }
 
 bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const ModelGeometry& g,
-                            int64_t upto, bool index, std::string& error) {
+                            int64_t upto, bool index, std::string& error, const int32_t* table) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error)) return false;
     SessionKvSource s;
@@ -302,9 +434,25 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
     s.sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const auto src = pools(st);
     const auto sizes = s.sizes;
+    const auto pb = page_bytes(l);
     auto why = std::make_shared<std::string>();
-    s.read = [src, sizes, why](size_t part, size_t offset, void* dst, size_t n) {
+    s.read = [src, sizes, why, table, pb](size_t part, size_t offset, void* dst, size_t n) {
         if (part >= 5 || offset > sizes[part] || n > sizes[part] - offset) { *why = "K/V read out of range"; return false; }
+        if (table != nullptr && part < 4 && pb[part] > 0) {
+            // a mapped state: the read walks the logical pages the file wants, each from its own physical one
+            size_t done = 0;
+            while (done < n) {
+                const size_t at = offset + done;
+                const size_t page = at / pb[part], in = at % pb[part];
+                const size_t chunk = std::min(n - done, pb[part] - in);
+                const int64_t phys = phys_page(table, (int64_t) page);
+                if (phys < 0) std::memset(static_cast<uint8_t*>(dst) + done, 0, chunk);
+                else if (!transfer(static_cast<uint8_t*>(dst) + done,
+                                   static_cast<const uint8_t*>(src[part]) + phys * pb[part] + in, chunk, *why)) return false;
+                done += chunk;
+            }
+            return true;
+        }
         return transfer(dst, src[part] ? static_cast<const uint8_t*>(src[part]) + offset : nullptr, n, *why);
     };
     s.error = [why] { return *why; };
@@ -313,8 +461,13 @@ bool conversation_kv_source(SessionKvSource& out, const QsaState& st, const Mode
 }
 
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
-                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error) {
+                            int64_t upto, bool index, uint64_t& fingerprint, std::string& error,
+                            const int32_t* table) {
     if (!conversation_kv_validate(image, st, g, upto, index, error)) return false;
+    if (table != nullptr) {
+        error = "conversation snapshot: verify of a page-mapped state is not implemented";
+        return false;
+    }
     std::array<uint8_t, 65536> buffer;
     uint64_t hash = 1469598103934665603ull;
     auto compare = [&](const void* device, const uint8_t* expected, size_t bytes, bool include_hash) {

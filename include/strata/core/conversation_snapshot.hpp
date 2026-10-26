@@ -15,37 +15,48 @@ size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int6
 // A nonzero unchanged_tokens is valid only for storage retained from an image
 // actually restored into this session, bounded by every subsequent rewrite.
 // Equal token IDs alone do not establish that its K/V bytes are unchanged.
+/// --kv-share: the K/V parts of a state whose page table is not the identity (a session branching from the
+/// shared prefix) live at their own physical pages.  `table` (n_pages entries, the HOST copy of the mapping
+/// the session's states were given, null = identity) translates logical pages to physical ones in save,
+/// restore, restore_prefix, copy and source.  The indexer rows (part 4) are per-session state in the
+/// logical layout and never translate.  A null table keeps the exact one-transfer-per-part path of before.
 bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error,
-                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr);
+                          int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr,
+                          const int32_t* table = nullptr);
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                    int64_t upto, bool include_index, size_t& bytes, std::string& error);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
 bool conversation_kv_validate(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                               int64_t upto, bool include_index, std::string& error);
 bool conversation_kv_restore(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
-                             int64_t upto, bool include_index, std::string& error);
+                             int64_t upto, bool include_index, std::string& error, const int32_t* table = nullptr,
+                             int64_t skip_pages = 0);
 // conversation_kv_save(from) + conversation_kv_restore(to) without a host image, for two states of the same layout.
 // The copies are complete on return; the residency refresh is queued on the legacy stream like the restore's.
 // `queued`: the copies are only queued on the private copy stream, the refresh is ordered after them on the device,
 // and the caller synchronizes the device before it reads or writes either state.
 bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelGeometry& g,
-                          int64_t upto, bool include_index, std::string& error, bool queued = false);
+                          int64_t upto, bool include_index, std::string& error, bool queued = false,
+                          const int32_t* table_from = nullptr, const int32_t* table_to = nullptr);
 // The first `upto` tokens of an image captured at `captured` tokens: the leading bytes of each buffer (cells come
 // first in the identity layout, as conversation_kv_save takes them), the image untouched.  Cells and indexer rows
 // past `upto` in the restored pages hold the image's later tokens until a request writes them, as after a whole
 // restore followed by a rewind to a checkpoint.
 bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
-                                    int64_t captured, int64_t upto, bool include_index, std::string& error);
+                                    int64_t captured, int64_t upto, bool include_index, std::string& error,
+                                    const int32_t* table = nullptr, int64_t skip_pages = 0);
 // Diagnostic read-back after a synchronized restore. Uses 64 KiB of stack
 // workspace, compares authoritative bytes and resident draft-ring pages, and
 // fingerprints the authoritative payload only. Never changes model state.
 bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
-                            int64_t upto, bool include_index, uint64_t& fingerprint, std::string& error);
+                            int64_t upto, bool include_index, uint64_t& fingerprint, std::string& error,
+                            const int32_t* table = nullptr);
 // Disk save without a host copy: the layer's authoritative K/V as a streamed source (same bytes and metadata as
 // conversation_kv_save).  Caller synchronizes the device first and keeps the state untouched while it is read.
 bool conversation_kv_source(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,
-                            int64_t upto, bool include_index, std::string& error);
+                            int64_t upto, bool include_index, std::string& error,
+                            const int32_t* table = nullptr);
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
                                 std::array<uint64_t, 5>& sizes, std::string& error);
@@ -97,13 +108,15 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& session, const ModelGeometry& g,
                                 const QsaState& draft, std::string& error,
-                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
+                                const int32_t* table = nullptr);
 // Disk save without capturing the K/V on the host: `meta` gets everything but the K/V (running state copied,
 // checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft.  Caller has
 // synchronized and must not run the session until the file is written.
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& session,
-                                   const ModelGeometry& g, const QsaState& draft, std::string& error);
+                                   const ModelGeometry& g, const QsaState& draft, std::string& error,
+                                   const int32_t* table = nullptr);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 enum class ConversationRestore { restored, invalid, transfer_failed };
@@ -111,13 +124,15 @@ enum class ConversationRestore { restored, invalid, transfer_failed };
 // leave partial state: caller MUST NOT continue inference from that session.
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState& draft,
-                                                   std::string& error);
+                                                   std::string& error, const int32_t* table = nullptr,
+                                                   int64_t skip_pages = 0);
 // The K/V of the image's first `upto` tokens (main layers and the draft layer), not its running state: the caller
 // mounts a checkpoint taken at `upto`.  For a checkpoint of a parked conversation that a new conversation starts
 // with, while the parked one stays where it is (ConversationCache::borrows).  Same failure contract as above.
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& session, const ModelGeometry& g,
-                                                          const QsaState& draft, std::string& error);
+                                                          const QsaState& draft, std::string& error,
+                                                          const int32_t* table = nullptr, int64_t skip_pages = 0);
 
 // The same with `draft == nullptr`: an image WITHOUT the draft layer's K/V (kv holds the session's own QSA layers
 // only).  A layer split's later stages park this way; the draft ring is saved once, with the first stage's image.
@@ -130,13 +145,16 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
                                          size_t& bytes, std::string& error);
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
-                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr);
+                                ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
+                                const int32_t* table = nullptr);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
-                                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
+                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                                   const int32_t* table = nullptr, int64_t skip_pages = 0);
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& session, const ModelGeometry& g,
-                                                          const QsaState* draft, std::string& error);
+                                                          const QsaState* draft, std::string& error,
+                                                          const int32_t* table = nullptr, int64_t skip_pages = 0);
 
 } // namespace strata::core

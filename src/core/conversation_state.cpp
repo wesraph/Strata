@@ -301,7 +301,7 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
                                 const QsaState* draft, std::string& error,
-                                ConversationKvReuse reuse, size_t* reused_bytes) {
+                                ConversationKvReuse reuse, size_t* reused_bytes, const int32_t* table) {
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
     // Build into a new object so a failure cannot publish a partial snapshot.
@@ -318,18 +318,18 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     const int64_t upto = (int64_t) view.ids.size();
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
-                                  unchanged, reused_bytes)) return false;
+                                  unchanged, reused_bytes, table)) return false;
     // The draft's final cell may not have been computed when the output cap was
     // reached. Refresh that page even when the main prefix continued unchanged.
     if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
-                                       std::max<int64_t>(0, unchanged - 1), reused_bytes)) return false;
+                                       std::max<int64_t>(0, unchanged - 1), reused_bytes, nullptr)) return false;
     image = std::move(captured);
     return true;
 }
 
 bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
                                    const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
-                                   const QsaState& draft, std::string& error) {
+                                   const QsaState& draft, std::string& error, const int32_t* table) {
     if (!view_validate(view, ss, g, error) || !sync(error)) return false;
     SavedConversation captured;
     captured.geometry = geometry_key(g);
@@ -341,8 +341,8 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     const size_t layers = owned_qsa(ss);
     std::vector<SessionKvSource> out(layers + 1);
     for (size_t j = 0; j < layers; ++j)
-        if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error)) return false;
-    if (!conversation_kv_source(out.back(), draft, g, upto, false, error)) return false;
+        if (!conversation_kv_source(out[j], owned(ss, j), g, upto, true, error, table)) return false;
+    if (!conversation_kv_source(out.back(), draft, g, upto, false, error, nullptr)) return false;
     meta = std::move(captured);
     sources = std::move(out);
     return true;
@@ -398,14 +398,15 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
 }
 
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
-                                                   const ModelGeometry& g, const QsaState* draft, std::string& error) {
+                                                   const ModelGeometry& g, const QsaState* draft, std::string& error,
+                                                   const int32_t* table, int64_t skip_pages) {
     if (!conversation_snapshot_validate(image, ss, g, draft, error)) return ConversationRestore::invalid;
     if (!sync(error)) return ConversationRestore::transfer_failed;
     const int64_t upto = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < owned_qsa(ss); ++j)
-        if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error))
+        if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error, table, skip_pages))
             return ConversationRestore::transfer_failed;
-    if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error)) ||
+    if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error, nullptr, 0)) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
 }
@@ -422,8 +423,8 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 }
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& ss,
                                 const ModelGeometry& g, const QsaState& draft, std::string& error,
-                                ConversationKvReuse reuse, size_t* reused_bytes) {
-    return conversation_snapshot_save(image, view, ss, g, &draft, error, std::move(reuse), reused_bytes);
+                                ConversationKvReuse reuse, size_t* reused_bytes, const int32_t* table) {
+    return conversation_snapshot_save(image, view, ss, g, &draft, error, std::move(reuse), reused_bytes, table);
 }
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
                                     const QsaState& draft, std::string& error) {
@@ -432,17 +433,20 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     return conversation_snapshot_validate(image, ss, g, &draft, error);
 }
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& ss,
-                                                   const ModelGeometry& g, const QsaState& draft, std::string& error) {
-    return conversation_snapshot_restore(image, ss, g, &draft, error);
+                                                   const ModelGeometry& g, const QsaState& draft, std::string& error,
+                                                   const int32_t* table, int64_t skip_pages) {
+    return conversation_snapshot_restore(image, ss, g, &draft, error, table, skip_pages);
 }
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& ss, const ModelGeometry& g,
-                                                          const QsaState& draft, std::string& error) {
-    return conversation_snapshot_restore_prefix(image, upto, ss, g, &draft, error);
+                                                          const QsaState& draft, std::string& error,
+                                                          const int32_t* table, int64_t skip_pages) {
+    return conversation_snapshot_restore_prefix(image, upto, ss, g, &draft, error, table, skip_pages);
 }
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& ss, const ModelGeometry& g,
-                                                          const QsaState* draft, std::string& error) {
+                                                          const QsaState* draft, std::string& error,
+                                                          const int32_t* table, int64_t skip_pages) {
     // a layer split's image (stage images) is restored stage by stage, never in part
     if (!image.stage_images.empty()) {
         fail(error, "a layer split's image restored as a single session");
@@ -456,9 +460,9 @@ ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation
     }
     if (!sync(error)) return ConversationRestore::transfer_failed;
     for (size_t j = 0; j < owned_qsa(ss); ++j)
-        if (!conversation_kv_restore_prefix(image.kv[j], owned(ss, j), g, captured, upto, true, error))
+        if (!conversation_kv_restore_prefix(image.kv[j], owned(ss, j), g, captured, upto, true, error, table, skip_pages))
             return ConversationRestore::transfer_failed;
-    if (draft && !conversation_kv_restore_prefix(image.kv.back(), *draft, g, captured, upto, false, error))
+    if (draft && !conversation_kv_restore_prefix(image.kv.back(), *draft, g, captured, upto, false, error, nullptr, 0))
         return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
 }
