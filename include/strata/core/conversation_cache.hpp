@@ -270,6 +270,11 @@ public:
         return best;
     }
 
+    /// STRATA_KV_SHARE_DEBUG: the most recently parked entry (null: none), for divergence tracing only.
+    const SavedConversation* debug_last() const {
+        return entries_.empty() ? nullptr : &entries_.back();
+    }
+
     SavedConversation take(size_t index) {
         SavedConversation out = std::move(entries_.at(index));
         bytes_ -= out.bytes();

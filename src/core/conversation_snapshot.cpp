@@ -239,7 +239,8 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         if (!paged_parts(dst, src, false, skip_pages + whole_cells / l.page_size, pages, table, pb2, skip_pages, error))
             return false;
         if (reused_bytes)
-            for (size_t i = 0; i < 4; ++i) *reused_bytes += (size_t) (whole_cells / l.page_size) * page_bytes(l)[i];
+            for (size_t i = 0; i < 4; ++i)
+                *reused_bytes += (size_t) ((whole_cells / l.page_size) + skip_pages) * page_bytes(l)[i];
     } else for (size_t i = 0; i < dst.size(); ++i) {
         // Recopy the partial page and the indexer's moving spare row. Completed
         // pages/rows strictly before the first rewritten token remain identical.
@@ -359,7 +360,10 @@ bool conversation_kv_copy(const QsaState& from, const QsaState& to, const ModelG
                 if (run == 0) {
                     if (pf0 < 0 && pt0 < 0) { ++p; continue; }   // unmapped on both sides: nothing to move
                     if (pf0 < 0 || pt0 < 0) {
-                        error = "conversation snapshot: direct K/V copy over an unmapped page";
+                        char detail[160];
+                        std::snprintf(detail, sizeof detail, " (page %lld of %lld: from=%lld to=%lld)", (long long) p,
+                                      (long long) pages, (long long) pf0, (long long) pt0);
+                        error = std::string("conversation snapshot: direct K/V copy over an unmapped page") + detail;
                         return false;
                     }
                     ++p;   // pf0 == pt0: already there

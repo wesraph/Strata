@@ -10080,6 +10080,10 @@ int main(int argc, char** argv) {
                     return true;
                 }
                 const size_t snapshot_bytes = image.bytes();
+                if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr)
+                    std::fprintf(stderr, "kvshare-park: %lld tokens, skip=%lld pages, table=%d\n",
+                                 (long long) live.size(), (long long) kvshs.sess[0].cached.size(),
+                                 kvshs.t() != nullptr ? 1 : 0);
                 const bool stored = conversations.put(std::move(image), held);
                 std::fprintf(stderr, "strata serve: conversation cache: %s %zu tokens in %.1f ms; parked=%zu bytes=%zu evictions=%zu snapshot_bytes=%zu reused_kv_bytes=%zu\n",
                              stored ? "parked" : "skipped", live.size(),
@@ -11896,7 +11900,24 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata batch: slot copies reuse the host image (STRATA_SLOT_SHUTTLE=0 allocates a fresh one)\n");
         };
         auto direct_slot_copy = [&](bool into_slot, int b, const std::vector<int32_t>& ids, std::string& e, int64_t growth) -> bool {
-            const int64_t upto = (int64_t) ids.size();
+            int64_t upto = (int64_t) ids.size();
+            // A GIVE-BACK may ask for pages past the slot's table (its conversation grew past what the last
+            // admission of that session mapped).  Clamping to the table's coverage is always correct - the
+            // conversation resumes from the covered prefix and the request re-reads the uncovered tail - where
+            // copying over an unmapped page would wipe the whole conversation into a full re-read.
+            if (!into_slot && kvsh && !kvshs.sess.empty() && (size_t) b + 1 < kvshs.sess.size()) {
+                const std::vector<int32_t>& ft = kvshs.sess[(size_t) b + 1].table;
+                int64_t covered = 0;
+                for (int64_t q = 0; q < (int64_t) ft.size(); ++q)
+                    if (ft[(size_t) q] >= 0) covered = q + 1;
+                const int64_t cov_cells = covered * kvsh_ps;
+                if (cov_cells < upto) {
+                    std::fprintf(stderr, "strata batch: slot %d's table covers %lld of %lld tokens; the give-back "
+                                         "takes the covered prefix and the request re-reads the tail\n",
+                                 b, (long long) cov_cells, (long long) upto);
+                    upto = cov_cells;
+                }
+            }
             if (kvsh) {   // the receiving session takes the conversation's mapping before anything moves
                 if (into_slot) {
                     if (!kvsh_admit((size_t) b + 1, ids, upto, upto + growth)) { e = "batch slot copy: the K/V pool is full"; return false; }
@@ -13516,6 +13537,35 @@ int main(int argc, char** argv) {
                 }
             }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
+            if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr) {
+                // why a parked match hit or missed: the decision inputs, and on a miss against a NON-empty
+                // cache the first token divergence against the most recent entry (the rendering changed there)
+                std::fprintf(stderr, "kvshare-match: n=%lld resume=%lld slot=%lld live=%d parked=%lld/%zu\n",
+                             (long long) n, (long long) resume, (long long) slot_tokens, live_ok ? 1 : 0,
+                             (long long) parked.tokens, conversations.size());
+                if (parked.tokens <= 0 && conversations.size() > 0) {
+                    const auto* e = conversations.debug_last();
+                    std::vector<int32_t> empty_ids;
+                    const std::vector<int32_t>* src = &empty_ids;
+                    if (e != nullptr) {
+                        if (!e->checkpoints.empty()) src = &e->checkpoints.back().ids;
+                        else if (!e->live.ids.empty()) src = &e->live.ids;
+                    }
+                    const std::vector<int32_t>& pids = *src;
+                    int64_t d = 0;
+                    while (d < (int64_t) pids.size() && d < (int64_t) ids.size() &&
+                           (int32_t) ids[(size_t) d] == pids[(size_t) d]) ++d;
+                    std::fprintf(stderr, "kvshare-match: MISS vs last entry of %lld tokens: common=%lld "
+                                         "(at the divergence: parked=%lld new=%lld; parked[0..3]=%lld,%lld,%lld,%lld "
+                                         "new[0..3]=%lld,%lld,%lld,%lld)\n", (long long) pids.size(), (long long) d,
+                                 d < (int64_t) pids.size() ? (long long) pids[(size_t) d] : -1LL,
+                                 d < (int64_t) ids.size() ? (long long) ids[(size_t) d] : -1LL,
+                                 (long long) (pids.size() > 0 ? pids[0] : -1), (long long) (pids.size() > 1 ? pids[1] : -1),
+                                 (long long) (pids.size() > 2 ? pids[2] : -1), (long long) (pids.size() > 3 ? pids[3] : -1),
+                                 (long long) (ids.size() > 0 ? ids[0] : -1), (long long) (ids.size() > 1 ? ids[1] : -1),
+                                 (long long) (ids.size() > 2 ? ids[2] : -1), (long long) (ids.size() > 3 ? ids[3] : -1));
+                }
+            }
             std::optional<strata::core::SavedConversation> incoming;
             // A checkpoint inside ANOTHER parked conversation (a sibling subagent's system prompt and tools, say) is
             // borrowed: its K/V up to there and the checkpoint come over, and that conversation stays parked for its
