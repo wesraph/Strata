@@ -162,12 +162,31 @@ int main() {
         check(cache_ext.take(4, again), "remap after the drop");
         check(cache_ext.register_page(again[0], 0xdeadbeef, &tok[0]), "register a page");
         cache_ext.release_page(again[0]);
+        for (int i = 1; i < 4; ++i) cache_ext.release_page(again[(size_t) i]);   // the held pages go too
         check(cache_ext.mapped_extents() == 1, "a cached page keeps its extent mapped");
-        map_fail_at = 0;   // no further mapping: eviction is the only room left, and evicting the one
-                           // cached page empties its extent - the memory drops, the page does not become takeable
+        map_fail_at = 0;   // no further mapping.  A take beyond the extent's three free siblings forces
+                           // the eviction; the freed page joins them, the extent empties, its memory drops,
+                           // and the take cannot be satisfied after all - evicted-to-nothing refuses
         std::vector<int32_t> third;
-        check(!cache_ext.take(1, third) && cache_ext.mapped_extents() == 0 && cache_ext.cached_count() == 0,
-              "evicting the only content empties the extent and refuses the take");
+        check(cache_ext.take(3, third) && cache_ext.cached_count() == 1,
+              "the freed siblings are taken while the cached page holds the extent");
+        {
+            // fresh memory beats eviction: a take that can MAP a new extent must not evict a cached
+            // page to satisfy itself (the prefix is worth more than idle VRAM)
+            PageCache pc;
+            pc.init(16, 4, [&](int64_t) { return true; }, [](int64_t) {});
+            std::vector<int32_t> fill;
+            check(pc.take(4, fill), "one extent filled");
+            static const int32_t t4b[4] = {9,8,7,6};
+            check(pc.register_page(fill[0], 0xabcULL, t4b), "one page cached");
+            pc.release_page(fill[0]);
+            for (int i = 1; i < 4; ++i) pc.release_page(fill[(size_t) i]);
+            std::vector<int32_t> five;
+            check(pc.take(5, five) && pc.cached_count() == 1 && pc.mapped_extents() == 2,
+                  "a mappable take maps a new extent instead of evicting the cache");
+        }
+        check(!cache_ext.take(2, third) && cache_ext.mapped_extents() == 1 && cache_ext.cached_count() == 0,
+              "eviction frees one page of a still-occupied extent and the take refuses");
         map_fail_at = -1;
         std::vector<int32_t> held;
         check(cache_ext.take(3, held), "three pages in one extent");
@@ -176,7 +195,7 @@ int main() {
         for (int i = 0; i < 3; ++i) cache_ext.release_page(held[(size_t) i]);   // cached, unpinned: evictable
         map_fail_at = 0;
         std::vector<int32_t> four;
-        check(cache_ext.take(2, four) && cache_ext.mapped_extents() == 1 && cache_ext.cached_count() <= 2,
+        check(cache_ext.take(3, four) && cache_ext.mapped_extents() >= 1 && cache_ext.cached_count() <= 2,
               "a failed map evicts cached pages of the mapped extent instead");
         while (cache_ext.cached_count() > 0 || cache_ext.free_count() > 0)
             if (!cache_ext.take(1, four)) break;   // evict-and-take until the extent is bare

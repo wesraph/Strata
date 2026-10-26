@@ -9802,7 +9802,15 @@ int main(int argc, char** argv) {
         // conversation cache's) or a full read; the K/V pages alone cannot reconstruct it.
         auto kvsh_admit = [&](size_t si, const auto& ids, int64_t resume, int64_t cells) -> bool {
             if (!kvsh) return true;
-            kvsh_release(si);
+            // A borrowed request admits twice (the borrow's restore, then the read with its growth headroom).
+            // The second admit must NOT drop the first's own pages - they hold the restored K/V, and the
+            // allocator is not guaranteed to hand back the same ids.  Keep the own-prefix whenever the
+            // cached prefix is unchanged (its size sets the own pages' logical offset); only a CHANGED
+            // cached prefix reindexes own, and then a full release is the only correct move.
+            const size_t old_cached_n = kvshs.sess[si].cached.size();
+            const size_t old_own_n = kvshs.sess[si].own.size();
+            for (int32_t id : kvshs.sess[si].cached) kv_pages.unpin(id);
+            kvshs.sess[si].cached.clear();
             KvShareState::Session& s = kvshs.sess[si];
             s.last_reg = 0;
             const int64_t limit = std::min<int64_t>({resume, (int64_t) ids.size(), cells}) / kvsh_ps;
@@ -9819,13 +9827,28 @@ int main(int argc, char** argv) {
             }
             const int64_t k = (int64_t) s.cached.size();
             const int64_t need = (std::max<int64_t>(cells, k * kvsh_ps) - k * kvsh_ps + kvsh_ps - 1) / kvsh_ps;
-            if (!kv_pages.take(need, s.own)) {
-                for (int32_t id : s.cached) kv_pages.unpin(id);
-                s.cached.clear();
+            const bool keep_own = (size_t) k == old_cached_n;   // same prefix: own keeps its logical offset
+            if (keep_own && (int64_t) old_own_n > need) {   // shrink: hand the tail back
+                std::vector<int32_t> tail(s.own.begin() + (std::ptrdiff_t) need, s.own.end());
+                for (int32_t id : tail) kv_pages.release_page(id);
+                s.own.resize((size_t) need);
+            }
+            if (!keep_own) {
+                for (int32_t id : s.own) kv_pages.release_page(id);
                 s.own.clear();
-                kvsh_build(s, false);
-                kvsh_apply(si);
-                return false;
+            }
+            while ((int64_t) s.own.size() < need) {
+                std::vector<int32_t> more;
+                if (!kv_pages.take(need - (int64_t) s.own.size(), more)) {
+                    for (int32_t id : s.cached) kv_pages.unpin(id);
+                    s.cached.clear();
+                    for (int32_t id : s.own) kv_pages.release_page(id);
+                    s.own.clear();
+                    kvsh_build(s, false);
+                    kvsh_apply(si);
+                    return false;
+                }
+                s.own.insert(s.own.end(), more.begin(), more.end());
             }
             kvsh_build(s, k > 0);
             kvsh_apply(si);

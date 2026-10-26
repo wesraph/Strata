@@ -68,6 +68,8 @@ public:
         for (int32_t id : ids) free_.erase(id);
     }
 
+    bool is_free(int32_t id) const { return free_.find(id) != free_.end(); }
+
     int64_t free_count() const { return (int64_t) free_.size(); }
     int64_t total() const { return total_; }
 
@@ -245,7 +247,8 @@ public:
         const int64_t e = id / per_extent_;
         if (e < 0 || e >= extents_ || !extent_mapped_[(size_t) e] || !unmap_extent_) return;
         for (int64_t p = e * per_extent_; p < (e + 1) * per_extent_ && p < total_pages_; ++p)
-            if (page_key_[(size_t) p] != 0 || page_refs_[(size_t) p] > 0) return;   // someone lives there
+            if (page_key_[(size_t) p] != 0 || page_refs_[(size_t) p] > 0 || !alloc_.is_free(p))
+                return;   // keyed, pinned, or held by a session mid-read: someone lives there
         std::vector<int32_t> drop;
         for (int64_t p = e * per_extent_; p < (e + 1) * per_extent_ && p < total_pages_; ++p)
             drop.push_back((int32_t) p);
