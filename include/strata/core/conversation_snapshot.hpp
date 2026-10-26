@@ -23,7 +23,7 @@ size_t conversation_kv_bytes(const QsaState& state, const ModelGeometry& g, int6
 bool conversation_kv_save(ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                           int64_t upto, bool include_index, std::string& error,
                           int64_t unchanged_tokens = 0, size_t* reused_bytes = nullptr,
-                          const int32_t* table = nullptr);
+                          const int32_t* table = nullptr, int64_t skip_pages = 0);
 bool conversation_kv_capture_bytes(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
                                    int64_t upto, bool include_index, size_t& bytes, std::string& error);
 // No CUDA calls or destination writes. Used for whole-session prevalidation.
@@ -109,7 +109,7 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
                                 const SessionState& session, const ModelGeometry& g,
                                 const QsaState& draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
-                                const int32_t* table = nullptr);
+                                const int32_t* table = nullptr, int64_t skip_pages = 0);
 // Disk save without capturing the K/V on the host: `meta` gets everything but the K/V (running state copied,
 // checkpoints as given by the view), `sources` one streamed source per QSA layer then the draft.  Caller has
 // synchronized and must not run the session until the file is written.
@@ -146,7 +146,7 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& session,
                                 const ModelGeometry& g, const QsaState* draft, std::string& error,
                                 ConversationKvReuse reuse = {}, size_t* reused_bytes = nullptr,
-                                const int32_t* table = nullptr);
+                                const int32_t* table = nullptr, int64_t skip_pages = 0);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState* draft, std::string& error);
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,

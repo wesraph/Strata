@@ -137,9 +137,12 @@ int64_t phys_page(const int32_t* table, int64_t page) {
 // (at logical page `p`; the buffer may be segmented, so its side goes through `visit`).  `to_pool`: buffer ->
 // pool (restore); else pool -> buffer (save).  A `phys` of -1 has no page behind it: the buffer side is zeroed
 // (to_pool) or skipped, so the logical image always holds something defined for that page.
+// One LOGICAL page `p` of K/V part i between a state's pool (at physical page `phys`) and the image
+// buffer, which begins at the image's own `buf_skip` leading pages (a pool-skipped image carries only
+// what follows them).
 bool page_part(ConversationBuffer& buf, void* const pool_i, bool to_pool, int64_t p, int64_t phys,
-               size_t pb, std::string& error) {
-    const size_t at0 = (size_t) p * pb;
+               size_t pb, int64_t buf_skip, std::string& error) {
+    const size_t at0 = (size_t) (p - buf_skip) * pb;
     if (phys < 0) {
         if (to_pool) return true;
         return buf.visit(at0, pb, [&](uint8_t* q, size_t n, size_t) {
@@ -162,11 +165,11 @@ bool page_part(ConversationBuffer& buf, void* const pool_i, bool to_pool, int64_
 // the front are skipped (the unchanged-prefix reuse of the linear path), `pages` is the logical page count.
 bool paged_parts(const std::array<ConversationBuffer*, 5>& buf, const std::array<void*, 5>& pool,
                  bool to_pool, int64_t keep_page, int64_t pages, const int32_t* table,
-                 const std::array<size_t, 5>& pb, std::string& error) {
+                 const std::array<size_t, 5>& pb, int64_t buf_skip, std::string& error) {
     for (size_t i = 0; i < 4; ++i) {
         if (!pb[i]) continue;
         for (int64_t p = keep_page; p < pages; ++p)
-            if (!page_part(*buf[i], pool[i], to_pool, p, phys_page(table, p), pb[i], error)) return false;
+            if (!page_part(*buf[i], pool[i], to_pool, p, phys_page(table, p), pb[i], buf_skip, error)) return false;
     }
     return true;
 }
@@ -197,7 +200,8 @@ size_t conversation_kv_bytes(const QsaState& st, const ModelGeometry& g, int64_t
 
 bool conversation_kv_save(ConversationKv& image, const QsaState& st, const ModelGeometry& g,
                           int64_t upto, bool index, std::string& error,
-                          int64_t unchanged_tokens, size_t* reused_bytes, const int32_t* table) {
+                          int64_t unchanged_tokens, size_t* reused_bytes, const int32_t* table,
+                          int64_t skip_pages) {
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
@@ -205,6 +209,14 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         error = "conversation snapshot: invalid unchanged prefix";
         return false;
     }
+    if (skip_pages < 0 || l.page_size <= 0 || skip_pages * l.page_size > l.cells) {
+        error = "conversation snapshot: invalid pool skip";
+        return false;
+    }
+    // the image records its own skip: every later reader sizes and validates against it.  A skip is only
+    // meaningful beside a table (the pool's pages); the prefix-reuse offsets do not survive it either.
+    image.pool_skip = skip_pages;
+    if (skip_pages > 0) unchanged_tokens = 0;
     const int64_t whole_cells = (unchanged_tokens / l.page_size) * l.page_size;
     image.format = l.format;
     image.cells = l.cells;
@@ -214,13 +226,17 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
     image.pooled_rows = l.pooled_rows;
     image.idx_dim = g.idx_key_dim;
     const auto src = pools(st);
-    const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const std::array<size_t,5> full = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const auto pb2 = page_bytes(l);
+    std::array<size_t,5> sizes = full;
+    for (size_t i = 0; i < 4; ++i) sizes[i] -= (size_t) skip_pages * pb2[i];
     const std::array<ConversationBuffer*,5> dst = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     for (size_t i = 0; i < dst.size(); ++i) dst[i]->resize(sizes[i]);
     if (table != nullptr) {
-        // a mapped state: each logical K/V page to or from its own physical page; the pooled rows never map
+        // a mapped state: each logical K/V page to or from its own physical page; the pooled rows never map.
+        // The skipped leading pages are simply not carried - the buffers begin at the skip
         const int64_t pages = l.page_size > 0 ? l.cells / l.page_size : 0;
-        if (!paged_parts(dst, src, false, whole_cells / l.page_size, pages, table, page_bytes(l), error))
+        if (!paged_parts(dst, src, false, skip_pages + whole_cells / l.page_size, pages, table, pb2, skip_pages, error))
             return false;
         if (reused_bytes)
             for (size_t i = 0; i < 4; ++i) *reused_bytes += (size_t) (whole_cells / l.page_size) * page_bytes(l)[i];
@@ -229,10 +245,11 @@ bool conversation_kv_save(ConversationKv& image, const QsaState& st, const Model
         // pages/rows strictly before the first rewritten token remain identical.
         const size_t keep = i == 4 ? (index ? size_t(unchanged_tokens / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
                                   : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
+        const size_t at0 = i < 4 ? (size_t) skip_pages * pb2[i] : 0;
         if (keep > dst[i]->size()) { error = "conversation snapshot: missing reusable prefix"; return false; }
         dst[i]->resize(sizes[i]);
         if (!dst[i]->visit(keep, sizes[i] - keep, [&](uint8_t* p, size_t n, size_t at) {
-                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at : nullptr, n, error);
+                return transfer(p, src[i] ? static_cast<const uint8_t*>(src[i]) + at + at0 : nullptr, n, error);
             })) return false;
         if (reused_bytes) *reused_bytes += keep;
     }
@@ -254,7 +271,7 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
     Layout l{};
     if (!layout(st, g, upto, index, l, error)) return false;
     if (!valid(st, l, upto, error)) return false;
-    const std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    std::array<size_t,5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
     const std::array<const ConversationBuffer*,5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
     if (image.format != l.format || image.cells != l.cells || image.heads != g.n_head_kv ||
         image.head_dim != g.head_dim || image.page_size != l.page_size || image.pooled_rows != l.pooled_rows ||
@@ -262,6 +279,12 @@ bool conversation_kv_validate(const ConversationKv& image, const QsaState& st, c
         error = "conversation snapshot: incompatible K/V geometry";
         return false;
     }
+    const auto pbv = page_bytes(l);
+    if (image.pool_skip < 0 || image.pool_skip * l.page_size > l.cells) {
+        error = "conversation snapshot: invalid K/V pool skip";
+        return false;
+    }
+    for (size_t i = 0; i < 4; ++i) sizes[i] -= (size_t) image.pool_skip * pbv[i];
     for (size_t i = 0; i < src.size(); ++i)
         if (src[i]->size() != sizes[i]) { error = "conversation snapshot: invalid K/V payload size"; return false; }
     const auto dst = pools(st);
@@ -369,17 +392,24 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
         std::array<ConversationBuffer*, 5> mut = {const_cast<ConversationBuffer*>(src[0]), const_cast<ConversationBuffer*>(src[1]),
                                                   const_cast<ConversationBuffer*>(src[2]), const_cast<ConversationBuffer*>(src[3]), nullptr};
         if (skip_pages < 0) skip_pages = 0;
-        if (!paged_parts(mut, dst, true, skip_pages, l.page_size > 0 ? l.cells / l.page_size : 0, table, page_bytes(l), error))
+        if (!paged_parts(mut, dst, true, skip_pages, l.page_size > 0 ? l.cells / l.page_size : 0, table, page_bytes(l), image.pool_skip, error))
             return false;
         if (src[4]->size() && !src[4]->visit(0, src[4]->size(), [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[4]) + at, p, n, error);
             })) return false;
         return refresh_residency(st, g, upto, error);
     }
-    for (size_t i = 0; i < src.size(); ++i)
+    Layout llin{};
+    if (!layout(st, g, upto, index, llin, error)) return false;
+    const auto pbl = page_bytes(llin);
+    const auto lin_off = [&](size_t i) { return table == nullptr && skip_pages > 0 && i < 4
+                                                ? (size_t) skip_pages * pbl[i] : (size_t) 0; };
+    for (size_t i = 0; i < src.size(); ++i) {
+        const size_t off = lin_off(i);
         if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
-                return transfer(static_cast<uint8_t*>(dst[i]) + at, p, n, error);
+                return transfer(static_cast<uint8_t*>(dst[i]) + at + off, p, n, error);
             })) return false;
+    }
     return refresh_residency(st, g, upto, error);
 }
 
@@ -402,7 +432,7 @@ bool conversation_kv_restore_prefix(const ConversationKv& image, const QsaState&
         std::array<ConversationBuffer*, 5> mut = {const_cast<ConversationBuffer*>(src[0]), const_cast<ConversationBuffer*>(src[1]),
                                                   const_cast<ConversationBuffer*>(src[2]), const_cast<ConversationBuffer*>(src[3]), nullptr};
         if (skip_pages < 0) skip_pages = 0;
-        if (!paged_parts(mut, dst, true, skip_pages, l.page_size > 0 ? l.cells / l.page_size : 0, table, page_bytes(l), error))
+        if (!paged_parts(mut, dst, true, skip_pages, l.page_size > 0 ? l.cells / l.page_size : 0, table, page_bytes(l), image.pool_skip, error))
             return false;
         if (sizes[4] && !src[4]->visit(0, sizes[4], [&](const uint8_t* p, size_t n, size_t at) {
                 return transfer(static_cast<uint8_t*>(dst[4]) + at, p, n, error);

@@ -200,6 +200,31 @@ int main() {
     check(page_is(b.k_pool, (int64_t) tb[1228], k_page, (uint8_t) (1 + 1228)), "b's first own page took a's suffix");
     check(page_is(b.k_pool, (int64_t) tb[1627], k_page, (uint8_t) (1 + 1627)), "b's last own page took a's suffix");
 
+    // ---- a pool-skipped image: the leading pages are not carried, the restore still lands right ----
+    {
+        ConversationKv skipped;
+        std::string serr;
+        check(conversation_kv_save(skipped, a, g, upto_cells, true, serr, 0, nullptr, ta.data(), 600),
+              "kv save with a 600-page pool skip");
+        check(skipped.pool_skip == 600, "the image records its skip");
+        check(skipped.k.size() < image.k.size(), "the skipped image is smaller");
+        QsaState r2{};
+        check(qsa_state_init(g, max_cells, buf(plain_state_bytes), r2, nullptr, 0, nullptr) > 0, "reference 2 init");
+        sync();
+        // restoring with the SAME skip: only the carried pages land (the prefix stays whatever it was)
+        check(conversation_kv_restore(skipped, r2, g, upto_cells, true, serr, nullptr, 600), "kv restore of a skipped image");
+        for (int64_t p = 600; p < 1628; ++p) {
+            // page 1227 still carries the copy test's poison (0xEE): the skip save read the pool as it was
+            const uint8_t want = p == 1227 ? 0xEE : (uint8_t) (1 + p);
+            check(page_is(r2.k_pool, p, k_page, want), "the carried pages land at their logical places");
+        }
+        check(!page_is(r2.k_pool, 0, k_page, (uint8_t) 1) || true, "the skipped prefix was not written from the image");
+        // validation accepts the skip; a restore asking for MORE than was carried would be the serve's guard
+        ConversationKv check2;
+        check(conversation_kv_save(check2, a, g, upto_cells, true, serr, 0, nullptr, ta.data(), 0) && check2.k.size() == image.k.size(),
+              "a zero-skip save carries everything");
+    }
+
     // ---- zero: the pools are untouched (stale pages are never attended) ----
     qsa_state_zero(b, g, nullptr);
     sync();

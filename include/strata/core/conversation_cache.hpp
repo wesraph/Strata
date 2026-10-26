@@ -57,6 +57,11 @@ struct ConversationCheckpoint {
 struct ConversationKv {
     int format = 0;
     int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
+    /// --kv-share: the leading pages this image does NOT carry because the pool's prefix cache held them
+    /// at capture time (their K/V parts are absent; the pooled indexer rows are carried in full - they are
+    /// per-session state).  A restore may use the image only while the pool still holds at least these
+    /// pages; below that the image is a miss and the conversation is read again from the start.
+    int64_t pool_skip = 0;
     ConversationBuffer k, v, k_scale, v_scale, pooled;
     size_t bytes() const {
         return k.bytes() + v.bytes() + k_scale.bytes() + v_scale.bytes() + pooled.bytes();

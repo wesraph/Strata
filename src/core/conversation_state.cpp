@@ -301,7 +301,8 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view,
                                 const SessionState& ss, const ModelGeometry& g,
                                 const QsaState* draft, std::string& error,
-                                ConversationKvReuse reuse, size_t* reused_bytes, const int32_t* table) {
+                                ConversationKvReuse reuse, size_t* reused_bytes, const int32_t* table,
+                                int64_t skip_pages) {
     size_t estimate = 0;
     if (!conversation_snapshot_capture_bytes(reuse, view, ss, g, draft, estimate, error) || !sync(error)) return false;
     // Build into a new object so a failure cannot publish a partial snapshot.
@@ -318,11 +319,11 @@ bool conversation_snapshot_save(SavedConversation& image, const ConversationView
     const int64_t upto = (int64_t) view.ids.size();
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_save(captured.kv[j], owned(ss, j), g, upto, true, error,
-                                  unchanged, reused_bytes, table)) return false;
+                                  unchanged, reused_bytes, table, table != nullptr ? skip_pages : 0)) return false;
     // The draft's final cell may not have been computed when the output cap was
     // reached. Refresh that page even when the main prefix continued unchanged.
     if (draft && !conversation_kv_save(captured.kv.back(), *draft, g, upto, false, error,
-                                       std::max<int64_t>(0, unchanged - 1), reused_bytes, nullptr)) return false;
+                                       std::max<int64_t>(0, unchanged - 1), reused_bytes, nullptr, 0)) return false;
     image = std::move(captured);
     return true;
 }
@@ -423,8 +424,10 @@ bool conversation_snapshot_capture_bytes(const ConversationKvReuse& reuse, const
 }
 bool conversation_snapshot_save(SavedConversation& image, const ConversationView& view, const SessionState& ss,
                                 const ModelGeometry& g, const QsaState& draft, std::string& error,
-                                ConversationKvReuse reuse, size_t* reused_bytes, const int32_t* table) {
-    return conversation_snapshot_save(image, view, ss, g, &draft, error, std::move(reuse), reused_bytes, table);
+                                ConversationKvReuse reuse, size_t* reused_bytes, const int32_t* table,
+                                int64_t skip_pages) {
+    return conversation_snapshot_save(image, view, ss, g, &draft, error, std::move(reuse), reused_bytes, table,
+                                      skip_pages);
 }
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& ss, const ModelGeometry& g,
                                     const QsaState& draft, std::string& error) {

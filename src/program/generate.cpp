@@ -9910,7 +9910,7 @@ int main(int argc, char** argv) {
                     bodies[0] = [&](std::string& e) {
                         const strata::core::OnDevice on(0);
                         return strata::core::conversation_snapshot_save(image, view, ss, g, draft0, e,
-                                std::move(reuse), &reused_b[0], kvshs.t());
+                                std::move(reuse), &reused_b[0], kvshs.t(), (int64_t) kvshs.sess[0].cached.size());
                     };
                     for (size_t k = 0; k < n_st; ++k)
                         bodies[k + 1] = [&, k](std::string& e) {
@@ -9929,7 +9929,7 @@ int main(int argc, char** argv) {
                     }
                 } else {
                     if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                            std::move(reuse), &reused_bytes, kvshs.t())) return false;
+                            std::move(reuse), &reused_bytes, kvshs.t(), (int64_t) kvshs.sess[0].cached.size())) return false;
                     for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                         auto& st = stages[k];
                         const strata::core::OnDevice on(st->dev);
@@ -13548,7 +13548,14 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 const int64_t kvsh_skip = (int64_t) kvshs.sess[0].cached.size();
-                if (donor == nullptr ||
+                if (kvsh && donor != nullptr && !donor->kv.empty() && donor->kv[0].pool_skip > kvsh_skip) {
+                    // the image was captured without its leading pages and the pool has since lost some:
+                    // the bytes exist nowhere, so this is a miss (the conversation is read from the start)
+                    std::fprintf(stderr, "strata serve: conversation cache: a parked prefix was evicted from the "
+                                         "K/V pool; reading the conversation whole\n");
+                    resume = 0;
+                    from_live = false;
+                } else if (donor == nullptr ||
                     strata::core::conversation_snapshot_restore_prefix(*donor, parked.tokens, ss, g,
                                                                        use_mtp ? &mtp.kv_state() : nullptr, err,
                                                                        kvshs.t(), kvsh_skip) !=
@@ -13582,7 +13589,12 @@ int main(int argc, char** argv) {
                     continue;
                 }
                 const int64_t kvsh_skip = (int64_t) kvshs.sess[0].cached.size();
-                if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
+                if (kvsh && !incoming->kv.empty() && incoming->kv[0].pool_skip > kvsh_skip) {
+                    std::fprintf(stderr, "strata serve: conversation cache: a parked prefix was evicted from the "
+                                         "K/V pool; reading the conversation whole\n");
+                    resume = 0;
+                    from_live = false;
+                } else if (strata::core::conversation_snapshot_restore(*incoming, ss, g,
                         use_mtp && (stages.empty() || mtp_first) ? &mtp.kv_state() : nullptr, err,
                         kvshs.t(), kvsh_skip) !=
                     strata::core::ConversationRestore::restored) {
@@ -14779,10 +14791,47 @@ int main(int argc, char** argv) {
                             pins += si == 0 ? " main:" + std::to_string(held)
                                             : " slot" + std::to_string(si - 1) + ":" + std::to_string(held);
                     }
-                    std::printf("ERR the K/V pool has no room for this conversation: %lld of %lld pages free, "
-                                "pages held:%s (shorten it, raise --kv-share, or free an agent)\n",
-                                (long long) kv_pages.free_count(), (long long) kv_pages.total(), pins.c_str());
-                    continue;   // this request only, as the context-window refusal above
+                    // PREEMPT-BY-PARK: an idle slot's conversation is parked to the host cache (best
+                    // effort) and its pages freed, until this conversation fits.  Active or yielded slots,
+                    // and picture conversations (their image identity cannot be rebuilt here), are left.
+                    bool admitted = false;
+                    for (int b = 0; b < o.batch && !admitted; ++b) {
+                        const auto& sb = bs[(size_t) b];
+                        if (!sb.cached || sb.img || sb.partial || sb.ids.size() < 2) continue;
+                        const size_t held = kvshs.sess[(size_t) b + 1].cached.size() +
+                                            kvshs.sess[(size_t) b + 1].own.size();
+                        if (held == 0) continue;
+                        static const std::vector<strata::core::ConversationImageKey> no_imgs;
+                        const strata::core::ConversationView view{sb.ids, no_imgs, sb.checks, sb.cvec};
+                        strata::core::SavedConversation image;
+                        std::string perr;
+                        size_t estimate = 0;
+                        if (strata::core::conversation_snapshot_capture_bytes({}, view, *bslot_ss[0][(size_t) b], g,
+                                                                              nullptr, estimate, perr) &&
+                            conversations.make_room(estimate, 0) &&
+                            strata::core::conversation_snapshot_save(image, view, *bslot_ss[0][(size_t) b], g, nullptr,
+                                                                     perr, {}, nullptr, kvshs.st(b))) {
+                            conversations.put(std::move(image), 0);
+                            std::fprintf(stderr, "strata serve: --kv-share: pool full; parked slot %d's conversation "
+                                                 "(%lld tokens) to the host cache, freeing %zu pages\n", b,
+                                         (long long) sb.ids.size(), held);
+                        } else {
+                            std::fprintf(stderr, "strata serve: --kv-share: pool full; could not park slot %d (%s); "
+                                                 "freeing its pages anyway - it reads again when it returns\n", b,
+                                         perr.empty() ? "no room" : perr.c_str());
+                        }
+                        bs[(size_t) b].cached = false;
+                        bs[(size_t) b].ids.clear();
+                        bs[(size_t) b].checks.clear();
+                        kvsh_release((size_t) b + 1);
+                        admitted = kvsh_admit(0, ids, read_from, n + max_new + 8);
+                    }
+                    if (!admitted) {
+                        std::printf("ERR the K/V pool has no room for this conversation: %lld of %lld pages free, "
+                                    "pages held:%s (shorten it, raise --kv-share, or free an agent)\n",
+                                    (long long) kv_pages.free_count(), (long long) kv_pages.total(), pins.c_str());
+                        continue;   // this request only, as the context-window refusal above
+                    }
                 }
                 if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr) {
                     const auto& st0 = ss.qsa_states[ss.qsa_primary()];
