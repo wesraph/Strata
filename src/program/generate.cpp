@@ -4020,6 +4020,11 @@ int main(int argc, char** argv) {
     std::function<bool(int64_t)> kvsh_map_extent;   ///< map one extent everywhere (set once the pool exists)
     std::function<void(int64_t)> kvsh_unmap_extent;
     std::vector<std::vector<int32_t>> kvsh_chunk_refs;   ///< per range, per chunk: extents holding it
+    strata::core::SharePoolLayout kvsh_lay;   ///< the pool's layout (main scope: the extent lambdas
+                                              ///< outlive the pool-setup block, and a [&] capture of its
+                                              ///< local lay read a DEAD stack slot at admission - cpl=0,
+                                              ///< SIGFPE in take(); gdb caught it at generate.cpp:5352)
+    uint64_t kvsh_G = 0;                     ///< the granularity the layout was aligned to
     int64_t kvsh_mapped_floor = 0;        ///< extents committed before the expert cache sized itself
     std::vector<void*> kvsh_base;          ///< one arena per device ([0]: CUDA0, [k]: stage k-1's)
     int64_t kvsh_sessions = 1;             ///< the main session plus every batch slot
@@ -5330,6 +5335,9 @@ int main(int argc, char** argv) {
             kvsh_align = kvsh_vmm ? G : 256;
             const strata::core::SharePoolLayout lay =
                 strata::core::qsa_share_pool_layout(g, kvsh_pool_pages, kvsh_vmm ? G : 256);
+            kvsh_lay = lay;   // the extent lambdas read the MAIN-SCOPE copy (their [&] capture of this
+                              // block-local dies with the block; the admission read a dead slot)
+            kvsh_G = G;
             const uint64_t stride = lay.stride;
             kvsh_pages_per_extent = kvsh_vmm ? std::max<int64_t>(1, lay.pages_per_extent) : 0;
             if (kvsh_vmm) {
@@ -5338,33 +5346,57 @@ int main(int argc, char** argv) {
             }
             // the chunk math for one extent, shared by the eager floor below and the cache's callbacks
             auto kvsh_map_extent_impl = [&](int64_t e) -> bool {
-                const int64_t cpl = kvsh_cpl[0];
+                const bool beat = std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr;
+                if (beat) { std::fprintf(stderr, "kvshare-map: extent %lld ...\n", (long long) e); std::fflush(stderr); }
+                // every LAYER's every ARRAY: the extent's chunk span inside that layer's slice of the
+                // range.  (The old form looped kvsh_cpl's phantom array bases and mapped NOTHING -
+                // "successfully"; the floor then covered a reservation with no physical memory and the
+                // first kernel write faulted.  extent_span computes the true span; per-page sizes do
+                // not divide the granularity, so neighbouring extents share chunks - refcounted.)
+                // The layout and granularity are read from the MAIN-SCOPE copies: a [&] capture of the
+                // pool block's locals dies with the block, and the admission read a dead stack slot
+                // (cpl=0 -> SIGFPE in take(); gdb pinned it to this lambda).
+                const int64_t cpl = kvsh_lay.chunks_per_layer;
+                const uint64_t Gr = kvsh_G;
+                if (cpl <= 0) return false;   // a layout without granularity chunks: nothing to map
                 for (size_t k = 0; k < kvsh_range.size(); ++k) {
                     const int dev = k == 0 ? 0 : stages[k - 1]->dev;
                     const strata::core::OnDevice on_k(dev);
                     const int64_t q_n = (int64_t) kvsh_range[k]->chunks() / cpl;
                     for (int64_t j = 0; j < q_n; ++j)
-                        for (size_t a = 1; a < kvsh_cpl.size(); ++a) {
-                            const int64_t c = j * cpl + kvsh_cpl[a] + e;
-                            if (c >= kvsh_range[k]->chunks()) continue;
-                            if (!kvsh_range[k]->map_range(c, c + 1, [] { return (strata::core::VmmChunk) 0; }))
+                        for (int64_t a = 0; a < kvsh_lay.arrays; ++a) {
+                            const auto span = kvsh_lay.extent_span(Gr, (size_t) a, e, kvsh_pages_per_extent, cpl);
+                            if (span.first < 0 || span.second < span.first) continue;
+                            if (!kvsh_range[k]->map_range(j * cpl + span.first, j * cpl + span.second + 1,
+                                                          [] { return (strata::core::VmmChunk) 0; }))
                                 return false;
+                            for (int64_t c = j * cpl + span.first; c <= j * cpl + span.second; ++c)
+                                kvsh_chunk_refs[k][(size_t) c] += 1;
                         }
                 }
+                if (beat) { std::fprintf(stderr, "kvshare-map: extent %lld done\n", (long long) e); std::fflush(stderr); }
                 return true;
             };
             auto kvsh_unmap_extent_impl = [&](int64_t e) {
-                const int64_t cpl = kvsh_cpl[0];
+                const int64_t cpl = kvsh_lay.chunks_per_layer;
+                const uint64_t Gr = kvsh_G;
+                if (cpl <= 0) return;
                 for (size_t k = 0; k < kvsh_range.size(); ++k) {
                     const int dev = k == 0 ? 0 : stages[k - 1]->dev;
                     const strata::core::OnDevice on_k(dev);
                     const int64_t q_n = (int64_t) kvsh_range[k]->chunks() / cpl;
                     for (int64_t j = 0; j < q_n; ++j)
-                        for (size_t a = 1; a < kvsh_cpl.size(); ++a) {
-                            const int64_t c = j * cpl + kvsh_cpl[a] + e;
-                            if (c >= kvsh_range[k]->chunks()) continue;
-                            const strata::core::VmmChunk h = kvsh_range[k]->unmap(c);
-                            if (h != 0) strata::core::vmm_chunk_free(h);
+                        for (int64_t a = 0; a < kvsh_lay.arrays; ++a) {
+                            const auto span = kvsh_lay.extent_span(Gr, (size_t) a, e, kvsh_pages_per_extent, cpl);
+                            if (span.first < 0 || span.second < span.first) continue;
+                            for (int64_t c = j * cpl + span.first; c <= j * cpl + span.second; ++c) {
+                                auto& r = kvsh_chunk_refs[k][(size_t) c];
+                                if (r <= 0) continue;
+                                if (--r == 0) {
+                                    const strata::core::VmmChunk h = kvsh_range[k]->unmap(c);
+                                    if (h != 0) strata::core::vmm_chunk_free(h);
+                                }
+                            }
                         }
                 }
             };
@@ -5403,6 +5435,8 @@ int main(int argc, char** argv) {
                              (long long) o.max_context, (double) bytes / 1073741824.0,
                              kvsh_vmm ? " RESERVED, physical on demand" : "", dev);
             }
+            for (size_t k = 0; k < kvsh_range.size(); ++k)
+                kvsh_chunk_refs.emplace_back((size_t) kvsh_range[k]->chunks(), 0);
             kvsh_map_extent = kvsh_map_extent_impl;
             kvsh_unmap_extent = kvsh_unmap_extent_impl;
             if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr)
@@ -5420,7 +5454,27 @@ int main(int argc, char** argv) {
                 // otherwise the cache eats every byte of free VRAM and the first long request cannot fit.  What
                 // the floor holds is what the plain pool always held; extents past it map lazily into whatever
                 // the cache left, and drop again when they empty.
-                const int64_t floor_extents = (kvsh_pages_of_context + kvsh_pages_per_extent - 1) / kvsh_pages_per_extent;
+                // THE FLOOR claims the pool's SHARE before the expert cache sizes itself (the cache opens
+                // after and takes every byte it sees - without a claim the first long request could not fit),
+                // but only a SHARE: a whole-context floor takes ~3.7 GiB eagerly, starves the cache to a few
+                // hundred MiB, and the prompt reads crawl on RAM experts until the watchdog ends the engine.
+                // What the floor holds is a START; take() maps more extents on demand.
+                constexpr double floor_share = 0.35;
+                uint64_t free_b = 0, total_b = 0;
+                if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) free_b = 0;
+                const uint64_t G = strata::core::vmm_granularity();
+                const int64_t layers = (int64_t) kvsh_range.front()->chunks() / lay.chunks_per_layer;
+                const int64_t extent_bytes = (int64_t) G * layers * (int64_t) lay.arrays;   // ~1 chunk per layer per array
+                int64_t floor_extents = extent_bytes > 0
+                    ? (int64_t) ((double) free_b * floor_share) / extent_bytes : 1;
+                const int64_t whole = (kvsh_pages_of_context + kvsh_pages_per_extent - 1) / kvsh_pages_per_extent;
+                if (floor_extents < 1) floor_extents = 1;
+                if (floor_extents > whole) floor_extents = whole;
+                if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr)
+                    std::fprintf(stderr, "kvshare-floor-size: free=%.2f GiB -> %lld of %lld extents "
+                                         "(%.2f GiB claimed)\n", (double) free_b / 1073741824.0,
+                                 (long long) floor_extents, (long long) whole,
+                                 (double) (floor_extents * extent_bytes) / 1073741824.0);
                 int64_t mapped = 0;
                 for (; mapped < floor_extents; ++mapped)
                     if (!kvsh_map_extent_impl(mapped)) break;
@@ -5429,6 +5483,19 @@ int main(int argc, char** argv) {
                                          "(VRAM); the pool may refuse long conversations\n",
                                  (long long) mapped, (long long) floor_extents);
                 kvsh_mapped_floor = mapped;
+                if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr && !kvsh_range.empty()) {
+                    // probe: write and read the first bytes of every layer's every array through the floor
+                    const auto& pr = *kvsh_range.front();
+                    int ok = 0, bad = 0;
+                    for (int64_t j = 0; j < (int64_t) pr.chunks() / kvsh_cpl[0]; ++j)
+                        for (size_t a = 0; a < lay.arrays; ++a) {
+                            uint8_t* at = pr.base() + j * lay.stride + lay.arr_off[a];
+                            if (cudaMemset(at, 0x5A, 256) == cudaSuccess) ++ok; else ++bad;
+                        }
+                    cudaDeviceSynchronize();
+                    std::fprintf(stderr, "kvshare-floor: base=%p chunks=%lld/%lld probe ok=%d bad=%d\n",
+                                 pr.base(), (long long) pr.mapped_count(), (long long) pr.chunks(), ok, bad);
+                }
             }
         }
         strata::core::QsaShareArena kvsh_main{kvsh ? kvsh_base[0] : nullptr, kvsh ? kvsh_pool_pages : 0,

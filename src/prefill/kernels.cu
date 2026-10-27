@@ -2446,6 +2446,23 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
     kv_append_kernel<<<dim3((unsigned) T, 2, 8), 64, 0, (cudaStream_t) stream>>>(
         K, V, pos0, page_table, page_size, k_pool, v_pool, k_q, v_q, k_scale, v_scale,
         host ? *host : strata::kernels::KvHostPools{}, stage ? *stage : strata::kernels::KvHostPools{});
+    {   // STRATA_KV_FAULT_DUMP: the launch's own arguments on a fault - the host knows them all.
+        // The sync runs only under the env: it makes every append synchronous and the serve watchdog
+        // ends the engine on a long prefill.
+        if (std::getenv("STRATA_KV_FAULT_DUMP") == nullptr) { check("kv_append"); return; }
+        const cudaError_t fe = cudaStreamSynchronize((cudaStream_t) stream);
+        if (fe != cudaSuccess) {
+            int32_t t4[4] = {-9, -9, -9, -9};
+            (void) cudaMemcpy(t4, page_table, sizeof t4, cudaMemcpyDeviceToHost);
+            std::fprintf(stderr, "kv_append FAULT: err=%s T=%lld pos0=%lld ps=%lld k_pool=%p v_pool=%p k_q=%p "
+                                 "v_q=%p k_scale=%p v_scale=%p table=%p table[0..3]=%d,%d,%d,%d host=%d\n",
+                         cudaGetErrorString(fe), (long long) T, (long long) pos0, (long long) page_size,
+                         (void*) k_pool, (void*) v_pool, (void*) k_q, (void*) v_q, (void*) k_scale, (void*) v_scale,
+                         (void*) page_table, t4[0], t4[1], t4[2], t4[3],
+                         (host ? *host : strata::kernels::KvHostPools{}).k_q != nullptr ? 1 : 0);
+            (void) fflush(stderr);
+        }
+    }
     check("kv_append");
 }
 void set_act_f16(bool on) {
