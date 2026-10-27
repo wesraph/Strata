@@ -11702,8 +11702,29 @@ int main(int argc, char** argv) {
         }
         const int64_t kvsh_trim_idle_s = [] {
             const char* v = std::getenv("STRATA_KV_TRIM_IDLE_S");
-            return v != nullptr ? std::atoll(v) : 30;
+            return v != nullptr ? std::atoll(v) : 60;
         }();
+        // the pool's working set of the last STRATA_KV_TRIM_WINDOW_S seconds (600): what the trim keeps mapped
+        // beyond the reserve, so agents whose tool calls leave minute-long gaps do not lose their extents to the
+        // caches and take them back (each take quiesces both GPUs) at every turn
+        const double kvsh_trim_window_s = [] {
+            const char* v = std::getenv("STRATA_KV_TRIM_WINDOW_S");
+            return v != nullptr ? std::atof(v) : 600.0;
+        }();
+        std::deque<std::pair<std::chrono::steady_clock::time_point, int64_t>> kvsh_use_samples;   // (when, pages in use)
+        auto kvsh_sample_use = [&]() {
+            if (!kvsh) return;
+            const auto now = std::chrono::steady_clock::now();
+            kvsh_use_samples.emplace_back(now, kv_pages.pinned_count() + kv_pages.evictable_count());
+            while (!kvsh_use_samples.empty() &&
+                   std::chrono::duration<double>(now - kvsh_use_samples.front().first).count() > kvsh_trim_window_s)
+                kvsh_use_samples.pop_front();
+        };
+        auto kvsh_recent_peak = [&]() -> int64_t {
+            int64_t peak = 0;
+            for (const auto& [t, n] : kvsh_use_samples) peak = std::max(peak, n);
+            return peak;
+        };
         const int64_t kvsh_trim_keep_pages = [&] {
             const char* v = std::getenv("STRATA_KV_TRIM_KEEP_TOKENS");
             const int64_t t = v != nullptr && std::atoll(v) > 0 ? std::atoll(v) : o.max_context;
@@ -11713,8 +11734,8 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: --kv-share: the VRAM exchange with the expert caches is %s%s\n",
                          kvsh_xc ? "on" : "off", kvsh_xc ? "" : " (a cache without a VMM range, residency table or profile)");
         if (kvsh_xc)
-            std::fprintf(stderr, "strata serve: --kv-share: idle trim after %llds keeps %lld pages (%lld tokens); the "
-                                 "caches lend from below slot%s\n", (long long) kvsh_trim_idle_s,
+            std::fprintf(stderr, "strata serve: --kv-share: idle trim after %llds keeps %lld pages (%lld tokens) or the last "
+                                 "%.0f s's working set; the caches lend from below slot%s\n", (long long) kvsh_trim_idle_s, kvsh_trim_window_s,
                          (long long) kvsh_trim_keep_pages, (long long) (kvsh_trim_keep_pages * kvsh_ps),
                          [&] { std::string t; for (const XcLoan& L : xcl) t += " " + std::to_string((long long) L.top); return t; }().c_str());
         // (the floor is taken below, once xc_take exists)
@@ -11733,7 +11754,10 @@ int main(int argc, char** argv) {
             };
             bool quiet = false, dirty = false;
             const int64_t lo0 = L.lo;
-            while ((int64_t) L.spare.size() + freeable() < n && L.lo > L.floor) {
+            // a quiesce (both GPUs drained, an adaptive round, a residency upload) is worth more than one
+            // extent: once the cache must lend, it lends for several (the spare serves the next takes quietly)
+            const int64_t n_batch = (int64_t) L.spare.size() + freeable() < n ? std::max<int64_t>(n, 48) : n;
+            while ((int64_t) L.spare.size() + freeable() < n_batch && L.lo > L.floor) {
                 if (!quiet) {
                     adapt_quiesce();
                     for (size_t kk = 0; kk < xcl.size(); ++kk) { const strata::core::OnDevice on_q(xcl[kk].dev); cudaDeviceSynchronize(); }
@@ -13418,7 +13442,7 @@ int main(int argc, char** argv) {
             if (!kvsh_xc) return;
             for (const BSlot& sb : bs) if (sb.active || sb.partial) return;
             const int64_t pinned = kv_pages.pinned_count(), evictable = kv_pages.evictable_count();
-            const int64_t keep = std::max<int64_t>(pinned, kvsh_trim_keep_pages);
+            const int64_t keep = std::max<int64_t>({pinned, kvsh_trim_keep_pages, kvsh_recent_peak()});
             const int64_t ext0 = kv_pages.mapped_extents();
             const int64_t target_ext = kvsh_pages_per_extent > 0 ? (keep + kvsh_pages_per_extent - 1) / kvsh_pages_per_extent : ext0;
             if (pinned + evictable <= keep && ext0 <= target_ext) return;
@@ -14184,6 +14208,7 @@ int main(int argc, char** argv) {
                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
                 }
             }
+            kvsh_sample_use();   // the working set the trim keeps
             if (kvsh_xc && kvsh_trim_idle_s > 0 &&
                 std::chrono::duration<double>(std::chrono::steady_clock::now() - kvsh_idle_t0).count() >= (double) kvsh_trim_idle_s)
                 kvsh_trim_idle();
@@ -15739,6 +15764,7 @@ int main(int argc, char** argv) {
                         continue;   // this request only, as the context-window refusal above
                     }
                 }
+                kvsh_sample_use();
                 if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr) {
                     const auto& st0 = ss.qsa_states[ss.qsa_primary()];
                     std::vector<int32_t> tb((size_t) st0.n_pages);
