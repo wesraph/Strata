@@ -444,6 +444,8 @@ struct SessionPages {
     std::vector<int32_t> table;    ///< the session's host table (n_pages); empty while unmapped
     bool shares = false;           ///< the table maps cached pages at the front
     int64_t last_reg = 0;          ///< logical pages already keyed into the cache this conversation
+    bool cow_partial = false;      ///< the page at the write start was copied private from a cached page (a
+                                   ///< restore may count it as held: own[0] holds that logical page whole)
 
     int64_t mapped() const { return (int64_t) (cached.size() + own.size()); }
     int32_t at(int64_t p) const {
@@ -559,6 +561,23 @@ inline bool session_admit(PageCache& cache, SessionPages& s, const int64_t* ids6
         }
         (void) flush_run();
     }
+    s.cow_partial = false;
+    // the restore path (nothing kept) whose write start falls inside a page the cache holds: that page is
+    // copied PRIVATE (the cells below the write start are the conversation's, the rest gets written), so an
+    // image that skipped every keyed page can be restored from the pool and the swap alone
+    int32_t cow_cached = -1;
+    if (nown.empty() && resume % ps != 0 && (int64_t) ncached.size() == walk_end && walk_end >= keep_full &&
+        (walk_end + 1) * ps <= n_ids && walk_end < n_pages) {
+        uint64_t key = 0;
+        std::array<int32_t, PageCache::page_cells> toks{};
+        for (int64_t p = 0; p <= walk_end; ++p) { toks_of(p, toks.data()); key = PageCache::page_key(key, toks.data(), (int) ps); }
+        int32_t page = cache.lookup(key, toks.data());
+        if (page < 0 && cache.swap_has(key)) {
+            const std::vector<int32_t> got = cache.restore_many({key}, toks.data());
+            if (!got.empty()) page = got[0];
+        }
+        cow_cached = page;
+    }
     // the partial page: own and unkeyed stays; shared or keyed is copied to a private page below
     int32_t cow_from = -1;
     if (part_idx >= 0) {
@@ -579,12 +598,22 @@ inline bool session_admit(PageCache& cache, SessionPages& s, const int64_t* ids6
     const int64_t want = total - (int64_t) ncached.size();   // own pages the new mapping holds
     int64_t missing = want - (int64_t) nown.size() - (int64_t) reusable.size();
     if (missing < 0) missing = 0;
+    if (cow_cached >= 0 && (int64_t) nown.size() + (int64_t) reusable.size() >= want) missing = 0;
     std::vector<int32_t> fresh;
     if (missing > 0 && !cache.take(missing, fresh)) {
         for (int32_t id : walked) cache.unpin(id);   // nothing else has changed: the old mapping stands
         return fail("the K/V pool is full");
     }
     for (int32_t id : fresh) cache.pin(id);
+    if (cow_cached >= 0 && (int64_t) nown.size() < want) {   // its destination: the next own page
+        std::vector<int32_t>& from = reusable.empty() ? fresh : reusable;
+        if (!from.empty()) {
+            const int32_t dest = from.front();
+            from.erase(from.begin());
+            if (copy && copy(cow_cached, dest)) { nown.push_back(dest); s.cow_partial = true; }
+            else from.insert(from.begin(), dest);
+        }
+    }
     // the copy first: a failure here still leaves the old mapping intact
     if (cow_from >= 0) {
         std::vector<int32_t>& from = reusable.empty() ? fresh : reusable;

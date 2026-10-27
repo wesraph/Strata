@@ -459,7 +459,8 @@ int main() {
         std::vector<int64_t> a2(a.begin(), a.begin() + 42);
         for (int64_t i = 42; i < 100; ++i) a2.push_back(7000 + i);
         check(session_admit(pc, s, a2.data(), nullptr, 100, 42, 42, 100, 4, 128, copier, &why), "A rewinds to 42");
-        check(copies.size() == 1 && copies[0].first == shared_page && copies[0].second == s.own[10] &&
+        // (the sibling restored at 38 already took a private copy of the page its write start fell into)
+        check(!copies.empty() && copies.back().first == shared_page && copies.back().second == s.own[10] &&
               s.own[10] != shared_page, "the page at the write start was copied to a private page");
         check(std::equal(before.begin(), before.begin() + 10, s.own.begin()), "the ten pages below stay");
         check(pc.keyed(shared_page) && pc.refs(shared_page) == 0 && !pc.keyed(s.own[10]),

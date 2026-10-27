@@ -10359,7 +10359,7 @@ int main(int argc, char** argv) {
                     bodies[0] = [&](std::string& e) {
                         const strata::core::OnDevice on(0);
                         return strata::core::conversation_snapshot_save(image, view, ss, g, draft0, e,
-                                std::move(reuse), &reused_b[0], kvshs.t(), (int64_t) kvshs.sess[0].cached.size());
+                                std::move(reuse), &reused_b[0], kvshs.t(), kvshs.sess[0].last_reg);
                     };
                     for (size_t k = 0; k < n_st; ++k)
                         bodies[k + 1] = [&, k](std::string& e) {
@@ -10368,7 +10368,8 @@ int main(int argc, char** argv) {
                             if (cudaDeviceSynchronize() != cudaSuccess) { e = "stage sync failed"; return false; }
                             const strata::core::ConversationView view_k{live, live_imgs, cs.parts[k], cvec_cached};
                             return strata::core::conversation_snapshot_save(parts[k], view_k, st->ss, g,
-                                    draft_of(k), e, std::move(stage_reuse[k]), &reused_b[k + 1], kvshs.t());
+                                    draft_of(k), e, std::move(stage_reuse[k]), &reused_b[k + 1], kvshs.t(),
+                                    kvshs.sess[0].last_reg);
                         };
                     if (!stage_pool->run(bodies, err)) return false;
                     reused_bytes += reused_b[0];
@@ -10378,7 +10379,7 @@ int main(int argc, char** argv) {
                     }
                 } else {
                     if (!strata::core::conversation_snapshot_save(image, view, ss, g, draft0, err,
-                            std::move(reuse), &reused_bytes, kvshs.t(), (int64_t) kvshs.sess[0].cached.size())) return false;
+                            std::move(reuse), &reused_bytes, kvshs.t(), kvshs.sess[0].last_reg)) return false;
                     for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                         auto& st = stages[k];
                         const strata::core::OnDevice on(st->dev);
@@ -14421,8 +14422,15 @@ int main(int argc, char** argv) {
                                 (long long) kv_pages.free_count(), (long long) kv_pages.total());
                     continue;
                 }
-                const int64_t kvsh_skip = (int64_t) kvshs.sess[0].cached.size();
-                if (kvsh && donor != nullptr && !donor->kv.empty() && donor->kv[0].pool_skip > kvsh_skip) {
+                // the image left its keyed pages out (pool_skip): the ones this request needs (below its resume
+                // point) must be held - cached from the pool or the swap, or the private copy of the partial page;
+                // the rest of the skipped pages are rewritten by the read.  The restore skips at least pool_skip
+                // (the image's buffers begin there)
+                const int64_t kvsh_held = (int64_t) kvshs.sess[0].cached.size() + (kvshs.sess[0].cow_partial ? 1 : 0);
+                const int64_t kvsh_pool_skip = kvsh && donor != nullptr && !donor->kv.empty() ? donor->kv[0].pool_skip : 0;
+                const int64_t kvsh_needed = std::min<int64_t>(kvsh_pool_skip, (parked.tokens + kvsh_ps - 1) / kvsh_ps);
+                const int64_t kvsh_skip = std::max<int64_t>((int64_t) kvshs.sess[0].cached.size(), kvsh_pool_skip);
+                if (kvsh && kvsh_held < kvsh_needed) {
                     // the image was captured without its leading pages and the pool has since lost some:
                     // the bytes exist nowhere, so this is a miss (the conversation is read from the start)
                     std::fprintf(stderr, "strata serve: conversation cache: a parked prefix was evicted from the "
@@ -14462,8 +14470,11 @@ int main(int argc, char** argv) {
                                 (long long) kv_pages.free_count(), (long long) kv_pages.total());
                     continue;
                 }
-                const int64_t kvsh_skip = (int64_t) kvshs.sess[0].cached.size();
-                if (kvsh && !incoming->kv.empty() && incoming->kv[0].pool_skip > kvsh_skip) {
+                const int64_t kvsh_held = (int64_t) kvshs.sess[0].cached.size() + (kvshs.sess[0].cow_partial ? 1 : 0);
+                const int64_t kvsh_pool_skip = kvsh && !incoming->kv.empty() ? incoming->kv[0].pool_skip : 0;
+                const int64_t kvsh_needed = std::min<int64_t>(kvsh_pool_skip, (parked.tokens + kvsh_ps - 1) / kvsh_ps);
+                const int64_t kvsh_skip = std::max<int64_t>((int64_t) kvshs.sess[0].cached.size(), kvsh_pool_skip);
+                if (kvsh && kvsh_held < kvsh_needed) {
                     std::fprintf(stderr, "strata serve: conversation cache: a parked prefix was evicted from the "
                                          "K/V pool; reading the conversation whole\n");
                     resume = 0;
@@ -15701,7 +15712,8 @@ int main(int argc, char** argv) {
                                                                                   nullptr, estimate, perr) &&
                                 conversations.make_room(estimate, 0) &&
                                 strata::core::conversation_snapshot_save(image, view, *bslot_ss[0][(size_t) b], g, nullptr,
-                                                                         perr, {}, nullptr, kvshs.st(b));
+                                                                         perr, {}, nullptr, kvshs.st(b),
+                                                                         kvshs.sess[(size_t) b + 1].last_reg);
                         } else {
                             // a layer split's conversation spans every stage's slot session: capture them
                             // all - the same per-stage dance park_current runs for the main session (the
@@ -15726,14 +15738,15 @@ int main(int argc, char** argv) {
                             if (ok && cudaDeviceSynchronize() == cudaSuccess &&
                                 strata::core::conversation_snapshot_save(image, view0, *bslot_ss[0][(size_t) b], g, nullptr,
                                                                          perr, {}, nullptr, kvshs.st(b),
-                                                                         (int64_t) kvshs.sess[(size_t) b + 1].cached.size())) {
+                                                                         kvshs.sess[(size_t) b + 1].last_reg)) {
                                 for (size_t k = 0; k < stages.size(); ++k) {
                                     const strata::core::ConversationView view_k{sb.ids, no_imgs, csplit.parts[k], sb.cvec};
                                     const strata::core::OnDevice on_k(stages[k]->dev);
                                     strata::core::SavedConversation part;
                                     if (cudaDeviceSynchronize() != cudaSuccess ||
                                         !strata::core::conversation_snapshot_save(part, view_k, *bslot_ss[k + 1][(size_t) b], g,
-                                                                                  nullptr, perr, {}, nullptr, kvshs.st(b))) {
+                                                                                  nullptr, perr, {}, nullptr, kvshs.st(b),
+                                                                                  kvshs.sess[(size_t) b + 1].last_reg)) {
                                         ok = false; break;
                                     }
                                     image.stage_images.push_back(std::move(part));
