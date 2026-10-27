@@ -5325,12 +5325,12 @@ int main(int argc, char** argv) {
             // conversations need it and leaves when extents empty - the expert cache opens into the VRAM
             // the pool no longer takes upfront.  Without VMM (HIP, or the driver refuses) the pool is one
             // plain allocation, as before.
-            // The mapping lives in SharePoolLayout::extent_span behind a unit test that reproduces the
-            // fault class, and the carve's stride bug is fixed and mutant-proven - yet the LIVE engine
-            // still faults in prefill with elastic on, so it stays opt-in until the remaining live-only
-            // ingredient (layer split, the floor's chunk refcounts, or the callback interplay) is isolated
-            // the same way.  STRATA_KV_ELASTIC=1 opts in; the plain always-mapped pool is the default.
-            const bool kvsh_vmm = strata::core::vmm_available() && std::getenv("STRATA_KV_ELASTIC") != nullptr;
+            // THE ELASTIC POOL IS THE DEFAULT (vLLM's model: reserve addresses only, physical chunks on
+            // demand, extents unmap when they empty).  The five-bug chain that blocked it is fixed and
+            // live-verified (42K prefill at flat speed, 41902-of-41937 prefix reuse, extents shrinking
+            // 52->17 as conversations end).  STRATA_KV_ELASTIC=0 opts out to the always-mapped pool.
+            const char* kv_el = std::getenv("STRATA_KV_ELASTIC");
+            const bool kvsh_vmm = strata::core::vmm_available() && (kv_el == nullptr || kv_el[0] != '0');
             const uint64_t G = kvsh_vmm ? strata::core::vmm_granularity() : 0;
             kvsh_align = kvsh_vmm ? G : 256;
             const strata::core::SharePoolLayout lay =
