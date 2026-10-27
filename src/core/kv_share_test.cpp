@@ -20,6 +20,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <string>
+#include <utility>
 #include <vector>
 
 using namespace strata::core;
@@ -399,6 +401,95 @@ int main() {
         check(all_ok, "every layer's pool writes and reads back across its extents");
         cudaFree(ebuf);
         strata::core::qsa_set_kv_hybrid(false);
+    }
+
+    // ---- admission (session_admit): the rules a session's mapping follows across requests ----
+    {
+        // a continuing conversation keeps every page it holds (its last answer lives in own pages the cache
+        // never keyed: re-allocating them is how the model lost its own previous reply), cached pages are
+        // mapped only below the write start, a shared or keyed page at the write start is copied private,
+        // a refused admission leaves the mapping as it was, and every mapped page holds its session's pin
+        PageCache pc(64);
+        std::vector<int64_t> a;   // conversation A: 200 tokens
+        for (int64_t i = 0; i < 200; ++i) a.push_back(1000 + i);
+        std::vector<std::pair<int32_t, int32_t>> copies;
+        CopyPage copier = [&](int32_t from, int32_t to) { copies.emplace_back(from, to); return true; };
+        SessionPages s;
+        std::string why;
+        check(session_admit(pc, s, a.data(), nullptr, 40, 0, 0, 60, 4, 128, copier, &why), "a fresh prompt of 40 cells, 60 wanted");
+        check(s.cached.empty() && s.own.size() == 15, "nothing cached: 15 own pages");
+        bool pinned = true;
+        for (int32_t id : s.own) pinned = pinned && pc.refs(id) == 1;
+        check(pinned, "every own page holds one pin");
+        check(pc.free_count() == 64 - 15, "the pool lent 15 pages");
+        std::vector<int32_t> a32(a.begin(), a.end());
+        session_register(pc, s, a32, 40, 4);   // the read wrote 40 cells: 10 full pages keyed
+        check(pc.cached_count() == 10 && s.last_reg == 10, "ten full pages keyed");
+        // the answer took it to 47 cells; the next turn appends and reads from 47
+        const std::vector<int32_t> before = s.own;
+        check(session_admit(pc, s, a.data(), nullptr, 70, 47, 47, 90, 4, 128, copier, &why), "turn two continues at 47");
+        check(s.cached.empty() && s.own.size() == 23, "23 own pages now");
+        check(std::equal(before.begin(), before.end(), s.own.begin()), "the first 15 pages are exactly the ones it had");
+        pinned = true;
+        for (int32_t id : s.own) pinned = pinned && pc.refs(id) == 1;
+        check(pinned && copies.empty(), "still one pin each, nothing copied");
+        check(s.last_reg == 10, "the keyed prefix is still known");
+        // a second session on the same first 40 tokens: a restore at cell 45 maps the 10 keyed pages (not the
+        // eleventh, which is unkeyed and below the write start anyway) and writes the rest itself
+        std::vector<int64_t> b(a.begin(), a.begin() + 40);
+        for (int64_t i = 40; i < 120; ++i) b.push_back(5000 + i);
+        SessionPages s2;
+        check(session_admit(pc, s2, b.data(), nullptr, 120, 0, 45, 120, 4, 128, copier, &why), "a sibling restored at 45");
+        check(s2.cached.size() == 10 && std::equal(s2.cached.begin(), s2.cached.end(), s.own.begin()),
+              "it maps A's ten keyed pages");
+        check(s2.own.size() == 20 && pc.refs(s.own[0]) == 2 && pc.refs(s2.own[0]) == 1, "shared pages carry both pins");
+        bool disjoint = true;
+        for (int32_t id : s2.own) disjoint = disjoint && std::find(s.own.begin(), s.own.end(), id) == s.own.end();
+        check(disjoint, "its own pages are nobody else's");
+        // the walk is bounded by the write start: a restore at 38 maps nine
+        SessionPages s3;
+        check(session_admit(pc, s3, b.data(), nullptr, 120, 0, 38, 60, 4, 128, copier, &why), "a sibling restored at 38");
+        check(s3.cached.size() == 9, "only the full pages below the write start are shared");
+        session_release(pc, s3);
+        check(pc.refs(s.own[8]) == 2 && pc.refs(s.own[9]) == 2, "its pins are gone, A's and the sibling's stay");
+        // A's user rewinds into a keyed page: cells 0..41 stay, the page of cell 42 is keyed (and mapped by
+        // the sibling) - it is copied private before the read writes into it
+        session_register(pc, s, a32, 48, 4);   // 12 pages keyed by now
+        const int32_t shared_page = s.own[10];
+        std::vector<int64_t> a2(a.begin(), a.begin() + 42);
+        for (int64_t i = 42; i < 100; ++i) a2.push_back(7000 + i);
+        check(session_admit(pc, s, a2.data(), nullptr, 100, 42, 42, 100, 4, 128, copier, &why), "A rewinds to 42");
+        check(copies.size() == 1 && copies[0].first == shared_page && copies[0].second == s.own[10] &&
+              s.own[10] != shared_page, "the page at the write start was copied to a private page");
+        check(std::equal(before.begin(), before.begin() + 10, s.own.begin()), "the ten pages below stay");
+        check(pc.keyed(shared_page) && pc.refs(shared_page) == 0 && !pc.keyed(s.own[10]),
+              "the keyed page stays cached for others; the private copy is unkeyed");
+        check(pc.refs(s.own[10]) == 1 && s.last_reg == 10, "the copy is pinned; the keyed prefix shrank to the kept pages");
+        bool tail_unkeyed = true;
+        for (size_t i = 10; i < s.own.size(); ++i) tail_unkeyed = tail_unkeyed && !pc.keyed(s.own[i]);
+        check(tail_unkeyed, "no page the read will write is keyed");
+        // a refused admission (the pool cannot hold it) changes nothing
+        const std::vector<int32_t> keep = s.own;
+        const int64_t free_before = pc.free_count();
+        check(!session_admit(pc, s, a2.data(), nullptr, 100, 42, 42, 4 * 70, 4, 128, copier, &why), "70 pages do not fit 64");
+        // (the failed take may have evicted unpinned cached pages on its way: more free, never fewer)
+        check(s.own == keep && pc.free_count() >= free_before && pc.refs(keep[0]) == 2, "refused: the mapping stands");
+        check(!session_admit(pc, s, a2.data(), nullptr, 100, 4 * 60, 4 * 60, 4 * 60, 4, 128, copier, &why),
+              "cells claimed valid beyond the mapping are refused");
+        check(s.own == keep, "refused: the mapping stands (bad claim)");
+        // a new conversation in A's session (nothing valid): A's keyed pages go to the cache, the unkeyed
+        // ones are reused, nothing keyed is written
+        std::vector<int64_t> c;
+        for (int64_t i = 0; i < 80; ++i) c.push_back(9000 + i);
+        check(session_admit(pc, s, c.data(), nullptr, 80, 0, 0, 80, 4, 128, copier, &why), "another conversation takes the session");
+        tail_unkeyed = true;
+        for (int32_t id : s.own) tail_unkeyed = tail_unkeyed && !pc.keyed(id) && pc.refs(id) == 1;
+        check(tail_unkeyed && s.cached.empty(), "its pages are all unkeyed and pinned once");
+        check(pc.refs(keep[0]) == 1 && pc.keyed(keep[0]), "A's shared pages keep the sibling's pin and their key");
+        session_release(pc, s2);
+        check(pc.refs(keep[0]) == 0 && pc.keyed(keep[0]), "released by all: cached, evictable");
+        session_release(pc, s);
+        check(pc.cached_count() + pc.free_count() == 64, "every page is cached or free in the end");
     }
 
     // ---- off: byte-identical plain carve, identity table ----

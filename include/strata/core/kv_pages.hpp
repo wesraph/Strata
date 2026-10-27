@@ -10,8 +10,13 @@
 // loop writes into the sessions' page tables (qsa_state_set_table).
 #pragma once
 
+#include <algorithm>
+#include <array>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <functional>
+#include <string>
 #include <unordered_map>
 #include <queue>
 #include <set>
@@ -150,6 +155,15 @@ public:
         if (id >= 0 && (size_t) id < page_key_.size()) page_refs_[(size_t) id] += 1;
     }
 
+    /// The page holds a keyed (hashed, verified) prefix page: immutable while it is keyed, since any session
+    /// whose chain reaches it may map it.
+    bool keyed(int32_t id) const {
+        return id >= 0 && (size_t) id < page_key_.size() && page_key_[(size_t) id] != 0;
+    }
+    int32_t refs(int32_t id) const {
+        return id >= 0 && (size_t) id < page_refs_.size() ? page_refs_[(size_t) id] : 0;
+    }
+
     /// A walk missed `key`: if the swap holds its bytes, take a fresh page (evicting under pressure -
     /// eviction may swap OTHER pages out), copy the bytes in, key it, and hand the page back.  -1: the
     /// key is nowhere; the walk stops as before.  `tokens` are the page's own ids, for verification.
@@ -211,8 +225,10 @@ public:
         return alloc_.take(n, out);
     }
 
-    /// A session's page goes back: pinned pages lose their pin, hashed pages stay cached (evictable),
-    /// the rest free outright.
+    /// A session's page goes back: it loses this session's pin, hashed pages stay cached (evictable once
+    /// nobody pins them), the rest free outright.  EVERY page a session maps holds one pin of that session
+    /// - the cached prefix pages its walk hit and the own pages it took alike (session_admit pins what
+    /// take() hands out) - so the eviction never takes a page some table still maps.
     void release_page(int32_t id) {
         if (id < 0 || (size_t) id >= page_key_.size()) { alloc_.release({id}); return; }
         unpin(id);
@@ -325,5 +341,169 @@ public:
             if (page_key_[id] != 0) heap_.emplace(page_stamp_[id], (int32_t) id);
     }
 };
+
+
+/// ONE SESSION'S MAPPING of its conversation's logical pages onto the pool: `cached` - the leading pages the
+/// prefix cache held (filled by whoever read them first; shared, read-only) - then `own`, the pages this
+/// session filled or is about to fill.  `table` is the host copy of what the device table holds (n_pages
+/// entries: cached, own, then -1).  Every page in either list holds one pin of this session.
+struct SessionPages {
+    std::vector<int32_t> cached;   ///< the prefix pages mapped from the cache (pinned, never written)
+    std::vector<int32_t> own;      ///< this conversation's pages past the cached prefix (pinned)
+    std::vector<int32_t> table;    ///< the session's host table (n_pages); empty while unmapped
+    bool shares = false;           ///< the table maps cached pages at the front
+    int64_t last_reg = 0;          ///< logical pages already keyed into the cache this conversation
+
+    int64_t mapped() const { return (int64_t) (cached.size() + own.size()); }
+    int32_t at(int64_t p) const {
+        return p < (int64_t) cached.size() ? cached[(size_t) p] : own[(size_t) (p - (int64_t) cached.size())];
+    }
+    void build(int64_t n_pages) {
+        shares = !cached.empty();
+        table.assign((size_t) n_pages, -1);
+        for (size_t i = 0; i < cached.size() && i < table.size(); ++i) table[i] = cached[i];
+        for (size_t i = 0; i < own.size() && cached.size() + i < table.size(); ++i) table[cached.size() + i] = own[i];
+    }
+};
+
+/// Copies one page's bytes on the device (every range, layer and array): (from, to).  false: it failed.
+using CopyPage = std::function<bool(int32_t, int32_t)>;
+
+/// ADMIT a conversation of `n_ids` ids (int64 or int32, one of the two) into `s`.
+///   `valid`  - cells of s's CURRENT mapping that already hold this conversation's K/V (a live continuation:
+///              the read start; a restore or a slot copy that writes the cells itself: 0).  Those pages stay
+///              exactly where they are - re-allocating them is how a conversation loses its own last answer.
+///   `resume` - the first cell this session WRITES.  Below it the cells come from the kept mapping, from the
+///              prefix cache (full pages below floor(resume/page) whose chained key hits), or from the restore
+///              the caller runs next.  At or past it nothing shared is ever mapped: a page the session writes
+///              is private, so the page the write start falls into is copied (`copy`) when it is shared or
+///              keyed - a keyed page is immutable for as long as its key may be hit.
+///   `cells`  - the whole need, generation included (the table's -1 past it would drop the decode's writes).
+/// Own pages the conversation no longer needs go back (keyed ones stay cached).  false: the pool cannot hold
+/// it even after eviction, or the mapping cannot be what the caller claims - and then s is UNCHANGED.
+inline bool session_admit(PageCache& cache, SessionPages& s, const int64_t* ids64, const int32_t* ids32,
+                          int64_t n_ids, int64_t valid, int64_t resume, int64_t cells, int page_size,
+                          int64_t n_pages, const CopyPage& copy, std::string* why = nullptr) {
+    auto fail = [&](const char* m) { if (why) *why = m; return false; };
+    const int64_t ps = page_size > 0 ? page_size : 1;
+    if (valid < 0) valid = 0;
+    if (valid > n_ids) valid = n_ids;
+    if (resume < valid) resume = valid;
+    if (cells < resume) cells = resume;
+    const int64_t have = s.mapped();
+    const int64_t total = (cells + ps - 1) / ps;
+    if (total > n_pages) return fail("the conversation does not fit the session's page table");
+    if (valid / ps > have || (valid % ps != 0 && valid / ps >= have))
+        return fail("the mapping does not cover the cells claimed valid");
+    const int64_t keep_full = valid / ps;                      // pages kept untouched
+    const int64_t part_idx = valid % ps != 0 ? valid / ps : -1;   // the page the write start falls into
+    auto toks_of = [&](int64_t p, int32_t* toks) {
+        for (int64_t i = 0; i < ps && i < (int64_t) PageCache::page_cells; ++i)
+            toks[i] = (int32_t) (ids64 ? ids64[p * ps + i] : ids32[p * ps + i]);
+    };
+    std::vector<int32_t> ncached, nown;
+    for (int64_t p = 0; p < keep_full; ++p) (p < (int64_t) s.cached.size() ? ncached : nown).push_back(s.at(p));
+    // THE WALK: full pages below the write start, keyed by the chain over every token up to them.  It runs
+    // from page 0 so the chain is right, skipping what is kept; it stops at the first miss (later pages
+    // cannot match), and never past kept own pages (the cached pages are a PREFIX of the table).
+    std::vector<int32_t> walked;
+    const int64_t walk_end = std::min<int64_t>(resume / ps, n_ids / ps);
+    if (nown.empty() && walk_end > keep_full) {
+        uint64_t key = 0;
+        std::array<int32_t, PageCache::page_cells> toks{};
+        for (int64_t p = 0; p < walk_end; ++p) {
+            toks_of(p, toks.data());
+            key = PageCache::page_key(key, toks.data(), (int) ps);
+            if (p < keep_full) continue;
+            int32_t page = cache.lookup(key, toks.data());
+            if (page < 0) page = cache.restore(key, toks.data());
+            if (page < 0) break;
+            cache.pin(page);
+            ncached.push_back(page);
+            walked.push_back(page);
+        }
+    }
+    // the partial page: own and unkeyed stays; shared or keyed is copied to a private page below
+    int32_t cow_from = -1;
+    if (part_idx >= 0) {
+        const int32_t entry = s.at(part_idx);
+        if (part_idx < (int64_t) s.cached.size() || cache.keyed(entry)) cow_from = entry;
+        else nown.push_back(entry);
+    }
+    // what else of the old mapping can serve: own pages neither kept nor re-found, unkeyed (a keyed page may be
+    // mapped by another chain: it goes back to the cache, never rewritten)
+    std::set<int32_t> used(ncached.begin(), ncached.end());
+    used.insert(nown.begin(), nown.end());
+    std::vector<int32_t> reusable, refound, leftover;
+    for (int32_t id : s.own) {
+        if (std::find(nown.begin(), nown.end(), id) != nown.end()) continue;
+        if (used.count(id)) { refound.push_back(id); continue; }   // re-found by the walk: now a cached page
+        (cache.keyed(id) ? leftover : reusable).push_back(id);
+    }
+    const int64_t want = total - (int64_t) ncached.size();   // own pages the new mapping holds
+    int64_t missing = want - (int64_t) nown.size() - (int64_t) reusable.size();
+    if (missing < 0) missing = 0;
+    std::vector<int32_t> fresh;
+    if (missing > 0 && !cache.take(missing, fresh)) {
+        for (int32_t id : walked) cache.unpin(id);   // nothing else has changed: the old mapping stands
+        return fail("the K/V pool is full");
+    }
+    for (int32_t id : fresh) cache.pin(id);
+    // the copy first: a failure here still leaves the old mapping intact
+    if (cow_from >= 0) {
+        std::vector<int32_t>& from = reusable.empty() ? fresh : reusable;
+        const int32_t dest = from.front();
+        from.erase(from.begin());
+        if (!copy || !copy(cow_from, dest)) {
+            for (int32_t id : walked) cache.unpin(id);
+            for (int32_t id : fresh) cache.release_page(id);
+            cache.release_page(dest);
+            return fail("copying the page at the write start failed");
+        }
+        nown.push_back(dest);
+    }
+    for (int32_t id : reusable) {
+        if ((int64_t) nown.size() < want) nown.push_back(id);
+        else cache.release_page(id);   // past the need: freed
+    }
+    for (int32_t id : fresh) nown.push_back(id);
+    // the old mapping's pins this one does not carry
+    for (int64_t p = keep_full; p < (int64_t) s.cached.size(); ++p) cache.unpin(s.cached[(size_t) p]);
+    for (int32_t id : refound) cache.release_page(id);    // its own pin goes; the walk's pin keeps it
+    for (int32_t id : leftover) cache.release_page(id);   // keyed: stays cached for whoever hits it
+    s.cached = std::move(ncached);
+    s.own = std::move(nown);
+    s.last_reg = std::min(s.last_reg, keep_full);
+    s.build(n_pages);
+    return true;
+}
+
+/// EVERYTHING a session maps goes back (its conversation leaves): the cached pins open, the own pages to the
+/// cache when keyed and to the free set otherwise.
+inline void session_release(PageCache& cache, SessionPages& s) {
+    for (int32_t id : s.cached) cache.unpin(id);
+    for (int32_t id : s.own) cache.release_page(id);
+    s.cached.clear();
+    s.own.clear();
+    s.last_reg = 0;
+}
+
+/// The conversation's pages up to `filled` cells hold its K/V: key them into the cache (full pages only, from
+/// where the last call stopped).  Pages the walk mapped are keyed already.
+template <class Ids>
+inline void session_register(PageCache& cache, SessionPages& s, const Ids& ids, int64_t filled, int page_size) {
+    const int64_t ps = page_size > 0 ? page_size : 1;
+    const int64_t upto = std::min<int64_t>(std::min<int64_t>(filled, (int64_t) ids.size()) / ps, s.mapped());
+    if (upto <= s.last_reg) return;
+    uint64_t key = 0;
+    std::array<int32_t, PageCache::page_cells> toks{};
+    for (int64_t p = 0; p < upto; ++p) {
+        for (int64_t i = 0; i < ps && i < (int64_t) PageCache::page_cells; ++i) toks[(size_t) i] = (int32_t) ids[(size_t) (p * ps + i)];
+        key = PageCache::page_key(key, toks.data(), (int) ps);
+        if (p < (int64_t) s.cached.size() || p < s.last_reg) continue;
+        cache.register_page(s.own[(size_t) (p - (int64_t) s.cached.size())], key, toks.data());
+    }
+    s.last_reg = upto;
+}
 
 }  // namespace strata::core

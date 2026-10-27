@@ -4069,6 +4069,7 @@ int main(int argc, char** argv) {
     uint64_t kvsh_G = 0;                     ///< the granularity the layout was aligned to
     int64_t kvsh_mapped_floor = 0;        ///< extents committed before the expert cache sized itself
     std::vector<void*> kvsh_base;          ///< one arena per device ([0]: CUDA0, [k]: stage k-1's)
+    std::vector<int64_t> kvsh_q_n;         ///< per arena: the QSA layers it holds (the page copy walks them)
     int64_t kvsh_sessions = 1;             ///< the main session plus every batch slot
     void* sbuf = nullptr;   // allocated after the layer-split search, sized to CUDA0's own layer range (the carve)
     // **THE ENGINE RAN ON THE LEGACY DEFAULT STREAM, WHICH ON WDDM IS THE SLOW PATH.**  All four session
@@ -5448,6 +5449,7 @@ int main(int argc, char** argv) {
                 const int64_t hi_raw = k == 0 ? hi0 : stages[k - 1]->le;
                 const int64_t hi = hi_raw < 0 ? g.n_layers : hi_raw;   // -1 = the whole model (no split)
                 const int64_t q_n = std::max<int64_t>(hi / I - lo / I, g.n_qsa_layers() > 0 ? 1 : 0);
+                kvsh_q_n.push_back(q_n);
                 const strata::core::OnDevice on_k(dev);
                 const uint64_t bytes = stride * (uint64_t) q_n;
                 if (!kvsh_vmm) {
@@ -9882,15 +9884,7 @@ int main(int argc, char** argv) {
         // cache already holds - no pin, any prefix, several at once - and allocates the rest.  Pressure
         // evicts the least recently used cached pages; a conversation is admitted when its whole need fits.
         struct KvShareState {
-            struct Session {
-                std::vector<int32_t> cached;   ///< the prefix pages mapped from the cache (pinned)
-                std::vector<int32_t> own;      ///< this conversation's pages past the cached prefix
-                std::vector<int32_t> table;    ///< the session's host table (n_pages); empty while unmapped
-                bool shares = false;           ///< the table maps cached pages at the front
-                int64_t last_reg = 0;          ///< logical pages already keyed into the cache this conversation
-                uint64_t own_key = 0;          ///< fingerprint of the ids `own` was filled for (0==0 would
-                                                ///< otherwise read as "same conversation" for any two)
-            };
+            using Session = strata::core::SessionPages;   // kv_pages.hpp: the mapping and its admission rules
             std::vector<Session> sess;      ///< [0] the main session, [b+1] batch slot b
             const int32_t* t() const { return !sess.empty() && !sess[0].table.empty() ? sess[0].table.data() : nullptr; }
             const int32_t* st(size_t b) const {
@@ -9996,17 +9990,6 @@ int main(int argc, char** argv) {
                 });
         }
         }
-        // a session's table: the cached prefix pages then its own pages, -1 past
-        auto kvsh_build = [&](KvShareState::Session& s, bool maps_cached) {
-            s.shares = maps_cached;
-            s.table.assign((size_t) ss.qsa_states[ss.qsa_primary()].n_pages, -1);
-            for (size_t i = 0; i < s.cached.size() && i < s.table.size(); ++i) s.table[i] = s.cached[i];
-            for (size_t i = 0; i < s.own.size(); i++) {
-                const size_t at = s.cached.size() + i;
-                if (at >= s.table.size()) break;
-                s.table[at] = s.own[i];
-            }
-        };
         // upload si's table (si 0 = the main session and stages, si b+1 = slot b across the stages)
         auto kvsh_apply = [&](size_t si) {
             if (!kvsh || si >= kvshs.sess.size() || kvshs.sess[si].table.empty()) return;
@@ -10025,107 +10008,58 @@ int main(int argc, char** argv) {
             }
             cudaDeviceSynchronize();
         };
-        // a session's previous conversation leaves: its cached pins open, its own pages go to the cache
+        // a session's conversation leaves: its cached pins open, its own pages go to the cache (keyed) or
+        // the free set; the device table is left as it was (nothing reads it until the next admission)
         auto kvsh_release = [&](size_t si) {
             if (!kvsh || si >= kvshs.sess.size()) return;
-            for (int32_t id : kvshs.sess[si].cached) kv_pages.unpin(id);
-            for (int32_t id : kvshs.sess[si].own) kv_pages.release_page(id);
-            kvshs.sess[si].cached.clear();
-            kvshs.sess[si].own.clear();
+            strata::core::session_release(kv_pages, kvshs.sess[si]);
         };
-        // admit a conversation into session si: `ids` its tokens, `resume` the first cell IT reads (the
-        // cached prefix never reaches past it - a page the conversation writes is never shared), `cells`
-        // the whole need.  Walks the chained keys, maps the cached prefix, allocates the rest.  false: the
-        // pool cannot hold it even after eviction (the caller refuses the request; the old mapping stays).
-        // GCC 16's -Wtemplate-body rejects calling PageCache::restore (which reaches take/evict and the
-        // swap callbacks) inside a generic lambda's body: route through this, declared complete beforehand.
-        std::function<int32_t(uint64_t, const int32_t*)> kvsh_restore =
-            [&](uint64_t k, const int32_t* t) { return kv_pages.restore(k, t); };
-        // The walk is bounded by `resume` - the first cell the conversation READS - because a mapped page
-        // must never be one the conversation writes (it would rewrite shared bytes).  A brand-new
-        // conversation (resume 0) therefore re-prefills even a fully cached prefix: the GDN layers are
-        // recurrent, so the running state at the branch point exists only through a checkpoint (the
-        // conversation cache's) or a full read; the K/V pages alone cannot reconstruct it.
+        // one page's bytes to another page, on every arena (every device), every layer, every array: what
+        // makes the page at a write start private when it is shared (session_admit's copy)
+        strata::core::CopyPage kvsh_copy_page = [&](int32_t from, int32_t to) -> bool {
+            if (from < 0 || to < 0 || kvsh_pool_pages <= 0) return false;
+            for (size_t k = 0; k < kvsh_base.size() && k < kvsh_q_n.size(); ++k) {
+                const int dev = k == 0 ? 0 : stages[k - 1]->dev;
+                const strata::core::OnDevice on_k(dev);
+                for (int64_t j = 0; j < kvsh_q_n[k]; ++j)
+                    for (int64_t a = 0; a < kvsh_lay.arrays; ++a) {
+                        const uint64_t per = kvsh_lay.arr_tight[(size_t) a] / (uint64_t) kvsh_pool_pages;
+                        if (per == 0) continue;
+                        uint8_t* base = (uint8_t*) kvsh_base[k] + (uint64_t) j * kvsh_lay.stride + kvsh_lay.arr_off[(size_t) a];
+                        if (cudaMemcpyAsync(base + (uint64_t) to * per, base + (uint64_t) from * per, (size_t) per,
+                                            cudaMemcpyDeviceToDevice, nullptr) != cudaSuccess)
+                            return false;
+                    }
+                if (cudaDeviceSynchronize() != cudaSuccess) return false;
+            }
+            return true;
+        };
+        // ADMIT a conversation into session si (session_admit, kv_pages.hpp): `valid` the cells of si's
+        // current mapping that already hold this conversation's K/V (they stay where they are - a live
+        // continuation keeps the pages of its own last answer, which re-allocating them lost), `resume` the
+        // first cell si writes (cached pages are mapped only below it: a shared page is never written),
+        // `cells` the whole need.  false: the pool cannot hold it even after eviction; the old mapping stands.
         auto kvsh_admit = [&](size_t si, const std::vector<int64_t>* ids64, const std::vector<int32_t>* ids32,
-                              int64_t resume, int64_t cells) -> bool {
+                              int64_t valid, int64_t resume, int64_t cells) -> bool {
             if (!kvsh) return true;
-            // A borrowed request admits twice (the borrow's restore, then the read with its growth headroom).
-            // The second admit must NOT drop the first's own pages - they hold the restored K/V, and the
-            // allocator is not guaranteed to hand back the same ids.  Keep the own-prefix whenever the
-            // cached prefix is unchanged (its size sets the own pages' logical offset); only a CHANGED
-            // cached prefix reindexes own, and then a full release is the only correct move.
-            const size_t old_cached_n = kvshs.sess[si].cached.size();
-            const size_t old_own_n = kvshs.sess[si].own.size();
-            for (int32_t id : kvshs.sess[si].cached) kv_pages.unpin(id);
-            kvshs.sess[si].cached.clear();
+            if (si >= kvshs.sess.size()) return false;
             KvShareState::Session& s = kvshs.sess[si];
-            s.last_reg = 0;
-            // the WHOLE prompt is matchable: a fresh request whose pages another conversation
-            // filled (or the swap holds) maps them here - resume alone bounded it to 0 for new asks
-            const int64_t limit = std::min<int64_t>(
-                {(int64_t) (ids64 ? ids64->size() : ids32->size()), cells}) / kvsh_ps;
-            uint64_t key = 0;
-            std::array<int32_t, strata::core::PageCache::page_cells> toks{};   // one page's ids (ids may be int64)
-            for (int64_t p = 0; p < limit; ++p) {
-                for (int i = 0; i < kvsh_ps && i < (int) toks.size(); ++i) {
-                    const size_t at = (size_t) p * kvsh_ps + (size_t) i;
-                    toks[(size_t) i] = (int32_t) (ids64 ? (*ids64)[at] : (*ids32)[at]);
-                }
-                key = strata::core::PageCache::page_key(key, toks.data(), (int) kvsh_ps);
-                const int32_t page = kv_pages.lookup(key, toks.data());
-                if (page < 0) {
-                    const int32_t sp = kvsh_restore(key, toks.data());
-                    if (std::getenv("STRATA_KV_SWAP_TRACE") != nullptr && p < 3)
-                        std::fprintf(stderr, "kvshare-walk: page %lld miss key=%llx restore -> %d\n",
-                                     (long long) p, (unsigned long long) key, (int) sp);
-                    if (sp >= 0) { kv_pages.pin(sp); s.cached.push_back(sp); continue; }
-                    break;   // the first miss ends the prefix: later pages cannot match either
-                }
-                kv_pages.pin(page);
-                s.cached.push_back(page);
-            }
-            const int64_t k = (int64_t) s.cached.size();
-            const int64_t need = (std::max<int64_t>(cells, k * kvsh_ps) - k * kvsh_ps + kvsh_ps - 1) / kvsh_ps;
-            uint64_t incoming = 1469598103934665603ull;   // fnv over the first 256 ids: past the chat
-            {   // template every request shares (a 4-token head called different docs the same)
-                const int64_t n_ids = (int64_t) (ids64 ? ids64->size() : ids32->size());
-                for (int64_t i = 0; i < n_ids && i < 256; ++i) {
-                    incoming ^= (uint64_t) (uint32_t) (ids64 ? (*ids64)[i] : (*ids32)[i]);
-                    incoming *= 1099511628211ull;
-                }
-            }
-            const bool keep_own = (size_t) k == old_cached_n &&
-                (s.own.empty() || s.own_key == incoming);   // same ids: own keeps its logical offset
-            if (keep_own && (int64_t) old_own_n > need) {   // shrink: hand the tail back
-                std::vector<int32_t> tail(s.own.begin() + (std::ptrdiff_t) need, s.own.end());
-                for (int32_t id : tail) kv_pages.release_page(id);
-                s.own.resize((size_t) need);
-            }
-            if (!keep_own) {
-                for (int32_t id : s.own) kv_pages.release_page(id);
-                s.own.clear();
-            }
+            const int64_t n_ids = (int64_t) (ids64 ? ids64->size() : ids32->size());
+            const int64_t n_pages = ss.qsa_states[ss.qsa_primary()].n_pages;
+            const int64_t before_cached = (int64_t) s.cached.size(), before_own = (int64_t) s.own.size();
+            std::string why;
+            const bool ok = strata::core::session_admit(kv_pages, s, ids64 ? ids64->data() : nullptr,
+                                                        ids32 ? ids32->data() : nullptr, n_ids, valid, resume, cells,
+                                                        (int) kvsh_ps, n_pages, kvsh_copy_page, &why);
             if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr)
-                std::fprintf(stderr, "kvshare-admit: si=%zu need=%lld own=%lld keep=%d free=%lld cached=%lld mapped=%lld/%lld extents\n",
-                             si, (long long) need, (long long) old_own_n, keep_own ? 1 : 0,
-                             (long long) kv_pages.free_count(),
-                             (long long) kv_pages.cached_count(), (long long) kv_pages.mapped_extents(),
-                             (long long) kv_pages.extents());
-            while ((int64_t) s.own.size() < need) {
-                std::vector<int32_t> more;
-                if (!kv_pages.take(need - (int64_t) s.own.size(), more)) {
-                    for (int32_t id : s.cached) kv_pages.unpin(id);
-                    s.cached.clear();
-                    for (int32_t id : s.own) kv_pages.release_page(id);
-                    s.own.clear();
-                    kvsh_build(s, false);
-                    kvsh_apply(si);
-                    return false;
-                }
-                s.own.insert(s.own.end(), more.begin(), more.end());
-            }
-            s.own_key = incoming;
-            kvsh_build(s, k > 0);
+                std::fprintf(stderr, "kvshare-admit: si=%zu ok=%d valid=%lld resume=%lld cells=%lld cached=%lld->%zu "
+                                     "own=%lld->%zu free=%lld poolcached=%lld mapped=%lld/%lld extents%s%s\n",
+                             si, ok ? 1 : 0, (long long) valid, (long long) resume, (long long) cells,
+                             (long long) before_cached, s.cached.size(), (long long) before_own, s.own.size(),
+                             (long long) kv_pages.free_count(), (long long) kv_pages.cached_count(),
+                             (long long) kv_pages.mapped_extents(), (long long) kv_pages.extents(),
+                             ok ? "" : " refused: ", ok ? "" : why.c_str());
+            if (!ok) return false;
             kvsh_apply(si);
             return true;
         };
@@ -10135,29 +10069,15 @@ int main(int argc, char** argv) {
         // are keyed, so an unfinished tail never enters the cache.
         auto kvsh_register = [&](size_t si, const auto& ids, int64_t filled) {
             if (!kvsh || si >= kvshs.sess.size()) return;
-            KvShareState::Session& s = kvshs.sess[si];
-            const int64_t upto = std::min<int64_t>(filled / kvsh_ps, (int64_t) (s.cached.size() + s.own.size()));
-            if (upto <= s.last_reg) return;
-            uint64_t key = 0;
-            std::array<int32_t, strata::core::PageCache::page_cells> toks{};
-            for (int64_t p = 0; p < upto; ++p) {
-                for (int i = 0; i < kvsh_ps && i < (int) toks.size(); ++i) {
-                    const size_t at = (size_t) p * kvsh_ps + (size_t) i;
-                    toks[(size_t) i] = (int32_t) ids[at];
-                }
-                key = strata::core::PageCache::page_key(key, toks.data(), (int) kvsh_ps);
-                if (p < (int64_t) s.cached.size()) continue;   // already keyed by whoever filled it
-                if (p < s.last_reg) continue;                  // keyed on an earlier part of this read
-                kv_pages.register_page(s.own[(size_t) (p - (int64_t) s.cached.size())], key, toks.data());
-            }
-            s.last_reg = upto;
+            strata::core::session_register(kv_pages, kvshs.sess[si], ids, filled, (int) kvsh_ps);
         };
-        // the main session's conversation (the restores and the read that follow must see this mapping)
+        // the main session's conversation before a restore (which writes the cells from `resume` on through
+        // this mapping; the read that follows must see the same one): nothing of the old mapping is valid
         auto kvsh_decide_main = [&](const auto& ids, int64_t resume, int64_t cells) -> bool {
             if constexpr (std::is_same_v<std::decay_t<decltype(ids)>, std::vector<int64_t>>)
-                return kvsh_admit(0, &ids, nullptr, resume, cells);
+                return kvsh_admit(0, &ids, nullptr, 0, resume, cells);
             else
-                return kvsh_admit(0, nullptr, &ids, resume, cells);
+                return kvsh_admit(0, nullptr, &ids, 0, resume, cells);
         };
         // Save only on a switch/rewind, not on each continuing request. No graph
         // addresses change: all parked images live in ordinary host vectors.
@@ -12190,18 +12110,24 @@ int main(int argc, char** argv) {
                     if (ft[(size_t) q] >= 0) covered = q + 1;
                 const int64_t cov_cells = covered * kvsh_ps;
                 if (cov_cells < upto) {
-                    std::fprintf(stderr, "strata batch: slot %d's table covers %lld of %lld tokens; the give-back "
-                                         "takes the covered prefix and the request re-reads the tail\n",
-                                 b, (long long) cov_cells, (long long) upto);
-                    upto = cov_cells;
+                    // the caller takes a failure as "read the prompt from the start": the only answer that
+                    // keeps every cell it then attends a cell this conversation wrote
+                    char msg[160];
+                    std::snprintf(msg, sizeof msg, "slot %d's table covers %lld of %lld tokens", b,
+                                  (long long) cov_cells, (long long) upto);
+                    e = msg;
+                    return false;
                 }
             }
-            if (kvsh) {   // the receiving session takes the conversation's mapping before anything moves
+            if (kvsh) {   // the receiving session takes the conversation's mapping before anything moves: the
+                          // copy writes its cells, so nothing of the receiver's old mapping is valid (0), and the
+                          // pages below `upto` the cache holds (the giver's keyed ones) are shared, not copied
                 if (into_slot) {
-                    if (!kvsh_admit((size_t) b + 1, nullptr, &ids, upto, upto + growth)) { e = "batch slot copy: the K/V pool is full"; return false; }
+                    if (!kvsh_admit((size_t) b + 1, nullptr, &ids, 0, upto, upto + growth)) { e = "batch slot copy: the K/V pool is full"; return false; }
                 } else {
-                    if (!kvsh_admit(0, nullptr, &ids, upto, upto)) { e = "batch slot copy: the K/V pool is full"; return false; }
-                    kvsh_release((size_t) b + 1);
+                    // the slot keeps its own mapping: it stays a source (idle) or goes on decoding (a checkpoint
+                    // of an active slot), and its pages return at its next admission or a preemption
+                    if (!kvsh_admit(0, nullptr, &ids, 0, upto, upto)) { e = "batch slot copy: the K/V pool is full"; return false; }
                 }
             }
             auto sync_all = [&]() {
@@ -12246,6 +12172,7 @@ int main(int argc, char** argv) {
                     if (!stage_copy(k, e)) return failed();
             }
             if (!sync_all()) { e = "batch slot copy: device sync failed"; return false; }
+            kvsh_register(into_slot ? (size_t) b + 1 : 0, ids, upto);   // the receiver's copy is valid: key it
             return true;
         };
         auto copy_to_slot = [&](int b, const std::vector<int32_t>& ids, std::string& e, int64_t growth) -> bool {
@@ -12257,14 +12184,15 @@ int main(int argc, char** argv) {
                 // moves its own share on its own card (the copy of the running state and the K/V image are its
                 // own), so the stages do not queue behind each other.
                 say_shuttle();
+                if (kvsh) {   // the slot takes the conversation's mapping (once: the stage bodies run in parallel);
+                              // the shared pages move nowhere
+                    if (!kvsh_admit((size_t) b + 1, nullptr, &ids, 0, upto, upto + growth)) { e = "batch admission: the K/V pool is full"; return false; }
+                }
                 auto stage_copy = [&](size_t k, std::string& se) -> bool {
                     strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
                     strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
                     const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
                     if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch admission: device sync failed"; return false; }
-                    if (kvsh) {   // the slot takes the conversation's mapping; the shared pages move nowhere
-                        if (!kvsh_admit((size_t) b + 1, nullptr, &ids, upto, upto + growth)) { se = "batch admission: the K/V pool is full"; return false; }
-                    }
                     strata::core::ConversationCheckpoint ck;
                     ck.ids = ids;
                     if (!strata::core::conversation_checkpoint_save(ck, from, g, se) ||
@@ -12284,7 +12212,6 @@ int main(int argc, char** argv) {
                             return false;
                     }
                     if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch admission: device sync failed"; return false; }
-                    kvsh_register((size_t) b + 1, ids, upto);   // the slot's copy is valid: key it now
                     return true;
                 };
                 if (stage_pool) {
@@ -12296,6 +12223,7 @@ int main(int argc, char** argv) {
                     for (size_t k = 0; k < bslot_ss.size(); ++k)
                         if (!stage_copy(k, e)) return false;
                 }
+                kvsh_register((size_t) b + 1, ids, upto);   // the slot's copy is valid: key it now
             }
             if (batch_mtp) {
                 // Admission first builds the solo draft KV; copy it into the slot before drafting.  Both drafters' K/V
@@ -12326,6 +12254,11 @@ int main(int argc, char** argv) {
                 // (one thread per GPU) The stages' round trip through host memory at the same time (as in
                 // copy_to_slot): each stage moves its own share on its own card.
                 say_shuttle();
+                if (kvsh) {   // the main session takes the conversation's mapping (once, before the stage bodies -
+                              // they may run in parallel).  The slot keeps its own: it stays a source, or goes on
+                              // decoding past the checkpoint; its pages return at its next admission or a preemption
+                    if (!kvsh_admit(0, nullptr, &bs[(size_t) b].ids, 0, upto, upto)) { e = "batch slot restore: the K/V pool is full"; return false; }
+                }
                 auto stage_copy = [&](size_t k, std::string& se) -> bool {
                     strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
                     strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
@@ -12341,9 +12274,6 @@ int main(int argc, char** argv) {
                             !strata::core::conversation_checkpoint_restore(ck, to, g, se))
                             return false;
                     }
-                    if (kvsh) {   // the slot's conversation returns: the main session takes its mapping back
-                        if (!kvsh_admit(0, nullptr, &bs[(size_t) b].ids, upto, upto)) { se = "batch slot restore: the K/V pool is full"; return false; }
-                    }
                     for (int64_t j = 0; j < from.qsa_alloc; ++j) {
                         strata::core::ConversationKv fresh;
                         strata::core::ConversationKv* img = &fresh;
@@ -12355,10 +12285,6 @@ int main(int argc, char** argv) {
                         if (!strata::core::conversation_kv_restore(*img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, se,
                                                                    kvshs.t(), (int64_t) kvshs.sess[0].cached.size()))
                             return false;
-                    }
-                    if (kvsh) {
-                        kvsh_register(0, bs[(size_t) b].ids, upto);   // main's refilled copy is valid: key it
-                        kvsh_release((size_t) b + 1);   // the slot's own pages go back to the pool
                     }
                     if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch slot restore: device sync failed"; return false; }
                     return true;
@@ -12372,6 +12298,7 @@ int main(int argc, char** argv) {
                     for (size_t k = 0; k < bslot_ss.size(); ++k)
                         if (!stage_copy(k, e)) return false;
                 }
+                kvsh_register(0, bs[(size_t) b].ids, upto);   // main's refilled copy is valid: key it
             }
             if (batch_mtp) {
                 // A returning solo request resumes from its slot's draft KV (on the drafter's device, as above).
@@ -14702,7 +14629,9 @@ int main(int argc, char** argv) {
                     std::string ye;
                     const auto ty = Clock::now();
                     std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
-                    if (can && copy_to_slot(ys, pre, ye, max_new + 8)) {
+                    // the slot reads the rest of this prompt and then generates: room for both
+                    if (can && copy_to_slot(ys, pre, ye, ((int64_t) ids.size() - q) +
+                                                (admit_slot >= 0 ? (int64_t) admit_max_new : max_new) + 16)) {
                         BSlot& sl = bs[(size_t) ys];
                         sl = BSlot{};
                         sl.ids = std::move(pre);
@@ -15244,7 +15173,7 @@ int main(int argc, char** argv) {
             // holds are mapped (no read, no copy); a pool that cannot hold the whole thing even after
             // eviction refuses the request.
             if (kvsh) {
-                if (!kvsh_admit(0, &ids, nullptr, read_from, n + max_new + 8)) {
+                if (!kvsh_admit(0, &ids, nullptr, read_from, read_from, n + max_new + 16)) {
                     // what pins the pool, session by session (main first, then batch slots): the number a
                     // preemption would free.  Slots' conversations cannot simply be dropped - their K/V must
                     // go to the host cache first (park-from-slot), which is the designed follow-up.
@@ -15261,10 +15190,19 @@ int main(int argc, char** argv) {
                     bool admitted = false;
                     for (int b = 0; b < o.batch && !admitted; ++b) {
                         const auto& sb = bs[(size_t) b];
-                        if (!sb.cached || sb.img || sb.partial || sb.ids.size() < 2) continue;
                         const size_t held = kvshs.sess[(size_t) b + 1].cached.size() +
                                             kvshs.sess[(size_t) b + 1].own.size();
                         if (held == 0) continue;
+                        if (!sb.cached && !sb.active && !sb.partial) {
+                            // a slot whose conversation was dropped keeps its pages until its next admission:
+                            // nothing to park, the pages simply return
+                            kvsh_release((size_t) b + 1);
+                            std::fprintf(stderr, "strata serve: --kv-share: pool full; freed the %zu pages of idle "
+                                                 "slot %d (its conversation had ended)\n", held, b);
+                            admitted = kvsh_admit(0, &ids, nullptr, read_from, read_from, n + max_new + 16);
+                            continue;
+                        }
+                        if (!sb.cached || sb.img || sb.partial || sb.ids.size() < 2) continue;
                         static const std::vector<strata::core::ConversationImageKey> no_imgs;
                         const strata::core::ConversationView view{sb.ids, no_imgs, sb.checks, sb.cvec};
                         strata::core::SavedConversation image;
@@ -15334,7 +15272,7 @@ int main(int argc, char** argv) {
                         bs[(size_t) b].ids.clear();
                         bs[(size_t) b].checks.clear();
                         kvsh_release((size_t) b + 1);
-                        admitted = kvsh_admit(0, &ids, nullptr, read_from, n + max_new + 8);
+                        admitted = kvsh_admit(0, &ids, nullptr, read_from, read_from, n + max_new + 16);
                     }
                     if (!admitted) {
                         std::printf("ERR the K/V pool has no room for this conversation: %lld of %lld pages free, "
@@ -15450,7 +15388,8 @@ int main(int argc, char** argv) {
                     break;
                 }
                 at = to;
-                kvsh_register(0, ids, at);   // this part's pages are valid: share them already
+                // this part's pages are valid: share them already (a merged tail is the first window's: not yet)
+                kvsh_register(0, ids, merge_at >= 0 ? std::min<int64_t>(merge_at, at) : at);
                 if ((to == turn_at || to == root_at || to == message_at || to == pin_at) &&
                     !checkpoint_at(to, nullptr, to == message_at && to != turn_at && to != root_at && to != pin_at)) {   // the tail kind leaves first
                     std::printf("ERR saving a conversation checkpoint failed%s\n", ckpt_why.c_str());
@@ -15466,7 +15405,7 @@ int main(int argc, char** argv) {
             // the next request that starts with these tokens maps them instead of reading them again
             if (kvsh && !kvshs.sess[0].own.empty()) {
                 const size_t before = kv_pages.cached_count();
-                kvsh_register(0, ids, n);
+                kvsh_register(0, ids, merge_at >= 0 ? std::min<int64_t>(merge_at, at) : at);   // what the read wrote
                 static int64_t kvsh_reqs = 0;
                 if (++kvsh_reqs % 32 == 0 || std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr)
                     std::fprintf(stderr, "strata serve: --kv-share: pool %lld pages: %lld free, %lld cached, "
@@ -16855,7 +16794,10 @@ int main(int argc, char** argv) {
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
                             (int64_t) live.size() == p;
                 const auto tc0 = Clock::now();
-                if (cont && !copy_to_slot(admit_slot, live, err, max_new + 8)) {
+                // the slot's pages must cover ITS generation: admit_max_new (the BGEN cap), not this request's
+                // max_new, which is 1 for a handed-over request - with 9 cells of headroom a slot's long answer
+                // wrote its K/V past the table (dropped, page -1) and decoded blind to its own last tokens
+                if (cont && !copy_to_slot(admit_slot, live, err, admit_max_new + 16)) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;
