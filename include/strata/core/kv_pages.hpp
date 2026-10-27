@@ -457,6 +457,16 @@ struct SessionPages {
     }
 };
 
+/// EVERYTHING a session maps goes back (its conversation leaves): the cached pins open, the own pages to the
+/// cache when keyed and to the free set otherwise.
+inline void session_release(PageCache& cache, SessionPages& s) {
+    for (int32_t id : s.cached) cache.unpin(id);
+    for (int32_t id : s.own) cache.release_page(id);
+    s.cached.clear();
+    s.own.clear();
+    s.last_reg = 0;
+}
+
 /// Copies one page's bytes on the device (every range, layer and array): (from, to).  false: it failed.
 using CopyPage = std::function<bool(int32_t, int32_t)>;
 
@@ -471,7 +481,8 @@ using CopyPage = std::function<bool(int32_t, int32_t)>;
 ///              keyed - a keyed page is immutable for as long as its key may be hit.
 ///   `cells`  - the whole need, generation included (the table's -1 past it would drop the decode's writes).
 /// Own pages the conversation no longer needs go back (keyed ones stay cached).  false: the pool cannot hold
-/// it even after eviction, or the mapping cannot be what the caller claims - and then s is UNCHANGED.
+/// it even after eviction, or the mapping cannot be what the caller claims - then s is unchanged when
+/// `valid` > 0, and empty when `valid` == 0 (the old mapping was released first).
 inline bool session_admit(PageCache& cache, SessionPages& s, const int64_t* ids64, const int32_t* ids32,
                           int64_t n_ids, int64_t valid, int64_t resume, int64_t cells, int page_size,
                           int64_t n_pages, const CopyPage& copy, std::string* why = nullptr) {
@@ -481,6 +492,11 @@ inline bool session_admit(PageCache& cache, SessionPages& s, const int64_t* ids6
     if (valid > n_ids) valid = n_ids;
     if (resume < valid) resume = valid;
     if (cells < resume) cells = resume;
+    // nothing of the current mapping is valid: it goes first (its keyed pages stay cached, unpinned), so
+    // the pool holds the old conversation's pages only as cache, not as pins blocking the new one - a
+    // give-back or a restore into a session still pinning its previous 120K-token conversation could not
+    // fit beside it.  A refusal then leaves the mapping EMPTY (the caller drops the session's live state).
+    if (valid == 0) session_release(cache, s);
     const int64_t have = s.mapped();
     const int64_t total = (cells + ps - 1) / ps;
     if (total > n_pages) return fail("the conversation does not fit the session's page table");
@@ -610,16 +626,6 @@ inline bool session_extend(PageCache& cache, SessionPages& s, int64_t cells, int
     for (int32_t id : fresh) { cache.pin(id); s.own.push_back(id); }
     s.build(n_pages);
     return true;
-}
-
-/// EVERYTHING a session maps goes back (its conversation leaves): the cached pins open, the own pages to the
-/// cache when keyed and to the free set otherwise.
-inline void session_release(PageCache& cache, SessionPages& s) {
-    for (int32_t id : s.cached) cache.unpin(id);
-    for (int32_t id : s.own) cache.release_page(id);
-    s.cached.clear();
-    s.own.clear();
-    s.last_reg = 0;
 }
 
 /// The conversation's pages up to `filled` cells hold its K/V: key them into the cache (full pages only, from

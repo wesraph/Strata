@@ -10153,7 +10153,13 @@ int main(int argc, char** argv) {
                              (long long) kv_pages.free_count(), (long long) kv_pages.cached_count(),
                              (long long) kv_pages.mapped_extents(), (long long) kv_pages.extents(),
                              ok ? "" : " refused: ", ok ? "" : why.c_str());
-            if (!ok) return false;
+            if (!ok) {
+                if (valid == 0) {   // the old mapping was released first: nothing of the session's state stands
+                    kvsh_apply(si);   // (its table: all -1)
+                    if (si == 0) { live_ok = false; live.clear(); live_imgs.clear(); checks.clear(); }
+                }
+                return false;
+            }
             kvsh_apply(si);
             return true;
         };
