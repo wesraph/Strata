@@ -13519,11 +13519,13 @@ int main(int argc, char** argv) {
         // a batch slot holds this conversation at least as far as main does (its copy is the newer one: main's
         // last park would be a 1-5 s copy of state the slot keeps alive) - then main need not park it; the slot
         // parks it itself when it is recycled (park_slot_conversation) or preempted
+        // (an ACTIVE slot counts too: it is decoding this very conversation - 35 of the next 38 parks were of
+        // one still decoding in its slot - and ends idle with the longer copy)
         auto slot_holds_live = [&]() -> bool {
             if (!kvsh || live.empty()) return false;
             for (const BSlot& sl : bs)
-                if (sl.cached && !sl.tainted && !sl.img && sl.cvec == cvec_cached && sl.ids.size() >= live.size() &&
-                    std::equal(live.begin(), live.end(), sl.ids.begin()))
+                if ((sl.cached || sl.active) && !sl.tainted && !sl.img && sl.cvec == cvec_cached &&
+                    sl.ids.size() >= live.size() && std::equal(live.begin(), live.end(), sl.ids.begin()))
                     return true;
             return false;
         };
