@@ -13437,6 +13437,105 @@ int main(int argc, char** argv) {
                                      "long conversations may be refused\n", (long long) m, (long long) kvsh_floor_extents);
         }
         kvsh_idle_t0 = std::chrono::steady_clock::now();   // the idle clock starts with serving, not the process
+        // PARK A SLOT'S CONVERSATION to the host cache (best effort) and free its pages: the preemption under a
+        // full pool, and a slot about to be recycled for another conversation.  `why` names the occasion.
+        auto park_slot_conversation = [&](int b, const char* why) -> bool {
+            BSlot& sl = bs[(size_t) b];
+            if (!sl.cached || sl.img || sl.partial || sl.active || sl.ids.size() < 2) return false;
+            const size_t held = kvshs.sess.empty() ? 0 : kvshs.sess[(size_t) b + 1].cached.size() + kvshs.sess[(size_t) b + 1].own.size();
+            const auto t0 = Clock::now();
+            static const std::vector<strata::core::ConversationImageKey> no_imgs;
+            const strata::core::ConversationView view{sl.ids, no_imgs, sl.checks, sl.cvec};
+            strata::core::SavedConversation image;
+            std::string perr;
+            size_t estimate = 0;
+            // single GPU only: a layer split's conversation spans every stage's slot session, and
+            // capturing all of them here is the park machinery's stage_parts dance - on a split the
+            // pages are freed and the conversation simply reads again when it returns
+            bool slot_parked = false;
+            if (stages.empty()) {
+                slot_parked =
+                    strata::core::conversation_snapshot_capture_bytes({}, view, *bslot_ss[0][(size_t) b], g,
+                                                                      nullptr, estimate, perr) &&
+                    conversations.make_room(estimate, 0) &&
+                    strata::core::conversation_snapshot_save(image, view, *bslot_ss[0][(size_t) b], g, nullptr,
+                                                             perr, {}, nullptr, kvshs.st(b),
+                                                             kvshs.sess[(size_t) b + 1].last_reg);
+            } else {
+                // a layer split's conversation spans every stage's slot session: capture them
+                // all - the same per-stage dance park_current runs for the main session (the
+                // checks split: a slot's checkpoints are stored with their stage parts).  The
+                // draft ring is not saved (as on one GPU): it rebuilds on the slot's first window.
+                strata::core::ConversationCheckpointSplit csplit =
+                    strata::core::conversation_checkpoints_split(
+                        std::vector<strata::core::ConversationCheckpoint>(sl.checks), stages.size());
+                const strata::core::ConversationView view0{sl.ids, no_imgs, csplit.stage0, sl.cvec};
+                bool ok = strata::core::conversation_snapshot_capture_bytes({}, view0, *bslot_ss[0][(size_t) b],
+                                                                            g, nullptr, estimate, perr);
+                for (size_t k = 0; ok && k < stages.size(); ++k) {
+                    const strata::core::ConversationView view_k{sl.ids, no_imgs, csplit.parts[k], sl.cvec};
+                    const strata::core::OnDevice on_k(stages[k]->dev);
+                    if (cudaDeviceSynchronize() != cudaSuccess) { perr = "stage sync failed"; ok = false; break; }
+                    size_t part = 0;
+                    if (!strata::core::conversation_snapshot_capture_bytes({}, view_k, *bslot_ss[k + 1][(size_t) b],
+                                                                            g, nullptr, part, perr)) { ok = false; break; }
+                    estimate += part;
+                }
+                if (ok) ok = conversations.make_room(estimate, 0);
+                if (ok && cudaDeviceSynchronize() == cudaSuccess &&
+                    strata::core::conversation_snapshot_save(image, view0, *bslot_ss[0][(size_t) b], g, nullptr,
+                                                             perr, {}, nullptr, kvshs.st(b),
+                                                             kvshs.sess[(size_t) b + 1].last_reg)) {
+                    for (size_t k = 0; k < stages.size(); ++k) {
+                        const strata::core::ConversationView view_k{sl.ids, no_imgs, csplit.parts[k], sl.cvec};
+                        const strata::core::OnDevice on_k(stages[k]->dev);
+                        strata::core::SavedConversation part;
+                        if (cudaDeviceSynchronize() != cudaSuccess ||
+                            !strata::core::conversation_snapshot_save(part, view_k, *bslot_ss[k + 1][(size_t) b], g,
+                                                                      nullptr, perr, {}, nullptr, kvshs.st(b),
+                                                                      kvshs.sess[(size_t) b + 1].last_reg)) {
+                            ok = false; break;
+                        }
+                        image.stage_images.push_back(std::move(part));
+                    }
+                } else ok = false;
+                slot_parked = ok;
+            }
+            if (slot_parked) {
+                conversations.put(std::move(image), 0);
+                std::fprintf(stderr, "strata serve: %s: parked slot %d's conversation (%lld tokens) to the host cache in "
+                                     "%.0f ms, freeing %zu pages\n", why, b, (long long) sl.ids.size(),
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), held);
+            } else {
+                std::fprintf(stderr, "strata serve: %s: could not park slot %d's conversation (%s); freeing its pages - "
+                                     "it reads again when it returns\n", why, b, perr.empty() ? "no room" : perr.c_str());
+            }
+            sl.cached = false;
+            sl.ids.clear();
+            sl.checks.clear();
+            kvsh_release((size_t) b + 1);
+            return slot_parked;
+        };
+        // a batch slot holds this conversation at least as far as main does (its copy is the newer one: main's
+        // last park would be a 1-5 s copy of state the slot keeps alive) - then main need not park it; the slot
+        // parks it itself when it is recycled (park_slot_conversation) or preempted
+        auto slot_holds_live = [&]() -> bool {
+            if (!kvsh || live.empty()) return false;
+            for (const BSlot& sl : bs)
+                if (sl.cached && !sl.tainted && !sl.img && sl.cvec == cvec_cached && sl.ids.size() >= live.size() &&
+                    std::equal(live.begin(), live.end(), sl.ids.begin()))
+                    return true;
+            return false;
+        };
+        // a slot about to take another conversation parks the one it holds, unless the host cache has it whole
+        auto park_before_recycle = [&](int b) {
+            if (!kvsh || b < 0 || b >= (int) bs.size()) return;
+            const BSlot& sl = bs[(size_t) b];
+            if (!sl.cached || sl.active || sl.ids.empty()) return;
+            static const std::vector<strata::core::ConversationImageKey> no_imgs2;
+            if (conversations.parked_prefix_tokens(sl.ids, no_imgs2, sl.checks, sl.cvec) >= sl.ids.size()) return;
+            (void) park_slot_conversation(b, "slot recycled");
+        };
         // THE IDLE TRIM: nothing decoding for a while - the cached pages past the reserve go to the host swap
         // (batched), and the extents they empty go to the caches through kvsh_unmap_extent
         auto kvsh_trim_idle = [&]() {
@@ -14336,7 +14435,7 @@ int main(int argc, char** argv) {
                         return 1;
                     }
                 }
-            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth &&
+            } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth && !slot_holds_live() &&
                        !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
@@ -15124,6 +15223,7 @@ int main(int argc, char** argv) {
                     const auto ty = Clock::now();
                     std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
                     // the slot reads the rest of this prompt and then generates: room for both
+                    if (can) park_before_recycle(ys);
                     if (can && copy_to_slot(ys, pre, ye, ((int64_t) ids.size() - q) +
                                                 kvsh_headroom(admit_slot >= 0 ? (int64_t) admit_max_new : max_new))) {
                         BSlot& sl = bs[(size_t) ys];
@@ -15697,77 +15797,7 @@ int main(int argc, char** argv) {
                             continue;
                         }
                         if (!sb.cached || sb.img || sb.partial || sb.ids.size() < 2) continue;
-                        static const std::vector<strata::core::ConversationImageKey> no_imgs;
-                        const strata::core::ConversationView view{sb.ids, no_imgs, sb.checks, sb.cvec};
-                        strata::core::SavedConversation image;
-                        std::string perr;
-                        size_t estimate = 0;
-                        // single GPU only: a layer split's conversation spans every stage's slot session, and
-                        // capturing all of them here is the park machinery's stage_parts dance - on a split the
-                        // pages are freed and the conversation simply reads again when it returns
-                        bool slot_parked = false;
-                        if (stages.empty()) {
-                            slot_parked =
-                                strata::core::conversation_snapshot_capture_bytes({}, view, *bslot_ss[0][(size_t) b], g,
-                                                                                  nullptr, estimate, perr) &&
-                                conversations.make_room(estimate, 0) &&
-                                strata::core::conversation_snapshot_save(image, view, *bslot_ss[0][(size_t) b], g, nullptr,
-                                                                         perr, {}, nullptr, kvshs.st(b),
-                                                                         kvshs.sess[(size_t) b + 1].last_reg);
-                        } else {
-                            // a layer split's conversation spans every stage's slot session: capture them
-                            // all - the same per-stage dance park_current runs for the main session (the
-                            // checks split: a slot's checkpoints are stored with their stage parts).  The
-                            // draft ring is not saved (as on one GPU): it rebuilds on the slot's first window.
-                            strata::core::ConversationCheckpointSplit csplit =
-                                strata::core::conversation_checkpoints_split(
-                                    std::vector<strata::core::ConversationCheckpoint>(sb.checks), stages.size());
-                            const strata::core::ConversationView view0{sb.ids, no_imgs, csplit.stage0, sb.cvec};
-                            bool ok = strata::core::conversation_snapshot_capture_bytes({}, view0, *bslot_ss[0][(size_t) b],
-                                                                                        g, nullptr, estimate, perr);
-                            for (size_t k = 0; ok && k < stages.size(); ++k) {
-                                const strata::core::ConversationView view_k{sb.ids, no_imgs, csplit.parts[k], sb.cvec};
-                                const strata::core::OnDevice on_k(stages[k]->dev);
-                                if (cudaDeviceSynchronize() != cudaSuccess) { perr = "stage sync failed"; ok = false; break; }
-                                size_t part = 0;
-                                if (!strata::core::conversation_snapshot_capture_bytes({}, view_k, *bslot_ss[k + 1][(size_t) b],
-                                                                                        g, nullptr, part, perr)) { ok = false; break; }
-                                estimate += part;
-                            }
-                            if (ok) ok = conversations.make_room(estimate, 0);
-                            if (ok && cudaDeviceSynchronize() == cudaSuccess &&
-                                strata::core::conversation_snapshot_save(image, view0, *bslot_ss[0][(size_t) b], g, nullptr,
-                                                                         perr, {}, nullptr, kvshs.st(b),
-                                                                         kvshs.sess[(size_t) b + 1].last_reg)) {
-                                for (size_t k = 0; k < stages.size(); ++k) {
-                                    const strata::core::ConversationView view_k{sb.ids, no_imgs, csplit.parts[k], sb.cvec};
-                                    const strata::core::OnDevice on_k(stages[k]->dev);
-                                    strata::core::SavedConversation part;
-                                    if (cudaDeviceSynchronize() != cudaSuccess ||
-                                        !strata::core::conversation_snapshot_save(part, view_k, *bslot_ss[k + 1][(size_t) b], g,
-                                                                                  nullptr, perr, {}, nullptr, kvshs.st(b),
-                                                                                  kvshs.sess[(size_t) b + 1].last_reg)) {
-                                        ok = false; break;
-                                    }
-                                    image.stage_images.push_back(std::move(part));
-                                }
-                            } else ok = false;
-                            slot_parked = ok;
-                        }
-                        if (slot_parked) {
-                            conversations.put(std::move(image), 0);
-                            std::fprintf(stderr, "strata serve: --kv-share: pool full; parked slot %d's conversation "
-                                                 "(%lld tokens) to the host cache, freeing %zu pages\n", b,
-                                         (long long) sb.ids.size(), held);
-                        } else {
-                            std::fprintf(stderr, "strata serve: --kv-share: pool full; could not park slot %d (%s); "
-                                                 "freeing its pages anyway - it reads again when it returns\n", b,
-                                         perr.empty() ? "no room" : perr.c_str());
-                        }
-                        bs[(size_t) b].cached = false;
-                        bs[(size_t) b].ids.clear();
-                        bs[(size_t) b].checks.clear();
-                        kvsh_release((size_t) b + 1);
+                        (void) park_slot_conversation(b, "pool full");
                         admitted = kvsh_admit(0, &ids, nullptr, read_from, read_from, n + kvsh_headroom(max_new));
                     }
                     if (!admitted) {
@@ -17310,6 +17340,7 @@ int main(int argc, char** argv) {
                 // the slot's pages must cover ITS generation: admit_max_new (the BGEN cap), not this request's
                 // max_new, which is 1 for a handed-over request - with 9 cells of headroom a slot's long answer
                 // wrote its K/V past the table (dropped, page -1) and decoded blind to its own last tokens
+                if (cont) park_before_recycle(admit_slot);
                 if (cont && !copy_to_slot(admit_slot, live, err, kvsh_headroom(admit_max_new))) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
