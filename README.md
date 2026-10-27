@@ -22,6 +22,57 @@
 
 <p align="center"><sub><b>English</b> · <a href="README.zh-CN.md">简体中文</a> · <a href="README.ja.md">日本語</a> · <a href="README.de.md">Deutsch</a> · <a href="README.fr.md">Français</a> · <a href="README.es.md">Español</a> · <a href="README.pt-BR.md">Português</a> · <a href="README.pl.md">Polski</a></sub></p>
 
+> **This is a fork of [Niko1221/Strata](https://github.com/Niko1221/Strata).** It tracks upstream (currently v0.2.7) and adds a
+> shared, paged K/V memory model for the engine. The section below says why and what it changes; everything after it is
+> the upstream README.
+
+## About this fork: a shared K/V pool for agents
+
+We run coding agents against Strata: several conversations at once, each 80K to 200K tokens long, on two RTX 3090s with a
+MoE model (Qwen3.8-Flash-Next, IQ4_XS) whose experts live partly in VRAM and partly in RAM. Upstream's memory model gives
+every session (the main one plus each batch slot) its own contiguous K/V buffer sized up front. For that workload it meant:
+the context had to be capped below the model's 262K, a slot switch copied the whole K/V image (about 4.5 s for 25K tokens),
+the agents' shared system prompt was stored once per session that held it, prefix reuse only happened at checkpoints on a
+token schedule, and the VRAM carved out for K/V sat idle while the expert cache, which decides decode speed, went without.
+
+The fork replaces that with one flat pool of 4-token pages per card (`--kv-share`, branch `feature/kv-share`, merged on
+`main`). The comparison, measured on the rig above:
+
+| | upstream model | this fork |
+|---|---|---|
+| K/V layout | one contiguous buffer per session, sized at startup | one paged pool per card, shared by every session |
+| context per conversation | capped by the per-session budget | the model's full 262K (the pool holds 684K cells per card) |
+| growth during an answer | the whole buffer reserved | pages added on demand with 2K tokens of headroom |
+| shared prefix (system prompt) | once per session holding it | once; pages are keyed by a hash chain over their tokens and mapped by every conversation that shares them |
+| prefix reuse across turns | at checkpoints (`--prompt-cache-every`) | any prefix at page granularity: a turn reads only its new tokens (83,449 of 83,888 reused on a typical agent turn) |
+| slot switch | copy the K/V image: ~4.5 s per 25K tokens | copy the page table: 30 ms for 83K tokens |
+| a conversation that leaves its slot | host image, full restore on return | pages stay in the pool while there is room, else evicted least-recently-used to a host swap sized from free RAM; parks skip every pooled page |
+| VRAM for K/V | fixed carve-out, taken from the expert cache whether used or not | borrowed from the expert caches on demand and returned after a minute idle (the VRAM exchange), so experts get the VRAM back when conversations rest |
+
+Throughput, the same engine build with and without the fork's model, per-request decode of 700-token answers:
+
+| concurrent answers | upstream model (serial slots) | this fork + v0.2.7 pipelined groups and slot drafts |
+|---|---|---|
+| 1 | 88 tok/s | 95 tok/s |
+| 2 | 44 tok/s each | 68 tok/s each |
+| 4 | 26 tok/s each | 27 tok/s each |
+
+Prefill is unchanged (about 3.6K tok/s for 46K to 237K-token first reads on this rig). Four concurrent answers are bound by
+expert cache misses, not K/V, on two 24 GB cards.
+
+**Using it.** `--kv-share auto` sizes the pool from the free VRAM (`STRATA_KV_SHARE_FRAC`, default 0.75 of it); the host
+swap (`--kv-swap-mib`) sizes itself from free RAM when unset; the exchange is on by default (`STRATA_KV_EXCHANGE=0` turns
+it off, `STRATA_KV_TRIM_IDLE_S` and `STRATA_KV_TRIM_KEEP_TOKENS` tune the idle trim). The flags are documented in
+[docs/DETAILS.md](docs/DETAILS.md). With two NVIDIA cards, `STRATA_PIPED_MTP=1` and `--batch-mtp` add the pipelined slot
+drafts that the table above uses. Give the engine headroom: the pool shares the card's free VRAM with everything else, and
+`--vram-reserve-mib 1536` is what keeps three or more long contexts from paging on 24 GB cards.
+
+**Known edges.** Every mapped page is pinned, so three or more conversations near 200K tokens can fill the pool and the next
+answer waits on evictions. The exchange's working-set window and minimum lend are tuned on our traffic, not derived.
+Unpinned mappings for idle slots and a fairer share rule near a full pool are the next steps.
+
+---
+
 **Free, open source, and yours to run.** Use Strata on your desktop or with your favorite coding tools. No account needed.
 
 ## Models
