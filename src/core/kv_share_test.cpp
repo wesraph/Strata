@@ -486,6 +486,16 @@ int main() {
         for (int32_t id : s.own) tail_unkeyed = tail_unkeyed && !pc.keyed(id) && pc.refs(id) == 1;
         check(tail_unkeyed && s.cached.empty(), "its pages are all unkeyed and pinned once");
         check(pc.refs(keep[0]) == 1 && pc.keyed(keep[0]), "A's shared pages keep the sibling's pin and their key");
+        // the decode nears the end of its pages: an extension appends own pages and moves nothing
+        {
+            const std::vector<int32_t> had = s.own;
+            check(session_extend(pc, s, 80 + 40, 4, 128), "extend by 40 cells");
+            check(s.own.size() == had.size() + 10 && std::equal(had.begin(), had.end(), s.own.begin()),
+                  "ten pages appended, the rest where they were");
+            check(pc.refs(s.own.back()) == 1 && s.table[(size_t) s.mapped() - 1] == s.own.back(), "appended pages pinned and in the table");
+            check(session_extend(pc, s, 100, 4, 128) && s.own.size() == had.size() + 10, "a smaller need is already met");
+            check(!session_extend(pc, s, 4 * 100, 4, 128) && s.own.size() == had.size() + 10, "beyond the pool: refused, unchanged");
+        }
         session_release(pc, s2);
         check(pc.refs(keep[0]) == 0 && pc.keyed(keep[0]), "released by all: cached, evictable");
         session_release(pc, s);

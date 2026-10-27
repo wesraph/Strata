@@ -489,7 +489,8 @@ struct Options {
     std::string kv = "fp16";           ///< plan v0.3 P7: KV storage, fp16 (default) or int8 (half the VRAM)
     int64_t kv_resident = 0;           ///< KV streaming: resident cells per QSA layer (0: all in VRAM)
     bool kv_grow = false;              ///< the elastic K/V (--kv-grow, STRATA_KV_GROW=1; kvg_ensure)
-    int64_t kv_swap_mib = 4096;        ///< --kv-swap-mib N: host swap of evicted pool pages (vLLM's swap; 0 off)
+    int64_t kv_swap_mib = -1;          ///< --kv-swap-mib N: host swap of evicted pool pages (vLLM's swap; 0 off;
+                                       ///< -1 = auto: 40% of the RAM available at startup, at least 4096)
     int64_t kv_share = 0;              ///< --kv-share N: the shared-prefix K/V arena (STRATA_KV_SHARE=N): requests
                                        ///< whose prompts share the pinned prefix (pin=N) read the same K/V pages
     std::string dump_residual;
@@ -843,7 +844,8 @@ void usage() {
                  "                       all of it in VRAM. A context of N cells or fewer is not streamed\n"
                  "  --kv-swap-mib N       eviction copies pool pages out to host RAM keyed by their content\n"
                  "                       hash, and a later request copies them back instead of re-reading the\n"
-                 "                       tokens (vLLM's swap). Default 4096; 0 turns it off\n"
+                 "                       tokens (vLLM's swap). Default auto: 40%% of the RAM available at\n"
+                 "                       startup (at least 4096); 0 turns it off\n"
                  "  --kv-share N         --serve: one flat K/V pool of N tokens that every session draws pages from; a\n"
                  "                       pinned prefix (pin=N) is pages in it, so requests that share the prefix read\n"
                  "                       the same K/V pages with no copy and no re-read. N is the pool, not a prefix\n"
@@ -3232,9 +3234,13 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: --kv-share must be a number of tokens or \"auto\"\n");
         return 2;
     }
-    if (o.kv_swap_mib < 0) {
-        std::fprintf(stderr, "strata generate: --kv-swap-mib must be >= 0\n");
-        return 2;
+    if (o.kv_swap_mib < 0) {   // auto: a share of the RAM available now (the swap only ever holds what the
+                               // pool evicted; a page it does not hold is read again from its tokens)
+        const int64_t avail = mem_sample().avail_mib;
+        o.kv_swap_mib = std::max<int64_t>(4096, avail > 0 ? avail * 40 / 100 : 4096);
+        if (o.kv_share != 0 && o.serve)
+            std::fprintf(stderr, "strata generate: --kv-swap-mib auto: %lld MiB of host RAM for evicted K/V pages "
+                                 "(40%% of the %lld MiB available)\n", (long long) o.kv_swap_mib, (long long) avail);
     }
     if (o.kv_share > 0 && (!o.serve || o.kv_resident > 0 || o.kv_grow)) {
         std::fprintf(stderr, "strata generate: --kv-share %lld is off: it needs --serve with the K/V fully in VRAM "
@@ -4051,8 +4057,14 @@ int main(int argc, char** argv) {
         const uint8_t* give(uint64_t key) {
             auto it = held.find(key);
             if (it == held.end()) return nullptr;
-            ++in_count;
             return it->second.data();
+        }
+        void take_owned(uint64_t key, std::vector<uint8_t>&& buf) {
+            auto it = held.find(key);
+            if (it != held.end()) { bytes -= it->second.size(); it->second = std::move(buf); }
+            else held.emplace(key, std::move(buf));
+            bytes += held[key].size();
+            ++out_count;
         }
         void drop(uint64_t key) {
             auto it = held.find(key);
@@ -5332,8 +5344,15 @@ int main(int argc, char** argv) {
         // --kv-share auto: the pool takes a fixed share of the VRAM the weights left free (the expert
         // cache opens after the pool and sizes itself into the rest).  One number per rig, the tightest
         // device decides - vLLM's profiling step in miniature.
+        // STRATA_KV_SHARE_FRAC: the share of the free VRAM `--kv-share auto` takes (0.35 by default; more for
+        // several long agents at once, less for one agent and a bigger expert cache)
+        const double kvsh_share_frac = [] {
+            const char* v = std::getenv("STRATA_KV_SHARE_FRAC");
+            const double f = v != nullptr ? std::atof(v) : 0.35;
+            return f > 0.05 && f < 0.95 ? f : 0.35;
+        }();
         if (o.kv_share < 0) {
-            constexpr double auto_share = 0.35;
+            const double auto_share = kvsh_share_frac;
             const int64_t per_page = strata::kernels::kv_block_bytes(
                 strata::core::qsa_shapes(g), strata::core::qsa_kv_format(strata::core::QsaState{}));
             const int64_t q_n_all = std::max<int64_t>(g.n_layers / std::max<int64_t>(g.qsa_interval, 1),
@@ -5503,7 +5522,7 @@ int main(int argc, char** argv) {
                 // but only a SHARE: a whole-context floor takes ~3.7 GiB eagerly, starves the cache to a few
                 // hundred MiB, and the prompt reads crawl on RAM experts until the watchdog ends the engine.
                 // What the floor holds is a START; take() maps more extents on demand.
-                constexpr double floor_share = 0.35;
+                const double floor_share = kvsh_share_frac;
                 uint64_t free_b = 0, total_b = 0;
                 if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) free_b = 0;
                 const uint64_t G = strata::core::vmm_granularity();
@@ -5511,7 +5530,10 @@ int main(int argc, char** argv) {
                 const int64_t extent_bytes = (int64_t) G * layers * (int64_t) lay.arrays;   // ~1 chunk per layer per array
                 int64_t floor_extents = extent_bytes > 0
                     ? (int64_t) ((double) free_b * floor_share) / extent_bytes : 1;
-                const int64_t whole = (kvsh_pages_of_context + kvsh_pages_per_extent - 1) / kvsh_pages_per_extent;
+                // the floor may claim the WHOLE pool (not just one context's extents, which capped a pool
+                // sized for several agents at one context: the expert cache took the rest and the pool's
+                // remaining extents could never map)
+                const int64_t whole = (kvsh_pool_pages + kvsh_pages_per_extent - 1) / kvsh_pages_per_extent;
                 if (floor_extents < 1) floor_extents = 1;
                 if (floor_extents > whole) floor_extents = whole;
                 if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr)
@@ -9925,69 +9947,119 @@ int main(int argc, char** argv) {
                          (long long) kvsh_lay.chunks_per_layer,
                          (long long) (kvsh_range.empty() ? -1 : (int64_t) kvsh_range.front()->chunks()),
                          kvsh_range.size());
-            kv_pages.set_swap(
-                [&](int32_t page, uint64_t key) {
-                    if (kvsh_swap.budget == 0) return false;
-                    const int64_t layers = kvsh_lay.chunks_per_layer > 0
-                        ? (int64_t) kvsh_range.front()->chunks() / kvsh_lay.chunks_per_layer : 0;
-                    size_t at = 0;
-                    for (size_t r = 0; r < kvsh_range.size(); ++r) {
+            // THE BATCHED SWAP: a batch of pages moves in RUNS of consecutive physical pages - one transfer
+            // per run per (range, layer, array) - staged through one host buffer per range.  A page's host
+            // copy is flat: [range][layer][array].  (Per page it was 144 driver calls and a device sync.)
+            const int64_t page_total = [&] {
+                int64_t t = 0;
+                for (size_t r = 0; r < kvsh_q_n.size(); ++r) t += kvsh_q_n[r] * page_bytes;
+                return t;
+            }();
+            auto arr_prefix = [&](int64_t a) { int64_t o2 = 0; for (int64_t aa = 0; aa < a; ++aa) o2 += kvsh_swap_per_arr[(size_t) aa]; return o2; };
+            auto range_prefix = [&](size_t r) { int64_t o2 = 0; for (size_t rr = 0; rr < r; ++rr) o2 += kvsh_q_n[rr] * page_bytes; return o2; };
+            kv_pages.set_swap_many(
+                [&](const std::vector<std::pair<int32_t, uint64_t>>& victims) {
+                    if (kvsh_swap.budget == 0 || victims.empty() || page_total <= 0) return;
+                    // what the budget still holds (the oldest victims first: they are the LRU order)
+                    size_t k = 0;
+                    while (k < victims.size() && kvsh_swap.bytes + (uint64_t) (k + 1) * (uint64_t) page_total <= kvsh_swap.budget) ++k;
+                    if (k == 0) { kvsh_swap.refused += victims.size(); kvsh_swap.called += victims.size(); return; }
+                    std::vector<size_t> order(k);
+                    for (size_t i = 0; i < k; ++i) order[i] = i;
+                    std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return victims[x].first < victims[y].first; });
+                    std::vector<std::vector<uint8_t>> bufs(k);
+                    for (auto& b : bufs) b.resize((size_t) page_total);
+                    bool ok = true;
+                    for (size_t r = 0; r < kvsh_q_n.size() && ok; ++r) {
                         const int dev = r == 0 ? 0 : stages[r - 1]->dev;
                         const strata::core::OnDevice on_r(dev);
-                        for (int64_t j = 0; j < layers && at + (size_t) kvsh_swap_page_bytes <= stage.size(); ++j)
-                            for (int64_t a = 0; a < kvsh_lay.arrays; ++a) {
-                                const uint8_t* from = (const uint8_t*) kvsh_base[r] +
-                                    (uint64_t) j * kvsh_lay.stride + kvsh_lay.arr_off[(size_t) a] +
-                                    (uint64_t) page * (uint64_t) kvsh_swap_per_arr[(size_t) a];
-                                if (cudaMemcpyAsync(stage.data() + at, from, (size_t) kvsh_swap_per_arr[(size_t) a],
-                                                    cudaMemcpyDeviceToHost, nullptr) != cudaSuccess) {
-                                    if (kvsh_swap.out_count + kvsh_swap.refused == 0)
-                                        std::fprintf(stderr, "kvshare-swap: D2H failed r=%zu j=%lld a=%lld from=%p\n",
-                                                     r, (long long) j, (long long) a, (const void*) from);
-                                    return false;
+                        const size_t slab = (size_t) kvsh_q_n[r] * (size_t) page_bytes * k;
+                        if (stage.size() < slab) stage.resize(slab);
+                        for (int64_t j = 0; j < kvsh_q_n[r] && ok; ++j)
+                            for (int64_t a = 0; a < kvsh_lay.arrays && ok; ++a) {
+                                const size_t per = (size_t) kvsh_swap_per_arr[(size_t) a];
+                                if (per == 0) continue;
+                                const uint8_t* base = (const uint8_t*) kvsh_base[r] + (uint64_t) j * kvsh_lay.stride + kvsh_lay.arr_off[(size_t) a];
+                                uint8_t* slice = stage.data() + ((size_t) j * (size_t) page_bytes + (size_t) arr_prefix(a)) * k;
+                                for (size_t i = 0; i < k && ok;) {
+                                    size_t e = i;
+                                    while (e + 1 < k && victims[order[e + 1]].first == victims[order[e]].first + 1) ++e;
+                                    const size_t n = e + 1 - i;
+                                    ok = cudaMemcpyAsync(slice + i * per, base + (uint64_t) victims[order[i]].first * per, n * per,
+                                                         cudaMemcpyDeviceToHost, nullptr) == cudaSuccess;
+                                    i = e + 1;
                                 }
-                                at += (size_t) kvsh_swap_per_arr[(size_t) a];
+                            }
+                        if (ok) ok = cudaDeviceSynchronize() == cudaSuccess;
+                        if (!ok) break;
+                        for (int64_t j = 0; j < kvsh_q_n[r]; ++j)
+                            for (int64_t a = 0; a < kvsh_lay.arrays; ++a) {
+                                const size_t per = (size_t) kvsh_swap_per_arr[(size_t) a];
+                                if (per == 0) continue;
+                                const uint8_t* slice = stage.data() + ((size_t) j * (size_t) page_bytes + (size_t) arr_prefix(a)) * k;
+                                const size_t off = (size_t) range_prefix(r) + (size_t) j * (size_t) page_bytes + (size_t) arr_prefix(a);
+                                for (size_t i = 0; i < k; ++i) std::memcpy(bufs[order[i]].data() + off, slice + i * per, per);
                             }
                     }
-                    const cudaError_t sync_e = cudaDeviceSynchronize();
-                    if (sync_e != cudaSuccess) {
-                        if (kvsh_swap.out_count + kvsh_swap.refused == 0)
-                            std::fprintf(stderr, "kvshare-swap: sync failed: %s\n", cudaGetErrorString(sync_e));
+                    kvsh_swap.called += victims.size();
+                    if (!ok) {
+                        if (kvsh_swap.refused == 0) std::fprintf(stderr, "kvshare-swap: the batched copy out failed\n");
+                        kvsh_swap.refused += victims.size();
+                        return;
+                    }
+                    for (size_t i = 0; i < k; ++i) kvsh_swap.take_owned(victims[i].second, std::move(bufs[i]));
+                    kvsh_swap.refused += victims.size() - k;
+                    kv_pages.count_swapped_out((int64_t) k);
+                },
+                [&](const std::vector<std::pair<uint64_t, int32_t>>& pairs) -> bool {
+                    if (pairs.empty() || page_total <= 0) return false;
+                    const size_t k = pairs.size();
+                    std::vector<const uint8_t*> src(k);
+                    for (size_t i = 0; i < k; ++i)
+                        if ((src[i] = kvsh_swap.give(pairs[i].first)) == nullptr) return false;
+                    std::vector<size_t> order(k);
+                    for (size_t i = 0; i < k; ++i) order[i] = i;
+                    std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return pairs[x].second < pairs[y].second; });
+                    bool ok = true;
+                    for (size_t r = 0; r < kvsh_q_n.size() && ok; ++r) {
+                        const int dev = r == 0 ? 0 : stages[r - 1]->dev;
+                        const strata::core::OnDevice on_r(dev);
+                        const size_t slab = (size_t) kvsh_q_n[r] * (size_t) page_bytes * k;
+                        if (stage.size() < slab) stage.resize(slab);
+                        for (int64_t j = 0; j < kvsh_q_n[r]; ++j)
+                            for (int64_t a = 0; a < kvsh_lay.arrays; ++a) {
+                                const size_t per = (size_t) kvsh_swap_per_arr[(size_t) a];
+                                if (per == 0) continue;
+                                uint8_t* slice = stage.data() + ((size_t) j * (size_t) page_bytes + (size_t) arr_prefix(a)) * k;
+                                const size_t off = (size_t) range_prefix(r) + (size_t) j * (size_t) page_bytes + (size_t) arr_prefix(a);
+                                for (size_t i = 0; i < k; ++i) std::memcpy(slice + i * per, src[order[i]] + off, per);
+                            }
+                        for (int64_t j = 0; j < kvsh_q_n[r] && ok; ++j)
+                            for (int64_t a = 0; a < kvsh_lay.arrays && ok; ++a) {
+                                const size_t per = (size_t) kvsh_swap_per_arr[(size_t) a];
+                                if (per == 0) continue;
+                                uint8_t* base = (uint8_t*) kvsh_base[r] + (uint64_t) j * kvsh_lay.stride + kvsh_lay.arr_off[(size_t) a];
+                                const uint8_t* slice = stage.data() + ((size_t) j * (size_t) page_bytes + (size_t) arr_prefix(a)) * k;
+                                for (size_t i = 0; i < k && ok;) {
+                                    size_t e = i;
+                                    while (e + 1 < k && pairs[order[e + 1]].second == pairs[order[e]].second + 1) ++e;
+                                    const size_t n = e + 1 - i;
+                                    ok = cudaMemcpyAsync(base + (uint64_t) pairs[order[i]].second * per, slice + i * per, n * per,
+                                                         cudaMemcpyHostToDevice, nullptr) == cudaSuccess;
+                                    i = e + 1;
+                                }
+                            }
+                        if (ok) ok = cudaDeviceSynchronize() == cudaSuccess;
+                    }
+                    if (!ok) {
+                        std::fprintf(stderr, "kvshare-swap: the batched copy in failed\n");
                         return false;
                     }
-                    const bool ok = kvsh_swap.take(key, stage.data(), at);
-                    if (ok && kvsh_swap.out_count <= 2)
-                        std::fprintf(stderr, "kvshare-swap: out key=%llx at=%zu\n",
-                                     (unsigned long long) key, at);
-                    if (!ok && kvsh_swap.called <= 1)
-                        std::fprintf(stderr, "kvshare-swap: out refused at=%zu layers=%lld stage=%zu budget=%llu bytes=%llu\n",
-                                     at, (long long) layers, stage.size(),
-                                     (unsigned long long) kvsh_swap.budget, (unsigned long long) kvsh_swap.bytes);
-                    return ok;
+                    for (size_t i = 0; i < k; ++i) kvsh_swap.drop(pairs[i].first);   // the pages hold them now
+                    kvsh_swap.in_count += k;
+                    return true;
                 },
-                [&](uint64_t key, int32_t page) -> int64_t {
-                    const uint8_t* buf = kvsh_swap.give(key);
-                    if (buf == nullptr) return -1;
-                    const int64_t layers = kvsh_lay.chunks_per_layer > 0
-                        ? (int64_t) kvsh_range.front()->chunks() / kvsh_lay.chunks_per_layer : 0;
-                    size_t at = 0;
-                    for (size_t r = 0; r < kvsh_range.size(); ++r) {
-                        const int dev = r == 0 ? 0 : stages[r - 1]->dev;
-                        const strata::core::OnDevice on_r(dev);
-                        for (int64_t j = 0; j < layers; ++j)
-                            for (int64_t a = 0; a < kvsh_lay.arrays; ++a) {
-                                uint8_t* to = (uint8_t*) kvsh_base[r] + (uint64_t) j * kvsh_lay.stride +
-                                    kvsh_lay.arr_off[(size_t) a] + (uint64_t) page * (uint64_t) kvsh_swap_per_arr[(size_t) a];
-                                if (cudaMemcpyAsync(to, buf + at, (size_t) kvsh_swap_per_arr[(size_t) a],
-                                                    cudaMemcpyHostToDevice, nullptr) != cudaSuccess)
-                                    return -1;
-                                at += (size_t) kvsh_swap_per_arr[(size_t) a];
-                            }
-                    }
-                    if (cudaDeviceSynchronize() != cudaSuccess) return -1;
-                    kvsh_swap.drop(key);   // the page holds them now
-                    return (int64_t) at;
-                });
+                [&](uint64_t key) { return kvsh_swap.held.find(key) != kvsh_swap.held.end(); });
         }
         }
         // upload si's table (si 0 = the main session and stages, si b+1 = slot b across the stages)
@@ -10063,6 +10135,27 @@ int main(int argc, char** argv) {
             kvsh_apply(si);
             return true;
         };
+        // EXTEND session si's mapping to `cells` (the decode nears the end of what it holds): own pages are
+        // appended, nothing moves.  false: the pool has none to give; the mapping is unchanged.  The initial
+        // admission reserves only a bounded headroom (kvsh_headroom) - a request's cap can be the whole
+        // context, and reserving it up front emptied the pool for every other agent.
+        auto kvsh_extend = [&](size_t si, int64_t cells) -> bool {
+            if (!kvsh || si >= kvshs.sess.size()) return true;
+            KvShareState::Session& s = kvshs.sess[si];
+            const int64_t n_pages = ss.qsa_states[ss.qsa_primary()].n_pages;
+            const int64_t before = s.mapped();
+            if (!strata::core::session_extend(kv_pages, s, cells, (int) kvsh_ps, n_pages)) {
+                std::fprintf(stderr, "strata serve: --kv-share: no pages to extend %s to %lld cells (%lld mapped, "
+                                     "%lld free of %lld)\n", si == 0 ? "the main session" : "a batch slot",
+                             (long long) cells, (long long) (before * kvsh_ps), (long long) kv_pages.free_count(),
+                             (long long) kv_pages.total());
+                return false;
+            }
+            if (s.mapped() != before) kvsh_apply(si);
+            return true;
+        };
+        // the cells a session is admitted with past its prompt: a bounded headroom, grown on demand
+        auto kvsh_headroom = [&](int64_t cap) -> int64_t { return std::min<int64_t>(std::max<int64_t>(cap, 1), 2048) + 16; };
         // The conversation's pages up to `filled` cells are valid: hash them into the cache, from wherever
         // the last call stopped.  Called per read part (a concurrent agent can share a prefix while the
         // holder is still mid-prompt) and once more after the whole read; only pages whose K/V is written
@@ -12125,8 +12218,8 @@ int main(int argc, char** argv) {
                 if (into_slot) {
                     if (!kvsh_admit((size_t) b + 1, nullptr, &ids, 0, upto, upto + growth)) { e = "batch slot copy: the K/V pool is full"; return false; }
                 } else {
-                    // the slot keeps its own mapping: it stays a source (idle) or goes on decoding (a checkpoint
-                    // of an active slot), and its pages return at its next admission or a preemption
+                    // (the slot's pages return once the copy is done: the caller drops the slot, whose whole
+                    // conversation main holds now)
                     if (!kvsh_admit(0, nullptr, &ids, 0, upto, upto)) { e = "batch slot copy: the K/V pool is full"; return false; }
                 }
             }
@@ -12255,8 +12348,9 @@ int main(int argc, char** argv) {
                 // copy_to_slot): each stage moves its own share on its own card.
                 say_shuttle();
                 if (kvsh) {   // the main session takes the conversation's mapping (once, before the stage bodies -
-                              // they may run in parallel).  The slot keeps its own: it stays a source, or goes on
-                              // decoding past the checkpoint; its pages return at its next admission or a preemption
+                              // they may run in parallel).  A checkpoint give-back leaves the slot its mapping (it
+                              // goes on past the checkpoint, or stays a longer source); a whole-conversation
+                              // give-back's slot is dropped by the caller, and its pages return then
                     if (!kvsh_admit(0, nullptr, &bs[(size_t) b].ids, 0, upto, upto)) { e = "batch slot restore: the K/V pool is full"; return false; }
                 }
                 auto stage_copy = [&](size_t k, std::string& se) -> bool {
@@ -12330,6 +12424,13 @@ int main(int argc, char** argv) {
             for (size_t offset = 0; offset < bs.size() && S + (batch_mtp ? 2 : 1) <= strata::kernels::kVerifyMaxT; ++offset) {
                 const int b = (int) ((next_slot + offset) % bs.size());
                 if (bs[(size_t) b].active) {
+                    if (kvsh) {   // --kv-share: pages for this window's rows (see the piped group build)
+                        BSlot& sl = bs[(size_t) b];
+                        const int64_t want = sl.p + 2 + 8;
+                        if (kvshs.sess[(size_t) b + 1].mapped() * kvsh_ps < want &&
+                            !kvsh_extend((size_t) b + 1, want + 4096) && !kvsh_extend((size_t) b + 1, want))
+                            sl.max_new = sl.produced;
+                    }
                     first[A] = S;
                     active[A++] = b;
                     rows[S] = b;
@@ -12879,6 +12980,17 @@ int main(int argc, char** argv) {
                         G.first[t] = G.R;
                         G.rows[G.R] = pick * GS + t;
                         if (sl.active) {
+                            // --kv-share: the window's rows need pages; grow the slot's mapping ahead of them,
+                            // and when the pool has none left the slot's answer ends after this window (length)
+                            int64_t kv_room = INT64_MAX;
+                            if (kvsh) {
+                                const size_t si = (size_t) (pick * GS + t) + 1;
+                                const int64_t want = sl.p + 1 + pipe_drafts_n + 8;
+                                if (kvshs.sess[si].mapped() * kvsh_ps < want &&
+                                    !kvsh_extend(si, want + 4096) && !kvsh_extend(si, want))
+                                    sl.max_new = sl.produced;
+                                kv_room = kvshs.sess[si].mapped() * kvsh_ps - 1 - sl.p;
+                            }
                             G.tok[G.R] = sl.x;
                             G.pos[G.R] = sl.p;
                             ++G.R;
@@ -12889,7 +13001,7 @@ int main(int argc, char** argv) {
                                     return false;
                                 }
                                 const int nprop = std::min<int>(pipe_drafts_n,
-                                                               (int) std::max<int64_t>(0, o.max_context - 1 - sl.p));
+                                                               (int) std::max<int64_t>(0, std::min<int64_t>(o.max_context - 1 - sl.p, kv_room)));
                                 for (int j = 0; j < nprop; ++j) {
                                     G.rows[G.R] = pick * GS + t;
                                     G.tok[G.R] = sl.draft[(size_t) j];
@@ -13912,6 +14024,18 @@ int main(int argc, char** argv) {
                         checks.back().used = ++check_clock;
                     } else {
                         live = bs[(size_t) slot_source].ids;
+                        if (kvsh) {
+                            // --kv-share: main holds the slot's whole conversation now (its pages shared where keyed,
+                            // the rest copied).  The slot's copy would only pin pool pages: its checkpoints move to
+                            // main's chain (their cells are main's now, at the same positions) and the slot is freed
+                            BSlot& ssl = bs[(size_t) slot_source];
+                            if (!ssl.partial)
+                                for (const ConvCheckpoint& c : ssl.checks) checks.push_back(c);
+                            ssl.cached = false;
+                            ssl.ids.clear();
+                            ssl.checks.clear();
+                            kvsh_release((size_t) slot_source + 1);
+                        }
                     }
                     live_imgs.clear();
                     resume = slot_tokens;
@@ -14631,7 +14755,7 @@ int main(int argc, char** argv) {
                     std::vector<int32_t> pre(ids.begin(), ids.begin() + q);
                     // the slot reads the rest of this prompt and then generates: room for both
                     if (can && copy_to_slot(ys, pre, ye, ((int64_t) ids.size() - q) +
-                                                (admit_slot >= 0 ? (int64_t) admit_max_new : max_new) + 16)) {
+                                                kvsh_headroom(admit_slot >= 0 ? (int64_t) admit_max_new : max_new))) {
                         BSlot& sl = bs[(size_t) ys];
                         sl = BSlot{};
                         sl.ids = std::move(pre);
@@ -15173,7 +15297,7 @@ int main(int argc, char** argv) {
             // holds are mapped (no read, no copy); a pool that cannot hold the whole thing even after
             // eviction refuses the request.
             if (kvsh) {
-                if (!kvsh_admit(0, &ids, nullptr, read_from, read_from, n + max_new + 16)) {
+                if (!kvsh_admit(0, &ids, nullptr, read_from, read_from, n + kvsh_headroom(max_new))) {
                     // what pins the pool, session by session (main first, then batch slots): the number a
                     // preemption would free.  Slots' conversations cannot simply be dropped - their K/V must
                     // go to the host cache first (park-from-slot), which is the designed follow-up.
@@ -15199,7 +15323,7 @@ int main(int argc, char** argv) {
                             kvsh_release((size_t) b + 1);
                             std::fprintf(stderr, "strata serve: --kv-share: pool full; freed the %zu pages of idle "
                                                  "slot %d (its conversation had ended)\n", held, b);
-                            admitted = kvsh_admit(0, &ids, nullptr, read_from, read_from, n + max_new + 16);
+                            admitted = kvsh_admit(0, &ids, nullptr, read_from, read_from, n + kvsh_headroom(max_new));
                             continue;
                         }
                         if (!sb.cached || sb.img || sb.partial || sb.ids.size() < 2) continue;
@@ -15272,7 +15396,7 @@ int main(int argc, char** argv) {
                         bs[(size_t) b].ids.clear();
                         bs[(size_t) b].checks.clear();
                         kvsh_release((size_t) b + 1);
-                        admitted = kvsh_admit(0, &ids, nullptr, read_from, read_from, n + max_new + 16);
+                        admitted = kvsh_admit(0, &ids, nullptr, read_from, read_from, n + kvsh_headroom(max_new));
                     }
                     if (!admitted) {
                         std::printf("ERR the K/V pool has no room for this conversation: %lld of %lld pages free, "
@@ -16011,6 +16135,14 @@ int main(int argc, char** argv) {
                     if (A.ready && !A.fl && A.fr < pl_nf && !doomed) {
                         const int st = A.fr;
                         if (st == 0 && A.p + A.T > o.max_context) { ending = true; continue; }
+                        if (st == 0 && kvsh && kvshs.sess[0].mapped() * kvsh_ps < A.p + A.T + 8 &&   // --kv-share: pages
+                            !kvsh_extend(0, A.p + A.T + 8 + 4096) && !kvsh_extend(0, A.p + A.T + 8) &&
+                            kvshs.sess[0].mapped() * kvsh_ps < A.p + A.T) {
+                            std::fprintf(stderr, "strata serve: --kv-share: the pool has no page for the next window; "
+                                                 "the answer ends here\n");
+                            ending = true;
+                            continue;
+                        }
                         if (ajob && st == 0) a_gap(0);   // --adapt-async: stage 0 is idle until this launch
                         if (!snap_take(st, A.seq)) return die("the GDN snapshot failed");
                         if (!VF(st, A).pl_launch(A.T, A.tok, A.p, err)) return die(err);
@@ -16279,6 +16411,14 @@ int main(int argc, char** argv) {
                 const int32_t wt_flags = (first_window ? 1 : 0) | (merged ? 2 : 0) | (from_sfx ? 4 : 0) | (chain_n > 0 ? 8 : 0);
                 Clock::time_point wt_ra0, wt_ra1, wt_at1, wt_t3;
                 if (p + T > o.max_context) break;
+                if (kvsh && kvshs.sess[0].mapped() * kvsh_ps < p + T + 8 &&   // --kv-share: pages for the window's rows
+                    !kvsh_extend(0, p + T + 8 + 4096) && !kvsh_extend(0, p + T + 8)) {
+                    if (kvshs.sess[0].mapped() * kvsh_ps < p + T) {
+                        std::fprintf(stderr, "strata serve: --kv-share: the pool has no page for the next window; "
+                                             "the answer ends here\n");
+                        break;
+                    }
+                }
                 window[0] = x;
                 for (int i = 1; i < T_mtp; ++i)
                     window[(size_t) i] = merged     ? (int32_t) ids[(size_t) (p + i)]
@@ -16797,7 +16937,7 @@ int main(int argc, char** argv) {
                 // the slot's pages must cover ITS generation: admit_max_new (the BGEN cap), not this request's
                 // max_new, which is 1 for a handed-over request - with 9 cells of headroom a slot's long answer
                 // wrote its K/V past the table (dropped, page -1) and decoded blind to its own last tokens
-                if (cont && !copy_to_slot(admit_slot, live, err, admit_max_new + 16)) {
+                if (cont && !copy_to_slot(admit_slot, live, err, kvsh_headroom(admit_max_new))) {
                     std::fprintf(stderr, "strata serve: batch admission failed: %s\n", err.c_str());
                     bs[(size_t) admit_slot].cached = false;   // its sessions may be half written
                     cont = false;

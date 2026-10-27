@@ -101,6 +101,12 @@ public:
     /// -1 leaves today's behavior (the bytes die, a later request re-reads them).
     using SwapOut = std::function<bool(int32_t, uint64_t)>;
     using SwapIn = std::function<int64_t(uint64_t, int32_t)>;
+    /// The BATCHED swap (preferred: the engine copies runs of consecutive pages in one transfer each).
+    /// out: (page, key) pairs, stores what it can; in: (key, page) pairs, all or nothing; has: the swap holds
+    /// the key (a walk gathers a run of held keys and restores them together).
+    using SwapOutMany = std::function<void(const std::vector<std::pair<int32_t, uint64_t>>&)>;
+    using SwapInMany = std::function<bool(const std::vector<std::pair<uint64_t, int32_t>>&)>;
+    using SwapHas = std::function<bool(uint64_t)>;
     PageCache() = default;
     explicit PageCache(int64_t pages) { init(pages); }
 
@@ -108,6 +114,10 @@ public:
 
     /// `pages_per_extent` 0 or > pages: one extent (a plain always-mapped pool).
     void set_swap(SwapOut out, SwapIn in) { swap_out_ = std::move(out); swap_in_ = std::move(in); }
+    void set_swap_many(SwapOutMany out, SwapInMany in, SwapHas has) {
+        swap_out_many_ = std::move(out); swap_in_many_ = std::move(in); swap_has_ = std::move(has);
+    }
+    bool swap_has(uint64_t key) const { return swap_has_ ? swap_has_(key) : false; }
 
     void init(int64_t pages, int64_t pages_per_extent, MapExtent map_extent, UnmapExtent unmap_extent) {
         alloc_.init_empty(pages);
@@ -181,6 +191,28 @@ public:
         return page;
     }
 
+    /// A walk missed a RUN of keys the swap holds: take that many pages (evicting under pressure), copy the
+    /// run in with one batched transfer, key them.  `toks`: page_cells ids per key.  Returns the pages (in
+    /// key order), empty when the pool has no room or the copy failed (nothing is kept then).
+    std::vector<int32_t> restore_many(const std::vector<uint64_t>& keys, const int32_t* toks) {
+        std::vector<int32_t> got;
+        if (keys.empty() || (!swap_in_many_ && !swap_in_)) return got;
+        if (!take((int64_t) keys.size(), got) || got.size() != keys.size()) { alloc_.release(got); return {}; }
+        bool ok = true;
+        if (swap_in_many_) {
+            std::vector<std::pair<uint64_t, int32_t>> pairs;
+            pairs.reserve(keys.size());
+            for (size_t i = 0; i < keys.size(); ++i) pairs.emplace_back(keys[i], got[i]);
+            ok = swap_in_many_(pairs);
+        } else {
+            for (size_t i = 0; i < keys.size() && ok; ++i) ok = swap_in_(keys[i], got[i]) > 0;
+        }
+        if (!ok) { alloc_.release(got); return {}; }
+        swap_in_count_ += (int64_t) keys.size();
+        for (size_t i = 0; i < keys.size(); ++i) register_page(got[i], keys[i], toks + i * page_cells);
+        return got;
+    }
+
     void unpin(int32_t id) {
         if (id < 0 || (size_t) id >= page_key_.size() || page_refs_[(size_t) id] <= 0) return;
         if (--page_refs_[(size_t) id] == 0 && page_key_[(size_t) id] != 0)
@@ -219,7 +251,7 @@ public:
         while (alloc_.free_count() < n) {
             int64_t before = alloc_.free_count();
             if (map_one_more() && alloc_.free_count() > before) continue;
-            if (evict_one()) continue;
+            if (evict_batch(n - alloc_.free_count()) > 0) continue;
             break;
         }
         return alloc_.take(n, out);
@@ -251,27 +283,40 @@ public:
         alloc_.release({id});
     }
 
-    /// Evict the least recently used cached page nobody maps.  false: nothing evictable.  The heap is
-    /// lazy: stale entries (touched, re-keyed, freed since) are skipped until a live one surfaces.
-    bool evict_one() {
+    /// Evict the least recently used cached page nobody maps.  false: nothing evictable.
+    bool evict_one() { return evict_batch(1) == 1; }
+
+    /// Evict up to `n` of the least recently used cached pages nobody maps, their bytes swapped out in ONE
+    /// batched transfer (or one at a time without the batched swap).  Returns how many.  The heap is lazy:
+    /// stale entries (touched, re-keyed, freed since) are skipped until live ones surface.
+    int64_t evict_batch(int64_t n) {
         if (std::getenv("STRATA_KV_SWAP_TRACE") != nullptr)
-            std::fprintf(stderr, "evict: heap=%zu swapset=%d\n", heap_.size(), swap_out_ ? 1 : 0);
-        while (!heap_.empty()) {
+            std::fprintf(stderr, "evict: n=%lld heap=%zu swapset=%d\n", (long long) n, heap_.size(),
+                         swap_out_many_ || swap_out_ ? 1 : 0);
+        std::vector<std::pair<int32_t, uint64_t>> victims;
+        while (!heap_.empty() && (int64_t) victims.size() < n) {
             const auto [stamp, id] = heap_.top();
             heap_.pop();
             if (id < 0 || (size_t) id >= page_key_.size()) continue;
             if (page_key_[(size_t) id] == 0 || page_refs_[(size_t) id] > 0) continue;   // freed or pinned: stale
             if (page_stamp_[(size_t) id] != stamp) continue;   // touched later: a fresher entry is in the heap
-            // A refused swap (budget full, copy failed) lets the bytes die - the page still frees, as before.
-            if (swap_out_ && swap_out_(id, page_key_[(size_t) id])) ++swap_out_count_;
-            key_to_page_.erase(page_key_[(size_t) id]);
+            victims.emplace_back(id, page_key_[(size_t) id]);
+            page_stamp_[(size_t) id] = -1;   // out of the heap's reach while the batch forms
+        }
+        if (victims.empty()) return 0;
+        // A refused swap (budget full, copy failed) lets the bytes die - the pages still free, as before.
+        if (swap_out_many_) swap_out_many_(victims);
+        else if (swap_out_)
+            for (const auto& [id, key] : victims) if (swap_out_(id, key)) ++swap_out_count_;
+        for (const auto& [id, key] : victims) {
+            key_to_page_.erase(key);
             page_key_[(size_t) id] = 0;
             alloc_.release({id});
             extent_release(id);
-            return true;
         }
-        return false;
+        return (int64_t) victims.size();
     }
+    void count_swapped_out(int64_t n) { swap_out_count_ += n; }
 
     int64_t free_count() const { return alloc_.free_count(); }
     int64_t total() const { return total_pages_; }
@@ -333,6 +378,9 @@ public:
     UnmapExtent unmap_extent_;
     SwapOut swap_out_;
     SwapIn swap_in_;
+    SwapOutMany swap_out_many_;
+    SwapInMany swap_in_many_;
+    SwapHas swap_has_;
     int64_t swap_out_count_ = 0, swap_in_count_ = 0;
 
     void rebuild_heap_() {
@@ -411,17 +459,46 @@ inline bool session_admit(PageCache& cache, SessionPages& s, const int64_t* ids6
     if (nown.empty() && walk_end > keep_full) {
         uint64_t key = 0;
         std::array<int32_t, PageCache::page_cells> toks{};
+        // keys the swap holds are gathered into a run and restored together (one transfer per run of pages)
+        std::vector<uint64_t> run_keys;
+        std::vector<int32_t> run_toks;
+        auto flush_run = [&]() -> bool {
+            if (run_keys.empty()) return true;
+            const std::vector<int32_t> got = cache.restore_many(run_keys, run_toks.data());
+            run_keys.clear();
+            run_toks.clear();
+            if (got.empty()) return false;
+            for (int32_t id : got) { cache.pin(id); ncached.push_back(id); walked.push_back(id); }
+            return true;
+        };
         for (int64_t p = 0; p < walk_end; ++p) {
             toks_of(p, toks.data());
             key = PageCache::page_key(key, toks.data(), (int) ps);
             if (p < keep_full) continue;
-            int32_t page = cache.lookup(key, toks.data());
-            if (page < 0) page = cache.restore(key, toks.data());
-            if (page < 0) break;
-            cache.pin(page);
-            ncached.push_back(page);
-            walked.push_back(page);
+            const int32_t page = cache.lookup(key, toks.data());
+            if (page >= 0) {
+                if (!flush_run()) break;   // a gap before it: the walk ends at the gap
+                cache.pin(page);
+                ncached.push_back(page);
+                walked.push_back(page);
+                continue;
+            }
+            if (cache.swap_has(key)) {
+                run_keys.push_back(key);
+                run_toks.insert(run_toks.end(), toks.begin(), toks.end());
+                continue;
+            }
+            if (run_keys.empty()) {   // the single-page swap path (no batched swap installed)
+                const int32_t sp = cache.restore(key, toks.data());
+                if (sp < 0) break;
+                cache.pin(sp);
+                ncached.push_back(sp);
+                walked.push_back(sp);
+                continue;
+            }
+            break;
         }
+        (void) flush_run();
     }
     // the partial page: own and unkeyed stays; shared or keyed is copied to a private page below
     int32_t cow_from = -1;
@@ -474,6 +551,20 @@ inline bool session_admit(PageCache& cache, SessionPages& s, const int64_t* ids6
     s.cached = std::move(ncached);
     s.own = std::move(nown);
     s.last_reg = std::min(s.last_reg, keep_full);
+    s.build(n_pages);
+    return true;
+}
+
+/// EXTEND a session's mapping to `cells` (the decode nears the end of what it holds): own pages are appended,
+/// nothing else moves.  false: the pool has none to give even after eviction; the mapping is unchanged.
+inline bool session_extend(PageCache& cache, SessionPages& s, int64_t cells, int page_size, int64_t n_pages) {
+    const int64_t ps = page_size > 0 ? page_size : 1;
+    const int64_t total = std::min<int64_t>((cells + ps - 1) / ps, n_pages);
+    const int64_t missing = total - s.mapped();
+    if (missing <= 0) return true;
+    std::vector<int32_t> fresh;
+    if (!cache.take(missing, fresh)) return false;
+    for (int32_t id : fresh) { cache.pin(id); s.own.push_back(id); }
     s.build(n_pages);
     return true;
 }
