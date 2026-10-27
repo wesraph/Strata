@@ -122,6 +122,39 @@ int main() {
         cache.unpin(got[0]);
         std::vector<int32_t> last;
         check(cache.take(1, last) && last[0] == got[0], "unpinned, the page is evictable again");
+        // host swap (vLLM's swap): eviction saves a page's bytes, restore brings them back
+        {
+            PageCache sw(2);
+            std::vector<uint64_t> saved;
+            sw.set_swap(
+                [&](int32_t, uint64_t k) { saved.push_back(k); return true; },
+                [&](uint64_t k, int32_t) {
+                    return (int64_t) (std::find(saved.begin(), saved.end(), k) != saved.end() ? 39 * 1024 : 0);
+                });
+            std::vector<int32_t> a;
+            check(sw.take(1, a), "swap: take page A");
+            const uint64_t ka = PageCache::page_key(0, &tok[0], 4);
+            check(sw.register_page(a[0], ka, &tok[0]), "swap: register A");
+            std::vector<int32_t> b2;
+            check(sw.take(1, b2), "swap: fill the pool with B");
+            const uint64_t kb = PageCache::page_key(ka, &tok[4], 4);
+            check(sw.register_page(b2[0], kb, &tok[4]), "swap: register B (A registered first: A is the LRU victim)");
+            std::vector<int32_t> fresh;   // a third page: pressure evicts A.  No lookups before this -
+            check(sw.take(1, fresh), "swap: pressure evicts");   // lookup bumps stamps without a heap entry
+            check(sw.lookup(ka, &tok[0]) == -1, "swap: the pool no longer holds A");
+            const int32_t ra = sw.restore(ka, &tok[0]);
+            check(ra >= 0, "swap: restore returns a page");
+            check(sw.lookup(ka, &tok[0]) == ra, "swap: the restored page is keyed and hits");
+            sw.pin(ra);
+            sw.unpin(ra);   // the engine pins every lookup hit: unpin re-enters the eviction order
+            check(sw.lookup(kb, &tok[4]) == -1, "swap: the restore evicted B under pressure");
+            check(std::find(saved.begin(), saved.end(), ka) != saved.end(), "swap: eviction saved A's bytes");
+            // a key the swap never saw: restore must refuse and not leak the page
+            const uint64_t stranger = PageCache::page_key(0, &tok[16], 4);
+            check(sw.restore(stranger, &tok[16]) == -1, "swap: an unknown key is refused");
+            std::vector<int32_t> after;
+            check(sw.take(1, after), "swap: the refused restore released its page back");
+        }
         // many touches force the heap's rebuild: eviction must keep working after it
         {
             PageCache big(64);

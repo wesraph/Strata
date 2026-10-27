@@ -91,12 +91,19 @@ public:
     /// the allocation (out of VRAM); the callbacks run on a synchronized device.
     using MapExtent = std::function<bool(int64_t)>;
     using UnmapExtent = std::function<void(int64_t)>;
+    /// HOST SWAP (vLLM's swap): eviction hands the page's device bytes to `swap_out` keyed by its chain
+    /// hash; a walk that misses a key asks `swap_in` to restore it into a fresh page.  Returning false /
+    /// -1 leaves today's behavior (the bytes die, a later request re-reads them).
+    using SwapOut = std::function<bool(int32_t, uint64_t)>;
+    using SwapIn = std::function<int64_t(uint64_t, int32_t)>;
     PageCache() = default;
     explicit PageCache(int64_t pages) { init(pages); }
 
     void init(int64_t pages) { init(pages, 0, nullptr, nullptr); }
 
     /// `pages_per_extent` 0 or > pages: one extent (a plain always-mapped pool).
+    void set_swap(SwapOut out, SwapIn in) { swap_out_ = std::move(out); swap_in_ = std::move(in); }
+
     void init(int64_t pages, int64_t pages_per_extent, MapExtent map_extent, UnmapExtent unmap_extent) {
         alloc_.init_empty(pages);
         total_pages_ = pages;
@@ -141,6 +148,23 @@ public:
 
     void pin(int32_t id) {
         if (id >= 0 && (size_t) id < page_key_.size()) page_refs_[(size_t) id] += 1;
+    }
+
+    /// A walk missed `key`: if the swap holds its bytes, take a fresh page (evicting under pressure -
+    /// eviction may swap OTHER pages out), copy the bytes in, key it, and hand the page back.  -1: the
+    /// key is nowhere; the walk stops as before.  `tokens` are the page's own ids, for verification.
+    int32_t restore(uint64_t key, const int32_t* tokens) {
+        if (!swap_in_) return -1;
+        std::vector<int32_t> got;
+        if (!take(1, got) || got.empty()) return -1;
+        const int32_t page = got[0];
+        if (swap_in_(key, page) <= 0) {
+            alloc_.release({page});
+            return -1;
+        }
+        ++swap_in_count_;
+        register_page(page, key, tokens);
+        return page;
     }
 
     void unpin(int32_t id) {
@@ -214,12 +238,16 @@ public:
     /// Evict the least recently used cached page nobody maps.  false: nothing evictable.  The heap is
     /// lazy: stale entries (touched, re-keyed, freed since) are skipped until a live one surfaces.
     bool evict_one() {
+        if (std::getenv("STRATA_KV_SWAP_TRACE") != nullptr)
+            std::fprintf(stderr, "evict: heap=%zu swapset=%d\n", heap_.size(), swap_out_ ? 1 : 0);
         while (!heap_.empty()) {
             const auto [stamp, id] = heap_.top();
             heap_.pop();
             if (id < 0 || (size_t) id >= page_key_.size()) continue;
             if (page_key_[(size_t) id] == 0 || page_refs_[(size_t) id] > 0) continue;   // freed or pinned: stale
             if (page_stamp_[(size_t) id] != stamp) continue;   // touched later: a fresher entry is in the heap
+            // A refused swap (budget full, copy failed) lets the bytes die - the page still frees, as before.
+            if (swap_out_ && swap_out_(id, page_key_[(size_t) id])) ++swap_out_count_;
             key_to_page_.erase(page_key_[(size_t) id]);
             page_key_[(size_t) id] = 0;
             alloc_.release({id});
@@ -232,6 +260,8 @@ public:
     int64_t free_count() const { return alloc_.free_count(); }
     int64_t total() const { return total_pages_; }
     int64_t cached_count() const { return (int64_t) key_to_page_.size(); }
+    int64_t swap_out_count() const { return swap_out_count_; }
+    int64_t swap_in_count() const { return swap_in_count_; }
     int64_t mapped_extents() const {
         int64_t m = 0;
         for (bool b : extent_mapped_)
@@ -285,6 +315,9 @@ public:
     std::vector<char> extent_mapped_;
     MapExtent map_extent_;
     UnmapExtent unmap_extent_;
+    SwapOut swap_out_;
+    SwapIn swap_in_;
+    int64_t swap_out_count_ = 0, swap_in_count_ = 0;
 
     void rebuild_heap_() {
         heap_ = {};
