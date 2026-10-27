@@ -4082,6 +4082,9 @@ int main(int argc, char** argv) {
     int64_t kvsh_mapped_floor = 0;        ///< extents committed before the expert cache sized itself
     std::vector<void*> kvsh_base;          ///< one arena per device ([0]: CUDA0, [k]: stage k-1's)
     std::vector<int64_t> kvsh_q_n;         ///< per arena: the QSA layers it holds (the page copy walks them)
+    bool kvsh_xc_wanted = false;           ///< the VRAM exchange with the expert caches (the caches open in VMM)
+    int64_t kvsh_floor_extents = 0;        ///< the pool's share in extents (claimed at startup, or lent by the caches)
+    std::chrono::steady_clock::time_point kvsh_idle_t0 = std::chrono::steady_clock::now();   ///< the last request or slot completion
     int64_t kvsh_sessions = 1;             ///< the main session plus every batch slot
     void* sbuf = nullptr;   // allocated after the layer-split search, sized to CUDA0's own layer range (the carve)
     // **THE ENGINE RAN ON THE LEGACY DEFAULT STREAM, WHICH ON WDDM IS THE SLOW PATH.**  All four session
@@ -5393,6 +5396,13 @@ int main(int argc, char** argv) {
             // 52->17 as conversations end).  STRATA_KV_ELASTIC=0 opts out to the always-mapped pool.
             const char* kv_el = std::getenv("STRATA_KV_ELASTIC");
             const bool kvsh_vmm = strata::core::vmm_available() && (kv_el == nullptr || kv_el[0] != '0');
+            // THE VRAM EXCHANGE (STRATA_KV_EXCHANGE, on by default): the expert caches open in VMM ranges too,
+            // so the pool's extents and the caches' slots can trade physical chunks (see the serve loop's
+            // xc_take / xc_give).  --vram-elastic's segmented cache is another mechanism: not with it.
+            const char* kv_xc = std::getenv("STRATA_KV_EXCHANGE");
+            kvsh_xc_wanted = kvsh_vmm && !o.vram_elastic && !o.expert_profile.empty() && o.expert_cache != 0 &&
+                             (kv_xc == nullptr || kv_xc[0] != '0');
+            if (kvsh_xc_wanted) strata::core::ExpertCache::set_vmm(true);
             const uint64_t G = kvsh_vmm ? strata::core::vmm_granularity() : 0;
             kvsh_align = kvsh_vmm ? G : 256;
             const strata::core::SharePoolLayout lay =
@@ -5542,14 +5552,23 @@ int main(int argc, char** argv) {
                                  (long long) floor_extents, (long long) whole,
                                  (double) (floor_extents * extent_bytes) / 1073741824.0);
                 int64_t mapped = 0;
-                for (; mapped < floor_extents; ++mapped)
-                    if (!kvsh_map_extent_impl(mapped)) break;
-                if (mapped < floor_extents)
+                kvsh_floor_extents = floor_extents;
+                // with the exchange the floor is NOT claimed here: the expert caches open into all the free VRAM
+                // and lend the floor's chunks to the pool right after (kvsh_floor_from_caches), so their loan
+                // region holds the pool's share from the start and an idle trim can hand it back to them
+                if (kvsh_xc_wanted)
+                    std::fprintf(stderr, "strata generate: --kv-share: the floor (%lld extents) is lent by the expert "
+                                         "caches once they are open (the VRAM exchange)\n", (long long) floor_extents);
+                else
+                    for (; mapped < floor_extents; ++mapped)
+                        if (!kvsh_map_extent_impl(mapped)) break;
+                if (mapped < floor_extents && !kvsh_xc_wanted)
                     std::fprintf(stderr, "strata generate: --kv-share: only %lld of %lld floor extents mapped "
                                          "(VRAM); the pool may refuse long conversations\n",
                                  (long long) mapped, (long long) floor_extents);
                 kvsh_mapped_floor = mapped;
-                if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr && !kvsh_range.empty()) {
+                if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr && !kvsh_range.empty() && mapped > 0) {
+                    // (only over a mapped floor: a write into unmapped addresses poisons the context)
                     // probe EVERY range (its own device context), EVERY layer's EVERY array at FULL depth:
                     // holes past a shallow probe are exactly what the split fault looks like
                     for (size_t r = 0; r < kvsh_range.size(); ++r) {
@@ -9927,6 +9946,9 @@ int main(int argc, char** argv) {
                         return (*this0)(e);
                     },
                     [this1 = &kvsh_unmap_extent](int64_t e) { (*this1)(e); });
+                // the floor's extents hold physical memory already: the cache counts them as mapped (free pages),
+                // so the idle trim can hand the unused ones to the expert caches
+                for (int64_t e = 0; e < kvsh_mapped_floor; ++e) kv_pages.mark_mapped(e);
             } else {
                 kv_pages.init(kvsh_pool_pages);
             }
@@ -11631,6 +11653,260 @@ int main(int argc, char** argv) {
                 cudaDeviceSynchronize();
             }
         };
+        // ---- --kv-share: THE VRAM EXCHANGE with the expert caches (one chunk loan per GPU, --kv-grow's model) ----
+        // The pool's extents take their physical chunks from the driver while it has VRAM, then from the slots just
+        // below the device's expert-cache loan (those experts become CPU misses, as under --kv-grow); an extent that
+        // empties hands its chunks back to those slots, which refill with the profile's hottest experts.  The idle
+        // trim (kvsh_trim_idle) is what empties extents: after STRATA_KV_TRIM_IDLE_S seconds with nothing decoding,
+        // the cached pages past a reserve (STRATA_KV_TRIM_KEEP_TOKENS, one context by default) go to the host swap
+        // and the extents they held go to the caches - one agent at a time runs with a bigger expert cache, several
+        // at once take the VRAM back.  STRATA_KV_EXCHANGE=0 keeps the fixed split.
+        struct XcLoan {
+            strata::core::ExpertCache* cache = nullptr;
+            int32_t* d_res = nullptr;
+            const std::vector<std::pair<int32_t, int32_t>>* profile = nullptr;
+            int64_t lb = 0, le = 0;         ///< the layers this cache owns (host_res slot numbers are per cache)
+            int dev = 0;
+            int64_t top = 0, lo = 0;        ///< slots [lo, top) hold no expert: their chunks may be with the pool
+            int64_t floor = 128;            ///< the cache keeps at least these slots
+            std::vector<strata::core::VmmChunk> spare;   ///< out of the cache, not (yet) in the pool
+            int64_t taken = 0, given = 0, evicted = 0, refilled = 0;
+        };
+        std::vector<XcLoan> xcl;
+        bool kvsh_xc = kvsh && kvsh_xc_wanted && !kvsh_range.empty() && !host_res.empty() && srcp != nullptr;
+        if (kvsh_xc) {
+            for (size_t k = 0; k < kvsh_range.size() && kvsh_xc; ++k) {
+                XcLoan L;
+                if (k == 0) {
+                    L.cache = &xcache; L.d_res = d_res; L.profile = &profile; L.lb = 0;
+                    L.le = multi_gpu ? split_at[0] : g.n_layers; L.dev = 0;
+                } else {
+                    GpuStage& st = *stages[k - 1];
+                    L.cache = &st.cache; L.d_res = st.d_res; L.profile = &st.profile; L.lb = st.lb; L.le = st.le; L.dev = st.dev;
+                }
+                if (L.cache->vmm_range() == nullptr || L.d_res == nullptr || !L.cache->valid()) { kvsh_xc = false; break; }
+                int64_t top = L.cache->slots();   // the prompt path's lent slots (the last ones) stay the cache's
+                for (const PfPart& pp : pf_parts)
+                    if (pp.cache == L.cache && pp.first >= 0) top = std::min<int64_t>(top, pp.first);
+                if (const char* v = std::getenv("STRATA_KV_XC_FLOOR"); v != nullptr && std::atoll(v) > 0) L.floor = std::atoll(v);
+                if (top <= L.floor) { kvsh_xc = false; break; }
+                L.top = L.lo = top;
+                xcl.push_back(L);
+            }
+        }
+        const int64_t kvsh_trim_idle_s = [] {
+            const char* v = std::getenv("STRATA_KV_TRIM_IDLE_S");
+            return v != nullptr ? std::atoll(v) : 30;
+        }();
+        const int64_t kvsh_trim_keep_pages = [&] {
+            const char* v = std::getenv("STRATA_KV_TRIM_KEEP_TOKENS");
+            const int64_t t = v != nullptr && std::atoll(v) > 0 ? std::atoll(v) : o.max_context;
+            return (t + kvsh_ps - 1) / kvsh_ps;
+        }();
+        if (kvsh && kvsh_xc_wanted)
+            std::fprintf(stderr, "strata serve: --kv-share: the VRAM exchange with the expert caches is %s%s\n",
+                         kvsh_xc ? "on" : "off", kvsh_xc ? "" : " (a cache without a VMM range, residency table or profile)");
+        if (kvsh_xc)
+            std::fprintf(stderr, "strata serve: --kv-share: idle trim after %llds keeps %lld pages (%lld tokens); the "
+                                 "caches lend from below slot%s\n", (long long) kvsh_trim_idle_s,
+                         (long long) kvsh_trim_keep_pages, (long long) (kvsh_trim_keep_pages * kvsh_ps),
+                         [&] { std::string t; for (const XcLoan& L : xcl) t += " " + std::to_string((long long) L.top); return t; }().c_str());
+        // (the floor is taken below, once xc_take exists)
+        // up to n chunks out of cache k's loan region (the devices quiet first; the residency table says so before
+        // a chunk goes).  Appends to `out`; fewer when the cache is at its floor.
+        auto xc_take = [&](size_t k, int64_t n, std::vector<strata::core::VmmChunk>& out) {
+            XcLoan& L = xcl[k];
+            strata::core::VmmRange& r = *L.cache->vmm_range();
+            const uint64_t G = strata::core::vmm_granularity();
+            auto freeable = [&]() -> int64_t {   // mapped chunks wholly inside slots [lo, top)
+                const int64_t c0 = (int64_t) ((L.cache->slot_offset(L.lo) + G - 1) / G);
+                const int64_t c1 = (int64_t) (L.cache->slot_offset(L.top) / G);
+                int64_t m = 0;
+                for (int64_t c = c0; c < c1; ++c) m += r.mapped(c) ? 1 : 0;
+                return m;
+            };
+            bool quiet = false, dirty = false;
+            const int64_t lo0 = L.lo;
+            while ((int64_t) L.spare.size() + freeable() < n && L.lo > L.floor) {
+                if (!quiet) {
+                    adapt_quiesce();
+                    for (size_t kk = 0; kk < xcl.size(); ++kk) { const strata::core::OnDevice on_q(xcl[kk].dev); cudaDeviceSynchronize(); }
+                    quiet = true;
+                }
+                --L.lo;
+                for (int64_t l = L.lb; l < L.le; ++l)   // the slot's expert leaves: a CPU miss from now on
+                    for (int64_t e = 0; e < g.n_expert; ++e) {
+                        const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
+                        if (host_res[i] == (int32_t) L.lo) { host_res[i] = strata::core::kNotResident; ++L.evicted; dirty = true; }
+                    }
+            }
+            const strata::core::OnDevice on_k(L.dev);
+            if (dirty && res_put(L.d_res) != cudaSuccess)
+                std::fprintf(stderr, "strata serve: --kv-share: the residency table upload failed after lending slots\n");
+            if (dirty) cudaDeviceSynchronize();
+            {
+                const int64_t c0 = (int64_t) ((L.cache->slot_offset(L.lo) + G - 1) / G);
+                const int64_t c1 = (int64_t) (L.cache->slot_offset(L.top) / G);
+                for (int64_t c = c0; c < c1; ++c)
+                    if (r.mapped(c))
+                        if (const strata::core::VmmChunk h = r.unmap(c)) L.spare.push_back(h);
+            }
+            while ((int64_t) out.size() < n && !L.spare.empty()) { out.push_back(L.spare.back()); L.spare.pop_back(); ++L.taken; }
+            if (L.lo != lo0)
+                std::fprintf(stderr, "strata serve: --kv-share: CUDA%d's expert cache lent slots [%lld, %lld) to the K/V "
+                                     "pool (%lld experts now CPU misses)\n", L.dev, (long long) L.lo, (long long) lo0,
+                             (long long) L.evicted);
+        };
+        // chunks back into cache k's loan region (lowest unmapped first); slots whose chunks are all mapped again
+        // refill from the profile.  Chunks nothing in the region can hold go back to the driver.
+        auto xc_give = [&](size_t k, std::vector<strata::core::VmmChunk>& chunks) {
+            XcLoan& L = xcl[k];
+            const strata::core::OnDevice on_k(L.dev);
+            L.spare.insert(L.spare.end(), chunks.begin(), chunks.end());
+            chunks.clear();
+            strata::core::VmmRange& r = *L.cache->vmm_range();
+            const uint64_t G = strata::core::vmm_granularity();
+            if (L.lo < L.top && !L.spare.empty()) {
+                const int64_t c0 = (int64_t) (L.cache->slot_offset(L.lo) / G);
+                const int64_t c1 = (int64_t) (L.cache->slot_offset(L.top) / G);
+                int64_t cend = c0, need = (int64_t) L.spare.size();
+                while (cend < c1 && need > 0) need -= r.mapped(cend++) ? 0 : 1;
+                if (!r.map_range(c0, cend, [&]() -> strata::core::VmmChunk {
+                        if (L.spare.empty()) return 0;
+                        const strata::core::VmmChunk h = L.spare.back();
+                        L.spare.pop_back();
+                        return h;
+                    }))
+                    std::fprintf(stderr, "strata serve: --kv-share: CUDA%d's expert cache could not take its VRAM back\n", L.dev);
+                const int64_t lo0 = L.lo;
+                while (L.lo < L.top) {
+                    const int64_t a = (int64_t) (L.cache->slot_offset(L.lo) / G);
+                    const int64_t b = (int64_t) ((L.cache->slot_offset(L.lo + 1) + G - 1) / G);
+                    bool all = true;
+                    for (int64_t c = a; c < b && all; ++c) all = r.mapped(c);
+                    if (!all) break;
+                    ++L.lo;
+                }
+                const auto& lay = strata::kernels::cpu::expert_layout();
+                std::vector<std::pair<size_t, int32_t>> filled;
+                size_t pi = 0;
+                for (int64_t sl = lo0; sl < L.lo; ++sl) {
+                    const uint64_t room = L.cache->slot_offset(sl + 1) - L.cache->slot_offset(sl);
+                    for (; pi < L.profile->size(); ++pi) {
+                        const int32_t l = (*L.profile)[pi].first, e = (*L.profile)[pi].second;
+                        if (l < L.lb || l >= L.le) continue;
+                        const size_t i = (size_t) l * (size_t) g.n_expert + (size_t) e;
+                        if (host_res[i] >= 0 || lay.blob_bytes(l) > room) continue;
+                        const uint8_t* b = srcp->blob_stable(l, e);
+                        if (b == nullptr) continue;
+                        if (cudaMemcpyAsync(L.cache->device_slot((int32_t) sl), b, (size_t) lay.blob_bytes(l),
+                                            cudaMemcpyHostToDevice, nullptr) != cudaSuccess) break;
+                        filled.emplace_back(i, (int32_t) sl);
+                        ++pi;
+                        break;
+                    }
+                }
+                if (cudaDeviceSynchronize() == cudaSuccess) {
+                    for (const auto& [i, sl] : filled) host_res[i] = sl;
+                    L.refilled += (int64_t) filled.size();
+                    if (!filled.empty() && res_put(L.d_res) != cudaSuccess)
+                        std::fprintf(stderr, "strata serve: --kv-share: the residency table upload failed after a refill\n");
+                } else {
+                    std::fprintf(stderr, "strata serve: --kv-share: refilling CUDA%d's expert cache failed: %s\n", L.dev,
+                                 cudaGetErrorString(cudaGetLastError()));
+                }
+                L.given += L.lo - lo0;
+                if (L.lo != lo0)
+                    std::fprintf(stderr, "strata serve: --kv-share: CUDA%d's expert cache took slots [%lld, %lld) back, "
+                                         "%zu refilled from the profile\n", L.dev, (long long) lo0, (long long) L.lo, filled.size());
+            }
+            for (const strata::core::VmmChunk h : L.spare) strata::core::vmm_chunk_free(h);   // nothing to hold them
+            L.spare.clear();
+        };
+        if (kvsh_xc) {
+            // the pool's extent callbacks, with the caches as the second source and the destination of chunks
+            kvsh_map_extent = [&](int64_t e) -> bool {
+                const int64_t cpl = kvsh_lay.chunks_per_layer;
+                const uint64_t Gr = kvsh_G;
+                if (cpl <= 0) return false;
+                for (size_t k = 0; k < kvsh_range.size(); ++k) {
+                    const strata::core::OnDevice on_k(xcl[k].dev);
+                    const int64_t q_n = (int64_t) kvsh_range[k]->chunks() / cpl;
+                    std::vector<int64_t> chunks;   // every chunk this extent spans in this range, once
+                    for (int64_t j = 0; j < q_n; ++j)
+                        for (int64_t a = 0; a < kvsh_lay.arrays; ++a) {
+                            const auto span = kvsh_lay.extent_span(Gr, (size_t) a, e, kvsh_pages_per_extent, cpl);
+                            if (span.first < 0 || span.second < span.first) continue;
+                            for (int64_t c = j * cpl + span.first; c <= j * cpl + span.second; ++c) chunks.push_back(c);
+                        }
+                    std::sort(chunks.begin(), chunks.end());
+                    chunks.erase(std::unique(chunks.begin(), chunks.end()), chunks.end());
+                    std::vector<strata::core::VmmChunk> lent;
+                    // the driver's free VRAM only above the engine's reserve (--vram-reserve-mib, at least 512 MiB:
+                    // the prompt path's buffers and cuBLAS's workspaces live there; the floor once took it all and
+                    // the first prefill died inside cuBLAS); below it the cache lends
+                    const uint64_t reserve_b = (uint64_t) std::max<int64_t>(o.vram_reserve_mib, 512) << 20;
+                    auto driver_has_room = [&]() -> bool {
+                        size_t free_b = 0, total_b = 0;
+                        if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) return false;
+                        return free_b > reserve_b + Gr;
+                    };
+                    bool driver_dry = !driver_has_room();
+                    for (const int64_t c : chunks) {
+                        if (kvsh_range[k]->mapped(c)) continue;
+                        if (!driver_dry && driver_has_room() &&
+                            kvsh_range[k]->map_range(c, c + 1, [] { return (strata::core::VmmChunk) 0; })) continue;
+                        driver_dry = true;   // the driver is at the reserve: the cache lends
+                        if (lent.empty()) {
+                            int64_t still = 0;
+                            for (const int64_t c2 : chunks) still += kvsh_range[k]->mapped(c2) ? 0 : 1;
+                            xc_take(k, still, lent);
+                        }
+                        if (lent.empty()) return false;   // the cache is at its floor too (what mapped stays)
+                        if (!kvsh_range[k]->map_range(c, c + 1, [&]() -> strata::core::VmmChunk {
+                                if (lent.empty()) return 0;
+                                const strata::core::VmmChunk h = lent.back();
+                                lent.pop_back();
+                                return h;
+                            })) {
+                            xc_give(k, lent);
+                            return false;
+                        }
+                    }
+                    if (!lent.empty()) xc_give(k, lent);   // more than it turned out to need
+                    for (int64_t j = 0; j < q_n; ++j)
+                        for (int64_t a = 0; a < kvsh_lay.arrays; ++a) {
+                            const auto span = kvsh_lay.extent_span(Gr, (size_t) a, e, kvsh_pages_per_extent, cpl);
+                            if (span.first < 0 || span.second < span.first) continue;
+                            for (int64_t c = j * cpl + span.first; c <= j * cpl + span.second; ++c)
+                                kvsh_chunk_refs[k][(size_t) c] += 1;
+                        }
+                }
+                return true;
+            };
+            kvsh_unmap_extent = [&](int64_t e) {
+                const int64_t cpl = kvsh_lay.chunks_per_layer;
+                const uint64_t Gr = kvsh_G;
+                if (cpl <= 0) return;
+                for (size_t k = 0; k < kvsh_range.size(); ++k) {
+                    const strata::core::OnDevice on_k(xcl[k].dev);
+                    const int64_t q_n = (int64_t) kvsh_range[k]->chunks() / cpl;
+                    std::vector<strata::core::VmmChunk> freed;
+                    for (int64_t j = 0; j < q_n; ++j)
+                        for (int64_t a = 0; a < kvsh_lay.arrays; ++a) {
+                            const auto span = kvsh_lay.extent_span(Gr, (size_t) a, e, kvsh_pages_per_extent, cpl);
+                            if (span.first < 0 || span.second < span.first) continue;
+                            for (int64_t c = j * cpl + span.first; c <= j * cpl + span.second; ++c) {
+                                auto& rc = kvsh_chunk_refs[k][(size_t) c];
+                                if (rc <= 0) continue;
+                                if (--rc == 0)
+                                    if (const strata::core::VmmChunk h = kvsh_range[k]->unmap(c)) freed.push_back(h);
+                            }
+                        }
+                    if (!freed.empty()) xc_give(k, freed);
+                }
+            };
+        }
         // --pipeline-windows 2: the loop has drained (nothing in flight on either card): what waits for a gap goes now,
         // and the round in flight goes on unfenced (a_pl_idle unset) from the next tick, the next request's drain.  The
         // job's work is the host's alone, so the wait for it ends.
@@ -12551,6 +12827,7 @@ int main(int argc, char** argv) {
                                  (long long) pos[first[t]]);
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                     std::printf("BDONE %d %lld nonfinite %.1f\n", b, (long long) sl.produced, ms);
+                    kvsh_idle_t0 = std::chrono::steady_clock::now();
                     sl.active = false;
                     sl.cached = false;
                     sl.checks.clear();
@@ -12568,6 +12845,7 @@ int main(int argc, char** argv) {
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                        kvsh_idle_t0 = std::chrono::steady_clock::now();
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
                         break;
@@ -12861,6 +13139,7 @@ int main(int argc, char** argv) {
                                      gi * GS + t, (long long) sl.p);
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld nonfinite %.1f\n", gi * GS + t, (long long) sl.produced, ms);
+                        kvsh_idle_t0 = std::chrono::steady_clock::now();
                         sl.active = false;
                         sl.cached = false;
                         sl.checks.clear();
@@ -12880,6 +13159,7 @@ int main(int argc, char** argv) {
                         if (fin != nullptr) {
                             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                             std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
+                            kvsh_idle_t0 = std::chrono::steady_clock::now();
                             sl.active = false;
                             // a pipelined slot is a cache again (#857: a request left alone in its slot goes back to the solo path with its
                             // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
@@ -13107,6 +13387,51 @@ int main(int argc, char** argv) {
             while (pipe_inflight())
                 if (!pump(false)) return false;
             return flush_pipe_commits();   // the queued commits are what is left on the stages' streams
+        };
+        // THE FLOOR, from the caches: the pool's share of the VRAM, taken from the slots below the caches' loans
+        // (the driver's free VRAM first).  Without the exchange (wanted but a cache lacks a range) the driver
+        // alone is asked, which the caches' open has mostly emptied: the pool then refuses long conversations.
+        if (kvsh && kvsh_xc_wanted && kvsh_mapped_floor == 0 && kvsh_floor_extents > 0) {
+            int64_t m = 0;
+            for (; m < kvsh_floor_extents; ++m)
+                if (!kv_pages.map_one_more()) break;
+            kvsh_mapped_floor = m;
+            std::string lent;
+            for (const XcLoan& L : xcl) lent += " CUDA" + std::to_string(L.dev) + ":" + std::to_string((long long) (L.top - L.lo));
+            std::fprintf(stderr, "strata serve: --kv-share: the floor: %lld of %lld extents mapped%s%s\n", (long long) m,
+                         (long long) kvsh_floor_extents, kvsh_xc ? "; slots lent by the caches:" : " (no exchange: the driver alone)",
+                         kvsh_xc ? lent.c_str() : "");
+            if (m < kvsh_floor_extents)
+                std::fprintf(stderr, "strata serve: --kv-share: WARNING: the pool holds %lld of its %lld floor extents; "
+                                     "long conversations may be refused\n", (long long) m, (long long) kvsh_floor_extents);
+        }
+        kvsh_idle_t0 = std::chrono::steady_clock::now();   // the idle clock starts with serving, not the process
+        // THE IDLE TRIM: nothing decoding for a while - the cached pages past the reserve go to the host swap
+        // (batched), and the extents they empty go to the caches through kvsh_unmap_extent
+        auto kvsh_trim_idle = [&]() {
+            if (!kvsh_xc) return;
+            for (const BSlot& sb : bs) if (sb.active || sb.partial) return;
+            const int64_t pinned = kv_pages.pinned_count(), evictable = kv_pages.evictable_count();
+            const int64_t keep = std::max<int64_t>(pinned, kvsh_trim_keep_pages);
+            const int64_t ext0 = kv_pages.mapped_extents();
+            const int64_t target_ext = kvsh_pages_per_extent > 0 ? (keep + kvsh_pages_per_extent - 1) / kvsh_pages_per_extent : ext0;
+            if (pinned + evictable <= keep && ext0 <= target_ext) return;
+            int64_t to_evict = std::max<int64_t>(0, pinned + evictable - keep), evicted = 0;
+            const auto t0 = Clock::now();
+            while (to_evict > 0) {
+                const int64_t n = kv_pages.evict_batch(std::min<int64_t>(to_evict, 4096));
+                if (n <= 0) break;
+                to_evict -= n;
+                evicted += n;
+            }
+            kv_pages.drop_free_extents(target_ext);   // the extents nothing lives in, past the reserve
+            if (ext0 == kv_pages.mapped_extents() && evicted == 0) return;
+            std::fprintf(stderr, "strata serve: --kv-share: idle: %lld cached pages to the host swap, %lld of %lld extents "
+                                 "(%.2f GiB per card) to the expert caches in %.0f ms (%lld pages pinned, %lld kept)\n",
+                         (long long) evicted, (long long) (ext0 - kv_pages.mapped_extents()), (long long) ext0,
+                         (double) (ext0 - kv_pages.mapped_extents()) * (double) kvsh_pages_per_extent * (double) kvsh_swap_page_bytes *
+                             (double) (kvsh_q_n.empty() ? 0 : kvsh_q_n[0]) / 1073741824.0,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), (long long) pinned, (long long) keep);
         };
         for (;;) {
             line_drain_ms = 0.0;
@@ -13853,6 +14178,9 @@ int main(int argc, char** argv) {
                                  k + 1, (long long) (k < now.size() ? now[k].start : -1));
                 }
             }
+            if (kvsh_xc && kvsh_trim_idle_s > 0 &&
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - kvsh_idle_t0).count() >= (double) kvsh_trim_idle_s)
+                kvsh_trim_idle();
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr) {
                 // why a parked match hit or missed: the decision inputs, and on a miss against a NON-empty
@@ -17232,7 +17560,8 @@ int main(int argc, char** argv) {
 #if defined(STRATA_GPU_METAL)
         // the stdin reader (detached above) may still take in_mu when the server closes the pipe after QUIT; on macOS
         // locking that mutex once this scope has destroyed it throws (the engine ended with an abort): end here
-        std::fflush(stdout);
+        kvsh_idle_t0 = std::chrono::steady_clock::now();   // the idle clock: the last completion
+            std::fflush(stdout);
         std::fflush(stderr);
         std::_Exit(0);
 #endif

@@ -320,6 +320,17 @@ public:
 
     int64_t free_count() const { return alloc_.free_count(); }
     int64_t total() const { return total_pages_; }
+    /// Pages some session maps (pinned), and cached pages nobody maps (what an eviction may take).
+    int64_t pinned_count() const {
+        int64_t n = 0;
+        for (int32_t r : page_refs_) n += r > 0 ? 1 : 0;
+        return n;
+    }
+    int64_t evictable_count() const {
+        int64_t n = 0;
+        for (size_t i = 0; i < page_key_.size(); ++i) n += page_key_[i] != 0 && page_refs_[i] == 0 ? 1 : 0;
+        return n;
+    }
     int64_t cached_count() const { return (int64_t) key_to_page_.size(); }
     int64_t swap_out_count() const { return swap_out_count_; }
     int64_t swap_in_count() const { return swap_in_count_; }
@@ -346,6 +357,38 @@ public:
         alloc_.erase(drop);   // the extent's pages leave availability: their memory is gone
         extent_mapped_[(size_t) e] = false;
         unmap_extent_(e);
+    }
+
+    /// Unmap mapped extents that hold nothing at all (every page free, unkeyed, unpinned), highest first,
+    /// until `target` extents stay mapped.  Returns how many were dropped.  (An extent empties through
+    /// extent_release only as a page leaves it: the ones the eager floor mapped and nobody ever used stay
+    /// mapped otherwise.)
+    int64_t drop_free_extents(int64_t target) {
+        int64_t dropped = 0;
+        if (!unmap_extent_) return 0;
+        for (int64_t e = extents_ - 1; e >= 0 && mapped_extents() > target; --e) {
+            if (!extent_mapped_[(size_t) e]) continue;
+            bool empty = true;
+            for (int64_t p = e * per_extent_; p < (e + 1) * per_extent_ && p < total_pages_ && empty; ++p)
+                empty = page_key_[(size_t) p] == 0 && page_refs_[(size_t) p] == 0 && alloc_.is_free((int32_t) p);
+            if (!empty) continue;
+            std::vector<int32_t> drop;
+            for (int64_t p = e * per_extent_; p < (e + 1) * per_extent_ && p < total_pages_; ++p) drop.push_back((int32_t) p);
+            alloc_.erase(drop);
+            extent_mapped_[(size_t) e] = false;
+            unmap_extent_(e);
+            ++dropped;
+        }
+        return dropped;
+    }
+
+    /// An extent the caller mapped itself (the eager floor at startup): known as mapped, its pages free.
+    void mark_mapped(int64_t e) {
+        if (e < 0 || e >= extents_ || extent_mapped_[(size_t) e]) return;
+        extent_mapped_[(size_t) e] = true;
+        std::vector<int32_t> add;
+        for (int64_t p = e * per_extent_; p < (e + 1) * per_extent_ && p < total_pages_; ++p) add.push_back((int32_t) p);
+        alloc_.release(add);
     }
 
     /// Map the next unmapped extent (lowest first) into physical memory; its pages become free.
