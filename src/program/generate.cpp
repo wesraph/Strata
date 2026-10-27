@@ -5484,17 +5484,23 @@ int main(int argc, char** argv) {
                                  (long long) mapped, (long long) floor_extents);
                 kvsh_mapped_floor = mapped;
                 if (std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr && !kvsh_range.empty()) {
-                    // probe: write and read the first bytes of every layer's every array through the floor
-                    const auto& pr = *kvsh_range.front();
-                    int ok = 0, bad = 0;
-                    for (int64_t j = 0; j < (int64_t) pr.chunks() / kvsh_cpl[0]; ++j)
-                        for (size_t a = 0; a < lay.arrays; ++a) {
-                            uint8_t* at = pr.base() + j * lay.stride + lay.arr_off[a];
-                            if (cudaMemset(at, 0x5A, 256) == cudaSuccess) ++ok; else ++bad;
-                        }
-                    cudaDeviceSynchronize();
-                    std::fprintf(stderr, "kvshare-floor: base=%p chunks=%lld/%lld probe ok=%d bad=%d\n",
-                                 pr.base(), (long long) pr.mapped_count(), (long long) pr.chunks(), ok, bad);
+                    // probe EVERY range (its own device context), EVERY layer's EVERY array at FULL depth:
+                    // holes past a shallow probe are exactly what the split fault looks like
+                    for (size_t r = 0; r < kvsh_range.size(); ++r) {
+                        const auto& pr = *kvsh_range[r];
+                        const int rdev = r == 0 ? 0 : stages[r - 1]->dev;
+                        const strata::core::OnDevice on_r(rdev);
+                        int ok = 0, bad = 0;
+                        for (int64_t j = 0; j < (int64_t) pr.chunks() / kvsh_cpl[0]; ++j)
+                            for (size_t a = 0; a < lay.arrays; ++a) {
+                                uint8_t* at = pr.base() + j * lay.stride + lay.arr_off[a];
+                                if (cudaMemset(at, 0x5A, lay.arr_tight[a]) == cudaSuccess) ++ok; else ++bad;
+                            }
+                        cudaDeviceSynchronize();
+                        std::fprintf(stderr, "kvshare-floor: range %zu (dev %d) base=%p chunks=%lld/%lld "
+                                             "probe ok=%d bad=%d\n", r, rdev, pr.base(),
+                                     (long long) pr.mapped_count(), (long long) pr.chunks(), ok, bad);
+                    }
                 }
             }
         }

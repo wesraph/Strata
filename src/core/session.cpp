@@ -123,6 +123,11 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
         if (share != nullptr) {
             layer.base = (uint8_t*) share->base + (uint64_t) j * share_stride;
             layer.pool_pages = share->pool_pages;
+            layer.pool_align = share->pool_align;   // the carve builds its layout from this: without the copy
+                                                     // every carve built the 256-aligned layout (tight array
+                                                     // offsets) inside a granularity-aligned mapping - it hid
+                                                     // while tight[0] was 2 MiB aligned (one GPU) and wrote
+                                                     // unmapped chunks on a split
         }
         if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
                            s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0], 0,

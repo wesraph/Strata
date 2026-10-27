@@ -74,10 +74,14 @@ uint64_t vmm_granularity() { return api().ok ? api().gran : 0; }
 VmmChunk vmm_chunk_new() {
     const Api& a = api();
     if (!a.ok) return 0;
+    int cur = a.dev;
+    (void) cudaGetDevice(&cur);   // the CALLER's device: a.dev is whatever was current at api()'s first
+                                  // call, so every chunk landed on one GPU and the other GPU's kernels
+                                  // wrote VA backed by foreign memory
     CUmemAllocationProp prop{};
     prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
     prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    prop.location.id = a.dev;
+    prop.location.id = cur;
     CUmemGenericAllocationHandle h = 0;
     if (a.create(&h, (size_t) a.gran, &prop, 0) != CUDA_SUCCESS) return 0;
     return (VmmChunk) h;
@@ -126,9 +130,11 @@ bool VmmRange::map_one(int64_t i, VmmChunk h) {
 bool VmmRange::set_access(int64_t lo, int64_t hi) {
     if (hi <= lo) return true;
     const Api& a = api();
+    int cur = a.dev;
+    (void) cudaGetDevice(&cur);   // access for the CALLER's device (see vmm_chunk_new)
     CUmemAccessDesc d{};
     d.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-    d.location.id = a.dev;
+    d.location.id = cur;
     d.flags = CU_MEM_ACCESS_FLAGS_PROT_READWRITE;
     return a.access((CUdeviceptr) (base_ + (uint64_t) lo * a.gran), (size_t) ((uint64_t) (hi - lo) * a.gran), &d, 1) ==
            CUDA_SUCCESS;

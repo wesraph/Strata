@@ -957,6 +957,13 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     st.page_table = c.take<int32_t>((uint64_t) pages);
     st.n_pages = pages;
     st.max_cells = max_cells;
+    if (share != nullptr && std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr)
+        std::fprintf(stderr, "kvshare-carve: align=%llu pages=%lld kq=%p k_scale=+%lld v_q4=+%lld "
+                             "(padded off1=%lld tight0=%lld)\n",
+                     (unsigned long long) share->pool_align, (long long) share->pool_pages, (void*) st.k_q,
+                     st.k_scale ? (long long) ((uint8_t*) st.k_scale - (uint8_t*) st.k_q) : -1LL,
+                     st.v_q4 ? (long long) ((uint8_t*) st.v_q4 - (uint8_t*) st.k_q) : -1LL,
+                     (long long) (share != nullptr ? lay.arr_off[1] : -1), (long long) lay.arr_tight[0]);
     st.map = strata::kernels::KvStreamMap{};
     st.map.page_table = st.page_table;
     st.map.n_blocks = pages;
