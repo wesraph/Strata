@@ -55,17 +55,20 @@ tool calls executed (read-only shell and file reads, writes into a workspace), a
 contexts grow to 90K-130K tokens. "Aggregate" is tokens generated over the agent's whole wall clock, prompt reads
 and tool waits included - what an agent experiences.
 
-| agents | | upstream 0.2.7 | this fork |
+| agents | | upstream 0.2.7 | this fork (two runs) |
 |---|---|---|---|
-| 1 | aggregate over the agent loop | 38 tok/s | 69 tok/s |
+| 1 | aggregate over the agent loop | 38 tok/s | 56-69 tok/s |
 | | decode on the long answers | 86 tok/s | 107-126 tok/s |
-| | wait before the first token, later turns | 1.7 s | 1.4 s |
-| 2 | aggregate | 43 tok/s | 66 tok/s |
-| | decode on the long answers, per agent | 31 and 51 tok/s | 34-64 and 80 tok/s |
-| | wait before the first token, later turns | 2.2-2.8 s | 1.5-1.6 s |
+| | wait before the first token, later turns | 1.7 s | 1.4-1.6 s |
+| 2 | aggregate | 43 tok/s | 54-66 tok/s |
+| | decode on the long answers, per agent | 31 and 51 tok/s | 49-66 and 66-80 tok/s |
+| | wait before the first token, later turns | 2.2-2.8 s | 1.5-2.7 s |
 | 3 | aggregate | 56 tok/s | 57 tok/s |
-| | decode on the long answers, per agent | 24-40 tok/s | 40-44 tok/s |
+| | decode on the long answers, per agent | 24-40 tok/s | 30-53 tok/s |
 | | expert cache hit rate at the end | 35-63% | 96-99% |
+
+The agents choose their own tool calls (temperature 0.6), so two runs of the same arm do different work: the
+aggregate moves with how many long modules the run happened to write, the decode and the hit rate do not.
 
 Prefill is unchanged (about 3.6K tok/s for 46K to 237K-token first reads). The three-agent aggregate is even
 because three different coding tasks keep the engine's prompt path and expert reads busy either way; the pool's
