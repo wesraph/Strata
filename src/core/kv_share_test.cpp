@@ -513,6 +513,39 @@ int main() {
     check(tab[(size_t) (pages - 1)] == (int32_t) (pages - 1), "the plain table is the identity");
     check(plain_state_bytes > shared_state_bytes, "a shared state carves fewer bytes of its own");
 
+    // ---- the agent loop without slot keeping (no per-slot draft K/V: no parks, no held conversations): every turn is a
+    // fresh admission of the whole prompt on main, a slot share of main's keyed pages, the slot's answer in own
+    // pages, and the slot's overwrite by the next admission.  Nothing of that may leave pages pinned behind.
+    {
+        PageCache pcl(4096);
+        CopyPage copier_l = [&](int32_t, int32_t) { return true; };
+        std::string why_l;
+        SessionPages mainl, slots_l[3];
+        const int64_t n_conv = 3, turns = 12;
+        std::vector<std::vector<int64_t>> conv(n_conv);
+        for (int64_t c = 0; c < n_conv; ++c) for (int64_t i = 0; i < 400; ++i) conv[(size_t) c].push_back(10000 * (c + 1) + i);
+        int64_t peak_pinned = 0;
+        for (int64_t t = 0; t < turns; ++t) {
+            const size_t c = (size_t) (t % n_conv);
+            std::vector<int64_t>& ids = conv[c];
+            const int64_t n = (int64_t) ids.size();
+            check(session_admit(pcl, mainl, ids.data(), nullptr, n, 0, 0, n + 16, 4, 4096, copier_l, &why_l), "no-park loop: main admits the prompt");
+            std::vector<int32_t> ids32(ids.begin(), ids.end());
+            session_register(pcl, mainl, ids32, n, 4);   // the read's pages keyed
+            SessionPages& sl = slots_l[c];
+            check(session_admit(pcl, sl, nullptr, ids32.data(), n, 0, n, n + 64, 4, 4096, copier_l, &why_l), "no-park loop: the slot takes it");
+            check(session_extend(pcl, sl, n + 32, 4, 4096), "no-park loop: the answer grows");
+            for (int64_t i = 0; i < 32; ++i) ids.push_back(20000 + t * 100 + i);
+            peak_pinned = std::max(peak_pinned, pcl.pinned_count());
+        }
+        // at most main's pages plus three slots' pages are pinned at any time
+        check(peak_pinned <= 4 * (int64_t) (conv[0].size() / 4 + 24), "no-park loop: the pins never exceed the live sessions'");
+        for (size_t c = 0; c < (size_t) n_conv; ++c) session_release(pcl, slots_l[c]);
+        session_release(pcl, mainl);
+        check(pcl.pinned_count() == 0, "no-park loop: no page stays pinned once every session left");
+        check(pcl.free_count() + pcl.evictable_count() == 4096, "no-park loop: every page is free or an evictable keyed page");
+    }
+
     sync();
     for (void* p : bufs) cudaFree(p);
     cudaFree(arena);

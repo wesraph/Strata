@@ -17183,6 +17183,13 @@ int main(int argc, char** argv) {
                 kvsh_register(0, ids, merge_at >= 0 ? std::min<int64_t>(merge_at, at) : at);   // what the read wrote
                 static int64_t kvsh_reqs = 0;
                 if (++kvsh_reqs % 32 == 0 || std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr)
+                {
+                    int64_t sess_pages = 0;   // every session's mapping (a shared page counts once per session)
+                    for (const auto& sp : kvshs.sess) sess_pages += sp.mapped();
+                    std::fprintf(stderr, "strata serve: --kv-share: pool: %lld pinned (%lld in sessions' mappings), %lld evictable\n",
+                                 (long long) kv_pages.pinned_count(), (long long) sess_pages, (long long) kv_pages.evictable_count());
+                }
+                if (true)
                     std::fprintf(stderr, "strata serve: --kv-share: pool %lld pages: %lld free, %lld cached, "
                                          "%lld mapped (%lld of %lld extents)\n",
                                  (long long) kv_pages.total(), (long long) kv_pages.free_count(),
