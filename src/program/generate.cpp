@@ -4684,6 +4684,7 @@ int main(int argc, char** argv) {
     } kvsh_swap;
     std::vector<uint8_t> kvsh_swap_stage;   ///< staging for one batch of swap copies
     int64_t kvsh_swap_page_bytes = 0;       ///< per-layer bytes per page (the swap lambdas outlive the
+    int64_t kvsh_swap_page_total = 0;       ///< a page's host copy: every range's layers (the working-set trim's room)
     std::array<int64_t, 4> kvsh_swap_per_arr{};   ///< wiring block: main-scope, or they read dead slots)
     strata::core::SharePoolLayout kvsh_lay;   ///< the pool's layout (main scope: the extent lambdas
                                               ///< outlive the pool-setup block, and a [&] capture of its
@@ -10897,6 +10898,7 @@ int main(int argc, char** argv) {
                 for (size_t r = 0; r < kvsh_q_n.size(); ++r) t += kvsh_q_n[r] * page_bytes;
                 return t;
             }();
+            kvsh_swap_page_total = page_total;
             // (both helpers are copied into the swap lambdas below, which run long after this block: page_bytes by
             // value - by reference it was a dead stack slot, and the first store ever made faulted in memcpy; the
             // two tables are main-scope)
@@ -14695,6 +14697,58 @@ int main(int argc, char** argv) {
                              (double) (kvsh_q_n.empty() ? 0 : kvsh_q_n[0]) / 1073741824.0,
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), (long long) pinned, (long long) keep);
         };
+        // THE WORKING-SET TRIM (no share): at the reserve's quiet moments, the cached pages nothing touched for the
+        // trim window (STRATA_KV_TRIM_WINDOW_S, 600 s) go to the host swap - as many as it has room for, up to
+        // 4,096 per moment - and the extents left empty past the live pages, the cached pages kept, the reserve
+        // and the keep (STRATA_KV_TRIM_KEEP_TOKENS) go back to the expert caches, up to 4 per moment.  Without it
+        // the pool only grew under steady traffic: the idle trim needs STRATA_KV_TRIM_IDLE_S seconds with no
+        // request, which a fleet of agents never gives it (measured on the 2x3090 rig, 2026-10-28: 45 to 320 of
+        // 712 extents in two hours, the caches down to 3,318 and 2,044 of their 5,029 and 3,756 lendable slots,
+        // nothing returned).  A page the swap cannot hold stays on the device: there it costs an expert slot,
+        // lost it costs a re-read of its tokens (a 186K-token conversation: ~100 s at this rig's prompt speed).
+        // STRATA_KV_TRIM_IDLE_S=0 turns this trim off with the idle one.
+        std::deque<std::pair<std::chrono::steady_clock::time_point, int64_t>> kvsh_stamp_samples;   // (when, pool stamp)
+        auto kvsh_trim_load_t = std::chrono::steady_clock::now();
+        auto kvsh_reserve_want = [&]() -> int64_t {
+            int64_t slots = 1;
+            for (const BSlot& sb : bs) if (sb.active || sb.partial) ++slots;
+            const int64_t quantum = (4096 + 16 + kvsh_ps - 1) / kvsh_ps;
+            return slots * quantum;
+        };
+        auto kvsh_trim_load = [&]() {
+            if (!kvsh_xc || kvsh_share_given || kvsh_pages_per_extent <= 0 || kvsh_trim_idle_s <= 0) return;
+            const auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration<double>(now - kvsh_trim_load_t).count() < 1.0) return;   // once a second at most
+            kvsh_trim_load_t = now;
+            // the stamp the pool had a window ago: a page stamped at or before it is stale
+            if (kvsh_stamp_samples.empty() || std::chrono::duration<double>(now - kvsh_stamp_samples.back().first).count() >= 5.0)
+                kvsh_stamp_samples.emplace_back(now, kv_pages.stamp());
+            while (kvsh_stamp_samples.size() >= 2 &&
+                   std::chrono::duration<double>(now - kvsh_stamp_samples[1].first).count() >= kvsh_trim_window_s)
+                kvsh_stamp_samples.pop_front();
+            if (std::chrono::duration<double>(now - kvsh_stamp_samples.front().first).count() < kvsh_trim_window_s) return;
+            const int64_t cutoff = kvsh_stamp_samples.front().second;
+            int64_t room = 0;   // what the swap can still hold, in pages
+            if (kvsh_swap.budget > 0 && kvsh_swap_page_total > 0 && kvsh_swap.bytes < kvsh_swap.budget)
+                room = (int64_t) ((kvsh_swap.budget - kvsh_swap.bytes) / (uint64_t) kvsh_swap_page_total);
+            const int64_t ext0 = kv_pages.mapped_extents();
+            const auto t0 = Clock::now();
+            const int64_t evicted = room > 0 ? kv_pages.evict_stale(cutoff, std::min<int64_t>(room, 4096)) : 0;
+            const int64_t pinned = kv_pages.pinned_count(), cached = kv_pages.evictable_count();
+            const int64_t need = pinned + cached + kvsh_reserve_want();
+            const int64_t target = std::max<int64_t>({(need + kvsh_pages_per_extent - 1) / kvsh_pages_per_extent,
+                                                      (kvsh_trim_keep_pages + kvsh_pages_per_extent - 1) / kvsh_pages_per_extent,
+                                                      ext0 - 4});
+            if (ext0 > target) kv_pages.drop_free_extents(target);
+            const int64_t dropped = ext0 - kv_pages.mapped_extents();
+            if (evicted == 0 && dropped == 0) return;
+            std::fprintf(stderr, "strata serve: --kv-share: working set: %lld cached pages untouched for %.0f s to the host swap, "
+                                 "%lld of %lld extents to the expert caches in %.0f ms (%lld pinned, %lld cached, %lld free; the swap "
+                                 "holds %llu MiB)\n",
+                         (long long) evicted, kvsh_trim_window_s, (long long) dropped, (long long) ext0,
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), (long long) pinned, (long long) cached,
+                         (long long) kv_pages.free_count(), (unsigned long long) (kvsh_swap.bytes >> 20));
+        };
         // THE RESERVE (no share): at a quiet moment - the drain before a line, a pump with nothing in flight - the
         // pool maps extents until its free pages cover one extension of every live slot (a window's growth asks
         // for 4,096 cells ahead, kvsh_extend) and one more for the next admission.  The windows then never need
@@ -14703,10 +14757,8 @@ int main(int argc, char** argv) {
         kvsh_topup = [&]() {
             if (!kvsh_xc || kvsh_share_given) return;
             if (kvsh_pipe_busy && kvsh_pipe_busy()) return;
-            int64_t slots = 1;
-            for (const BSlot& sb : bs) if (sb.active || sb.partial) ++slots;
-            const int64_t quantum = (4096 + 16 + kvsh_ps - 1) / kvsh_ps;
-            const int64_t want = slots * quantum;
+            kvsh_trim_load();   // first what goes back, then what the next windows need
+            const int64_t want = kvsh_reserve_want();
             kv_pages.set_grow_reserve(want);   // and under a window: cached pages give way before the pool grows
             if (kv_pages.free_count() >= want) return;
             const int64_t ext0 = kv_pages.mapped_extents();
@@ -14715,7 +14767,8 @@ int main(int argc, char** argv) {
             if (kv_pages.mapped_extents() != ext0 && std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr)
                 std::fprintf(stderr, "kvshare-reserve: %lld extents mapped (%lld of %lld) for %lld free pages (%lld slots x %lld) in %.1f ms\n",
                              (long long) (kv_pages.mapped_extents() - ext0), (long long) kv_pages.mapped_extents(),
-                             (long long) kv_pages.extents(), (long long) want, (long long) slots, (long long) quantum,
+                             (long long) kv_pages.extents(), (long long) want, (long long) (want / std::max<int64_t>(1, (4096 + 16 + kvsh_ps - 1) / kvsh_ps)),
+                             (long long) ((4096 + 16 + kvsh_ps - 1) / kvsh_ps),
                              std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
         };
         // A parked image without a draft ring (parked by a slot without a drafter, or saved without --mtp) restored

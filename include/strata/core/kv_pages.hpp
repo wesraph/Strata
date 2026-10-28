@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <functional>
+#include <limits>
 #include <string>
 #include <unordered_map>
 #include <queue>
@@ -297,13 +298,21 @@ public:
     /// Evict up to `n` of the least recently used cached pages nobody maps, their bytes swapped out in ONE
     /// batched transfer (or one at a time without the batched swap).  Returns how many.  The heap is lazy:
     /// stale entries (touched, re-keyed, freed since) are skipped until live ones surface.
-    int64_t evict_batch(int64_t n) {
+    int64_t evict_batch(int64_t n) { return evict_up_to_(n, std::numeric_limits<int64_t>::max()); }
+    /// evict_batch limited to the pages last touched at or before `max_stamp` (the front of the LRU
+    /// order): the engine samples stamp() against the clock, so this is "the cached pages nothing touched
+    /// for the last W seconds".  0 when the oldest cached page is fresher than that.
+    int64_t evict_stale(int64_t max_stamp, int64_t n) { return evict_up_to_(n, max_stamp); }
+    /// The recency counter: a page's stamp is its value at the page's last touch.
+    int64_t stamp() const { return stamp_; }
+    int64_t evict_up_to_(int64_t n, int64_t max_stamp) {
         if (std::getenv("STRATA_KV_SWAP_TRACE") != nullptr)
             std::fprintf(stderr, "evict: n=%lld heap=%zu swapset=%d\n", (long long) n, heap_.size(),
                          swap_out_many_ || swap_out_ ? 1 : 0);
         std::vector<std::pair<int32_t, uint64_t>> victims;
         while (!heap_.empty() && (int64_t) victims.size() < n) {
             const auto [stamp, id] = heap_.top();
+            if (stamp > max_stamp) break;   // the front is the oldest: nothing older is left
             heap_.pop();
             if (id < 0 || (size_t) id >= page_key_.size()) continue;
             if (page_key_[(size_t) id] == 0 || page_refs_[(size_t) id] > 0) continue;   // freed or pinned: stale

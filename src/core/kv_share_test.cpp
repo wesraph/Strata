@@ -546,6 +546,40 @@ int main() {
         check(pcl.free_count() + pcl.evictable_count() == 4096, "no-park loop: every page is free or an evictable keyed page");
     }
 
+    // ---- evict_stale: only the pages last touched at or before the stamp go (the working-set trim) ----
+    {
+        PageCache st(8);
+        std::vector<int32_t> tok(16);
+        for (int i = 0; i < 16; ++i) tok[(size_t) i] = 100 + i;
+        std::vector<int32_t> got;
+        check(st.take(4, got) && got.size() == 4, "stale: four pages");
+        uint64_t k = 0;
+        std::vector<uint64_t> keys;
+        for (int p = 0; p < 4; ++p) {
+            k = PageCache::page_key(k, &tok[(size_t) p * 4], 4);
+            keys.push_back(k);
+            check(st.register_page(got[(size_t) p], k, &tok[(size_t) p * 4]), "stale: register");
+            if (p == 1) st.touch(got[0]);   // A touched after B: A is fresher than B
+        }
+        const int64_t none = 0;
+        check(st.evict_stale(none, 10) == 0, "stale: nothing is as old as stamp 0");
+        // the stamp right after B's registration and A's touch: B is at or before it, A, C, D are not
+        // (A was touched after B registered; C and D registered later)
+        int64_t s_b = -1;
+        {
+            PageCache probe(8);
+            std::vector<int32_t> g2;
+            check(probe.take(4, g2), "stale: probe pages");
+            uint64_t kk = 0;
+            for (int p = 0; p < 2; ++p) { kk = PageCache::page_key(kk, &tok[(size_t) p * 4], 4); probe.register_page(g2[(size_t) p], kk, &tok[(size_t) p * 4]); }
+            s_b = probe.stamp();   // two registrations: the stamp B's registration carried
+        }
+        check(st.evict_stale(s_b, 10) == 1, "stale: exactly B is at or before the stamp");
+        check(st.cached_count() == 3 && st.free_count() == 5, "stale: three cached pages stay, B's page is free");
+        check(st.evict_stale(st.stamp(), 2) == 2, "stale: the bound n limits a batch");
+        check(st.evict_stale(st.stamp(), 10) == 1 && st.cached_count() == 0, "stale: the last one goes; the stamp is the pool's");
+    }
+
     sync();
     for (void* p : bufs) cudaFree(p);
     cudaFree(arena);
