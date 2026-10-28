@@ -4638,6 +4638,7 @@ int main(int argc, char** argv) {
     // conversation move can see them
     bool kvsh = false;                     ///< the flat shared pool is on
     int64_t kvsh_pool_pages = 0;           ///< the pool, in pages (every layer, every device)
+    bool kvsh_share_given = false;         ///< STRATA_KV_SHARE_FRAC set: the fixed split (else the pool follows the sessions)
     std::vector<std::unique_ptr<strata::core::VmmRange>> kvsh_range;   ///< per device: the pool's address space
     std::vector<int64_t> kvsh_cpl;        ///< chunks per layer, then each array's chunk base inside it
     int64_t kvsh_pages_per_extent = 0;    ///< VMM chunk granule in pages (0: no VMM, one plain extent)
@@ -6019,13 +6020,17 @@ int main(int argc, char** argv) {
         // --kv-share auto: the pool takes a fixed share of the VRAM the weights left free (the expert
         // cache opens after the pool and sizes itself into the rest).  One number per rig, the tightest
         // device decides - vLLM's profiling step in miniature.
-        // STRATA_KV_SHARE_FRAC: the share of the free VRAM `--kv-share auto` takes (0.35 by default; more for
-        // several long agents at once, less for one agent and a bigger expert cache)
-        const double kvsh_share_frac = [] {
+        // STRATA_KV_SHARE_FRAC: a FIXED share of the free VRAM for `--kv-share auto` (the floor is claimed at the
+        // start, the pool never grows past the share).  Unset (the default): no share.  The pool's capacity is
+        // then the whole free VRAM of the tightest card, it starts at one extent, grows at quiet moments to what
+        // the live sessions hold plus a reserve for their next extensions (kvsh_topup), and the idle trim hands
+        // the rest back; the expert cache opens into everything else and lends as the sessions grow.  The split
+        // follows the traffic: one agent runs with the biggest cache, several long ones take the VRAM they need.
+        kvsh_share_given = [] {
             const char* v = std::getenv("STRATA_KV_SHARE_FRAC");
-            const double f = v != nullptr ? std::atof(v) : 0.35;
-            return f > 0.05 && f < 0.95 ? f : 0.35;
+            return v != nullptr && std::atof(v) > 0.05 && std::atof(v) < 0.95;
         }();
+        const double kvsh_share_frac = kvsh_share_given ? std::atof(std::getenv("STRATA_KV_SHARE_FRAC")) : 1.0;
         if (o.kv_share < 0) {
             const double auto_share = kvsh_share_frac;
             const int64_t per_page = strata::kernels::kv_block_bytes(
@@ -6038,15 +6043,23 @@ int main(int argc, char** argv) {
                 const strata::core::OnDevice on_d(d);
                 size_t free_b = 0, total_b = 0;
                 if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) continue;
+                // the card's own QSA layers (a split holds a part of them; the share's rule counted them all,
+                // which halved what a card could hold)
+                int64_t q_n_here = 0;
+                const int64_t l0 = multi_gpu && d > 0 ? split_at[0] : 0;
+                const int64_t l1 = multi_gpu && d == 0 ? split_at[0] : g.n_layers;
+                for (int64_t l = l0; l < l1; ++l) if (strata::core::is_qsa_layer(g, l)) ++q_n_here;
+                const int64_t q_n = kvsh_share_given ? q_n_all : std::max<int64_t>(q_n_here, 1);
                 const int64_t here = (int64_t) ((double) free_b * auto_share) /
-                                     std::max<int64_t>(per_page * q_n_all, 1) * 4;
+                                     std::max<int64_t>(per_page * q_n, 1) * 4;
                 tokens = std::min<int64_t>(tokens, here);
             }
             if (tokens == INT64_MAX || tokens < 1) tokens = 4 * 1024;   // measurement failed: a small floor
             strata::core::qsa_set_kv_share(tokens);
-            std::fprintf(stderr, "strata generate: --kv-share auto: %lld tokens of K/V pool "
-                                 "(%.2f GiB of the free VRAM per card)\n", (long long) tokens,
-                         (double) (tokens / 4 * per_page) / 1073741824.0);
+            std::fprintf(stderr, "strata generate: --kv-share auto: %lld tokens of K/V pool at most "
+                                 "(%.2f GiB over every layer%s)\n", (long long) tokens,
+                         (double) (tokens / 4 * per_page * q_n_all) / 1073741824.0,
+                         kvsh_share_given ? ", a fixed share of the free VRAM" : "; no share: the pool grows with the sessions");
         }
         kvsh = strata::core::qsa_kv_share_tokens() > 0;
         const int64_t kvsh_pages_of_context =
@@ -6204,7 +6217,7 @@ int main(int argc, char** argv) {
                 // but only a SHARE: a whole-context floor takes ~3.7 GiB eagerly, starves the cache to a few
                 // hundred MiB, and the prompt reads crawl on RAM experts until the watchdog ends the engine.
                 // What the floor holds is a START; take() maps more extents on demand.
-                const double floor_share = kvsh_share_frac;
+                const double floor_share = kvsh_share_given ? kvsh_share_frac : 0.0;   // no share: one extent, the rest on demand
                 uint64_t free_b = 0, total_b = 0;
                 if (cudaMemGetInfo(&free_b, &total_b) != cudaSuccess) free_b = 0;
                 const uint64_t G = strata::core::vmm_granularity();
@@ -13437,6 +13450,7 @@ int main(int argc, char** argv) {
             ConvCheckpoint::PromptPlan partial_plan;   ///< --prefill-pipe: the segment it stopped in, read on in its chunks
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
+        std::function<void()> kvsh_topup;   // --kv-share without a share: the pool's reserve, mapped at quiet moments
         // timing of the batch windows since the slots were last all idle (one stderr line then)
         double bt_run = 0, bt_commit = 0, bt_emit = 0;
         double bt_wait0 = 0, bt_pool0 = 0;
@@ -14493,6 +14507,7 @@ int main(int argc, char** argv) {
             }
             // every slot done: the last commits have run before anything reads a slot (between windows nothing does)
             if (pmtp && !pipe_inflight() && !batch_on() && !pmtp_settle()) return false;
+            if (kvsh_topup && !pipe_inflight() && !batch_on()) kvsh_topup();   // the reserve, while nothing is in flight
             if (!pipe_inflight() && !batch_on() && bt_windows > 0) {   // all idle: the timing line, as batch_step
                 const double w = (double) bt_windows, wall = std::chrono::duration<double, std::milli>(Clock::now() - bt_start).count();
                 char pa_txt[160] = "";
@@ -14669,6 +14684,29 @@ int main(int argc, char** argv) {
                              (double) (kvsh_q_n.empty() ? 0 : kvsh_q_n[0]) / 1073741824.0,
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), (long long) pinned, (long long) keep);
         };
+        // THE RESERVE (no share): at a quiet moment - the drain before a line, a pump with nothing in flight - the
+        // pool maps extents until its free pages cover one extension of every live slot (a window's growth asks
+        // for 4,096 cells ahead, kvsh_extend) and one more for the next admission.  The windows then never need
+        // the cache to lend while they are in flight (it cannot: the quiesce would wait on them), and never evict
+        // a cached prefix for their own rows.  What the reserve sizes is the extension rule itself: no number.
+        kvsh_topup = [&]() {
+            if (!kvsh_xc || kvsh_share_given) return;
+            if (kvsh_pipe_busy && kvsh_pipe_busy()) return;
+            int64_t slots = 1;
+            for (const BSlot& sb : bs) if (sb.active || sb.partial) ++slots;
+            const int64_t quantum = (4096 + 16 + kvsh_ps - 1) / kvsh_ps;
+            const int64_t want = slots * quantum;
+            kv_pages.set_grow_reserve(want);   // and under a window: cached pages give way before the pool grows
+            if (kv_pages.free_count() >= want) return;
+            const int64_t ext0 = kv_pages.mapped_extents();
+            const auto t0 = Clock::now();
+            while (kv_pages.free_count() < want && kv_pages.map_one_more()) {}
+            if (kv_pages.mapped_extents() != ext0 && std::getenv("STRATA_KV_SHARE_DEBUG") != nullptr)
+                std::fprintf(stderr, "kvshare-reserve: %lld extents mapped (%lld of %lld) for %lld free pages (%lld slots x %lld) in %.1f ms\n",
+                             (long long) (kv_pages.mapped_extents() - ext0), (long long) kv_pages.mapped_extents(),
+                             (long long) kv_pages.extents(), (long long) want, (long long) slots, (long long) quantum,
+                             std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+        };
         // A parked image without a draft ring (parked by a slot without a drafter, or saved without --mtp) restored
         // beside the drafter: its ring holds another conversation's cells for the resumed range, so it is cleared
         // and the drafter goes on from `at` with an empty window (its proposals improve as the new turn fills it;
@@ -14698,6 +14736,7 @@ int main(int argc, char** argv) {
                                                       return G.inflight; }) : 0;
                     const auto td = Clock::now();
                     if (!pipe_drain()) { std::fprintf(stderr, "strata serve: the serve loop ends: the pipelined drain failed (see the ERR above)\n"); return 1; }
+                    if (kvsh_topup) kvsh_topup();   // drained: the reserve for the line in hand and the next windows
                     if (trace) {   // STRATA_TRACE: what the drain before this line cost (BGEN: an admission's first phase)
                         line_drain_ms = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
                         std::fprintf(stderr, "strata trace: drain for %.*s: %d groups in flight, %.1f ms\n",

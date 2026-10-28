@@ -250,12 +250,20 @@ public:
     bool take(int64_t n, std::vector<int32_t>& out) {
         while (alloc_.free_count() < n) {
             int64_t before = alloc_.free_count();
+            // with a growth reserve set (the VRAM exchange without a share): a new extent only when the pinned
+            // pages plus the reserve need it (free + evictable < n + reserve); otherwise the cached pages give
+            // way first - what the live sessions do not hold is the expert cache's, not a prefix store's
+            const bool slack = grow_reserve_ >= 0 && alloc_.free_count() + evictable_count() >= n + grow_reserve_;
+            if (slack && evict_batch(n - alloc_.free_count()) > 0) continue;
             if (map_one_more() && alloc_.free_count() > before) continue;
             if (evict_batch(n - alloc_.free_count()) > 0) continue;
             break;
         }
         return alloc_.take(n, out);
     }
+    /// The growth rule's reserve in pages (-1, the default: a new extent before any eviction, as before).
+    void set_grow_reserve(int64_t pages) { grow_reserve_ = pages; }
+    int64_t grow_reserve() const { return grow_reserve_; }
 
     /// A session's page goes back: it loses this session's pin, hashed pages stay cached (evictable once
     /// nobody pins them), the rest free outright.  EVERY page a session maps holds one pin of that session
@@ -424,6 +432,7 @@ public:
     int64_t stamp_ = 0;
     int64_t total_pages_ = 0, per_extent_ = 1, extents_ = 1;
     std::vector<char> extent_mapped_;
+    int64_t grow_reserve_ = -1;
     MapExtent map_extent_;
     UnmapExtent unmap_extent_;
     bool eager_extent_release_ = false;   ///< return an emptied extent at once (tests of that path); off: the idle trim does
