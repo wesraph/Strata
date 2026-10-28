@@ -10897,15 +10897,26 @@ int main(int argc, char** argv) {
                 for (size_t r = 0; r < kvsh_q_n.size(); ++r) t += kvsh_q_n[r] * page_bytes;
                 return t;
             }();
-            auto arr_prefix = [&](int64_t a) { int64_t o2 = 0; for (int64_t aa = 0; aa < a; ++aa) o2 += kvsh_swap_per_arr[(size_t) aa]; return o2; };
-            auto range_prefix = [&](size_t r) { int64_t o2 = 0; for (size_t rr = 0; rr < r; ++rr) o2 += kvsh_q_n[rr] * page_bytes; return o2; };
+            // (both helpers are copied into the swap lambdas below, which run long after this block: page_bytes by
+            // value - by reference it was a dead stack slot, and the first store ever made faulted in memcpy; the
+            // two tables are main-scope)
+            auto arr_prefix = [&kvsh_swap_per_arr](int64_t a) { int64_t o2 = 0; for (int64_t aa = 0; aa < a; ++aa) o2 += kvsh_swap_per_arr[(size_t) aa]; return o2; };
+            auto range_prefix = [&kvsh_q_n, page_bytes](size_t r) { int64_t o2 = 0; for (size_t rr = 0; rr < r; ++rr) o2 += kvsh_q_n[rr] * page_bytes; return o2; };
+            // (page_total, page_bytes and the two prefix helpers are this block's: by value, the swap runs long
+            // after the block - by reference they were garbage, and every store was refused "over budget")
             kv_pages.set_swap_many(
-                [&](const std::vector<std::pair<int32_t, uint64_t>>& victims) {
+                [&, page_total, page_bytes, arr_prefix, range_prefix](const std::vector<std::pair<int32_t, uint64_t>>& victims) {
                     if (kvsh_swap.budget == 0 || victims.empty() || page_total <= 0) return;
                     // what the budget still holds (the oldest victims first: they are the LRU order)
                     size_t k = 0;
                     while (k < victims.size() && kvsh_swap.bytes + (uint64_t) (k + 1) * (uint64_t) page_total <= kvsh_swap.budget) ++k;
-                    if (k == 0) { kvsh_swap.refused += victims.size(); kvsh_swap.called += victims.size(); return; }
+                    if (k == 0) {
+                        if (kvsh_swap.refused == 0)
+                            std::fprintf(stderr, "kvshare-swap: refused: budget %llu MiB, held %llu MiB, %lld bytes per page, %zu victims\n",
+                                         (unsigned long long) (kvsh_swap.budget >> 20), (unsigned long long) (kvsh_swap.bytes >> 20),
+                                         (long long) page_total, victims.size());
+                        kvsh_swap.refused += victims.size(); kvsh_swap.called += victims.size(); return;
+                    }
                     std::vector<size_t> order(k);
                     for (size_t i = 0; i < k; ++i) order[i] = i;
                     std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return victims[x].first < victims[y].first; });
@@ -10953,7 +10964,7 @@ int main(int argc, char** argv) {
                     kvsh_swap.refused += victims.size() - k;
                     kv_pages.count_swapped_out((int64_t) k);
                 },
-                [&](const std::vector<std::pair<uint64_t, int32_t>>& pairs) -> bool {
+                [&, page_total, page_bytes, arr_prefix, range_prefix](const std::vector<std::pair<uint64_t, int32_t>>& pairs) -> bool {
                     if (pairs.empty() || page_total <= 0) return false;
                     const size_t k = pairs.size();
                     std::vector<const uint8_t*> src(k);
