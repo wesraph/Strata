@@ -1807,6 +1807,63 @@ void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
 // being filled by another thread - the caller then waits), false when the caller must fill buffer `v`.
 thread_local int FileExpertSource::stage_cid_ = 0;
 
+// one more buffer for the pool (stage_mu_ held): pinned where the driver allows and the read beside the slots is
+// not on (set_stage_no_pin), pageable otherwise; SIZE_MAX when even that failed
+size_t FileExpertSource::stage_add_locked() {
+    const size_t v = stage_buf_.size();
+    // Pinned, where the driver allows: a stage buffer is the source of the cache fill's cudaMemcpyAsync,
+    // and a pageable source is staged through the driver's bounce buffer - an extra copy at a fraction of
+    // the transfer rate, on the calling thread.  A failure falls back to pageable for this buffer.
+    // STRATA_STAGE_PIN: 0 keeps them pageable (as before 0.1.41), 1 always tries to pin, unset (the default) pins while
+    // the host has kStagePinFloor of RAM to spare beside this buffer (the pool grows to ~257 buffers, 0.4-0.6 GiB):
+    // a low-RAM box keeps pageable ones instead of paying for the pinning (recommend, never force).
+    static const int pin_mode = [] { const char* v = std::getenv("STRATA_STAGE_PIN"); return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0); }();
+    bool want_pin = pin_mode != 0 && !stage_no_pin_.load(std::memory_order_relaxed);
+    if (pin_mode < 0 && want_pin) {
+        uint64_t avail = 0;
+        want_pin = STAGE_PIN_DEFAULT && available_memory_bytes(avail) && avail >= (uint64_t) stage_blob_ + kStagePinFloor;
+    }
+    void* p = nullptr;
+    cudaError_t pin_err = cudaSuccess;
+    if (want_pin) pin_err = cudaHostAlloc(&p, (size_t) stage_blob_, cudaHostAllocDefault);
+    const bool pinned = want_pin && pin_err == cudaSuccess && p != nullptr;
+    if (!pinned) (void) cudaGetLastError();   // the failed alloc's sticky error is ours, not the caller's
+    uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) stage_blob_];
+    if (raw == nullptr) return SIZE_MAX;
+    stage_buf_.emplace_back(raw, StageBufFree{pinned});
+    stage_idx_[raw] = stage_buf_.size() - 1;
+    stage_ev_.push_back(nullptr);
+    stage_ev_live_.push_back(0);
+    if (pinned && !stage_pin_said_) {
+        stage_pin_said_ = true;
+        std::fprintf(stderr, "FileExpertSource: the stage buffers are pinned (cudaHostAlloc)\n");
+    } else if (!pinned && want_pin && !stage_pin_failed_said_) {
+        stage_pin_failed_said_ = true;
+        std::fprintf(stderr, "FileExpertSource: cudaHostAlloc failed for a stage buffer (%s) - pageable it is\n",
+                     cudaGetErrorString(pin_err));
+    }
+    stage_key_.push_back(-1);
+    stage_epoch_.push_back(0);
+    stage_used_.push_back(0);
+    stage_used_d_.push_back(0);
+    stage_used_p_.push_back(0);
+    stage_busy_.push_back(0);
+    stage_pf_.push_back(0);
+    if (stage_buf_.size() == 512 && !stage_grew_) {
+        stage_grew_ = true;
+        std::fprintf(stderr, "FileExpertSource: %zu blobs assembled from the GGUF are in use at once (%.2f GiB)\n",
+                     stage_buf_.size(), (double) stage_buf_.size() * (double) stage_blob_ / 1073741824.0);
+    }
+    return v;
+}
+
+void FileExpertSource::stage_reserve(size_t n) {
+    if (stage_blob_ == 0) return;
+    std::lock_guard<std::mutex> lk(stage_mu_);
+    while (stage_buf_.size() < n)
+        if (stage_add_locked() == SIZE_MAX) break;
+}
+
 bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahead) {
     constexpr uint64_t kStageSeq = 256;
     const uint64_t seq = ++stage_seq_;
@@ -1843,49 +1900,8 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
             v = i;
         }
     if (v == stage_buf_.size()) {
-        // Pinned, where the driver allows: a stage buffer is the source of the cache fill's cudaMemcpyAsync,
-        // and a pageable source is staged through the driver's bounce buffer - an extra copy at a fraction of
-        // the transfer rate, on the calling thread.  A failure falls back to pageable for this buffer.
-        // STRATA_STAGE_PIN: 0 keeps them pageable (as before 0.1.41), 1 always tries to pin, unset (the default) pins while
-        // the host has kStagePinFloor of RAM to spare beside this buffer (the pool grows to ~257 buffers, 0.4-0.6 GiB):
-        // a low-RAM box keeps pageable ones instead of paying for the pinning (recommend, never force).
-        static const int pin_mode = [] { const char* v = std::getenv("STRATA_STAGE_PIN"); return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0); }();
-        bool want_pin = pin_mode != 0;
-        if (pin_mode < 0) {
-            uint64_t avail = 0;
-            want_pin = STAGE_PIN_DEFAULT && available_memory_bytes(avail) && avail >= (uint64_t) stage_blob_ + kStagePinFloor;
-        }
-        void* p = nullptr;
-        cudaError_t pin_err = cudaSuccess;
-        if (want_pin) pin_err = cudaHostAlloc(&p, (size_t) stage_blob_, cudaHostAllocDefault);
-        const bool pinned = want_pin && pin_err == cudaSuccess && p != nullptr;
-        if (!pinned) (void) cudaGetLastError();   // the failed alloc's sticky error is ours, not the caller's
-        uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) stage_blob_];
-        if (raw == nullptr) return false;
-        stage_buf_.emplace_back(raw, StageBufFree{pinned});
-        stage_idx_[raw] = stage_buf_.size() - 1;
-        stage_ev_.push_back(nullptr);
-        stage_ev_live_.push_back(0);
-        if (pinned && !stage_pin_said_) {
-            stage_pin_said_ = true;
-            std::fprintf(stderr, "FileExpertSource: the stage buffers are pinned (cudaHostAlloc)\n");
-        } else if (!pinned && want_pin && !stage_pin_failed_said_) {
-            stage_pin_failed_said_ = true;
-            std::fprintf(stderr, "FileExpertSource: cudaHostAlloc failed for a stage buffer (%s) - pageable it is\n",
-                         cudaGetErrorString(pin_err));
-        }
-        stage_key_.push_back(-1);
-        stage_epoch_.push_back(0);
-        stage_used_.push_back(0);
-        stage_used_d_.push_back(0);
-        stage_used_p_.push_back(0);
-        stage_busy_.push_back(0);
-        stage_pf_.push_back(0);
-        if (stage_buf_.size() == 512 && !stage_grew_) {
-            stage_grew_ = true;
-            std::fprintf(stderr, "FileExpertSource: %zu blobs assembled from the GGUF are in use at once (%.2f GiB)\n",
-                         stage_buf_.size(), (double) stage_buf_.size() * (double) stage_blob_ / 1073741824.0);
-        }
+        v = stage_add_locked();
+        if (v == SIZE_MAX) return false;
     } else {
         stage_of_.erase(stage_key_[v]);
         if (stage_pf_[v]) { stage_pf_[v] = 0; io_pf_unused_.fetch_add(1, std::memory_order_relaxed); }   // read ahead, never asked for

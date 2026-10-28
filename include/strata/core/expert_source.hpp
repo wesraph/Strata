@@ -917,6 +917,13 @@ public:
     /// The calling thread hands blobs out as consumer `cid` from now on: 0 the decode (the default), 1 the thread
     /// reading a prompt beside the decoding slots (see stage_cid_).
     static void set_stage_consumer(int cid) { stage_cid_ = cid; }
+    /// The pool of assembled blobs grows to at least `n` buffers now, pinned where the driver allows: called with
+    /// nothing in flight before a prompt is read beside the decoding slots, so that no thread of that read ever
+    /// allocates (claim_stage's cudaHostAlloc takes the driver's lock and can wait for the device: upstream's #31).
+    void stage_reserve(size_t n);
+    /// While on, a buffer the pool still has to add is pageable (new[], no driver call): the read beside the slots.
+    void set_stage_no_pin(bool on) { stage_no_pin_.store(on, std::memory_order_relaxed); }
+    size_t stage_buffers() const { return stage_buf_.size(); }
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
     int64_t prefetch_begin(int64_t layer, const int64_t* experts, int64_t n, uint8_t* pending) override;
@@ -989,6 +996,7 @@ private:
     bool open_gguf(std::string& err);
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
+    size_t stage_add_locked();   ///< one more buffer (stage_mu_ held), SIZE_MAX on failure
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
     void publish_stage(size_t v, int64_t layer, bool ok, double us);
     struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
@@ -1110,6 +1118,7 @@ private:
     // a buffer the decode's CPU workers are still reading (the global sequence did: one thread at a time was
     // the rule before).  A buffer is a victim only when every consumer that touched it has moved on.
     static thread_local int stage_cid_;
+    std::atomic<bool> stage_no_pin_{false};        ///< set_stage_no_pin: new buffers pageable (no cudaHostAlloc)
     uint64_t stage_seq_d_ = 0, stage_seq_p_ = 0;     ///< hand-outs per consumer
     std::vector<uint64_t> stage_used_d_, stage_used_p_;   ///< per buffer: that consumer's last hand-out (0: never)
     std::vector<char> stage_busy_;            ///< being filled (outside stage_mu_): never a victim

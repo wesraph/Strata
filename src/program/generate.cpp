@@ -10812,6 +10812,19 @@ int main(int argc, char** argv) {
         } kvshs;
         strata::core::PageCache kv_pages;   ///< the pool's pages: free, cached (keyed), or pinned by sessions
         const int64_t kvsh_ps = strata::kernels::qsa_real_shapes().page_size;
+        // The pool's device copies (the swap out and in, a page copy, a table upload) go on a non-blocking stream
+        // of their own per pool range and are waited for on that stream alone.  On the legacy default stream,
+        // finished with cudaDeviceSynchronize, they ordered against every blocking stream of the card: issued
+        // from the pump while a prompt was read beside the slots (STRATA_PIPED_CONCURRENT), that wedged the
+        // reader's cross-stream waits - both cards idle, a stream synchronize that never returned (cuda-gdb,
+        // 2026-10-28).  The pages a copy touches belong to no running session, so no wider order is needed.
+        std::vector<cudaStream_t> kvsh_streams;
+        auto kvsh_stream_for = [&](size_t r) -> cudaStream_t {   // (the caller has set the device of range r)
+            if (r >= kvsh_streams.size()) kvsh_streams.resize(r + 1, nullptr);
+            if (kvsh_streams[r] == nullptr && cudaStreamCreateWithFlags(&kvsh_streams[r], cudaStreamNonBlocking) != cudaSuccess)
+                kvsh_streams[r] = nullptr;
+            return kvsh_streams[r];
+        };
         // one session entry per batch session whether the pool is on or not: the serve loop reads the main
         // session's mapping sizes (kvsh_held, kvsh_skip, the restore's cached count) without asking first, and
         // with the pool off those must read as empty, not as sess[0] of an empty table (a null data pointer:
@@ -10890,11 +10903,11 @@ int main(int argc, char** argv) {
                                     while (e + 1 < k && victims[order[e + 1]].first == victims[order[e]].first + 1) ++e;
                                     const size_t n = e + 1 - i;
                                     ok = cudaMemcpyAsync(slice + i * per, base + (uint64_t) victims[order[i]].first * per, n * per,
-                                                         cudaMemcpyDeviceToHost, nullptr) == cudaSuccess;
+                                                         cudaMemcpyDeviceToHost, kvsh_stream_for(r)) == cudaSuccess;
                                     i = e + 1;
                                 }
                             }
-                        if (ok) ok = cudaDeviceSynchronize() == cudaSuccess;
+                        if (ok) ok = cudaStreamSynchronize(kvsh_stream_for(r)) == cudaSuccess;
                         if (!ok) break;
                         for (int64_t j = 0; j < kvsh_q_n[r]; ++j)
                             for (int64_t a = 0; a < kvsh_lay.arrays; ++a) {
@@ -10949,11 +10962,11 @@ int main(int argc, char** argv) {
                                     while (e + 1 < k && pairs[order[e + 1]].second == pairs[order[e]].second + 1) ++e;
                                     const size_t n = e + 1 - i;
                                     ok = cudaMemcpyAsync(base + (uint64_t) pairs[order[i]].second * per, slice + i * per, n * per,
-                                                         cudaMemcpyHostToDevice, nullptr) == cudaSuccess;
+                                                         cudaMemcpyHostToDevice, kvsh_stream_for(r)) == cudaSuccess;
                                     i = e + 1;
                                 }
                             }
-                        if (ok) ok = cudaDeviceSynchronize() == cudaSuccess;
+                        if (ok) ok = cudaStreamSynchronize(kvsh_stream_for(r)) == cudaSuccess;
                     }
                     if (!ok) {
                         std::fprintf(stderr, "kvshare-swap: the batched copy in failed\n");
@@ -10970,19 +10983,20 @@ int main(int argc, char** argv) {
         auto kvsh_apply = [&](size_t si) {
             if (!kvsh || si >= kvshs.sess.size() || kvshs.sess[si].table.empty()) return;
             const std::vector<int32_t>& tab = kvshs.sess[si].table;
-            auto put = [&](strata::core::SessionState& s, int dev) {
+            auto put = [&](strata::core::SessionState& s, size_t r, int dev) {
                 const strata::core::OnDevice on_k(dev);
+                cudaStream_t cs = kvsh_stream_for(r);
                 for (int64_t j = 0; j < s.qsa_alloc; ++j)
-                    strata::core::qsa_state_set_table(s.qsa_states[s.qsa_ord0 + j], g, tab.data(), nullptr);
+                    strata::core::qsa_state_set_table(s.qsa_states[s.qsa_ord0 + j], g, tab.data(), cs);
+                cudaStreamSynchronize(cs);   // (the table's host copy may change right after this call)
             };
             if (si > 0) {   // a batch slot: its session on every stage
                 for (size_t k = 0; k < bslot_ss.size(); ++k)
-                    put(*bslot_ss[k][si - 1], k == 0 ? 0 : stages[k - 1]->dev);
+                    put(*bslot_ss[k][si - 1], k, k == 0 ? 0 : stages[k - 1]->dev);
             } else {
-                put(ss, 0);
-                for (size_t k = 0; k < stages.size(); ++k) put(stages[k]->ss, stages[k]->dev);
+                put(ss, 0, 0);
+                for (size_t k = 0; k < stages.size(); ++k) put(stages[k]->ss, k + 1, stages[k]->dev);
             }
-            cudaDeviceSynchronize();
         };
         // a session's conversation leaves: its cached pins open, its own pages go to the cache (keyed) or
         // the free set; the device table is left as it was (nothing reads it until the next admission)
@@ -11003,10 +11017,10 @@ int main(int argc, char** argv) {
                         if (per == 0) continue;
                         uint8_t* base = (uint8_t*) kvsh_base[k] + (uint64_t) j * kvsh_lay.stride + kvsh_lay.arr_off[(size_t) a];
                         if (cudaMemcpyAsync(base + (uint64_t) to * per, base + (uint64_t) from * per, (size_t) per,
-                                            cudaMemcpyDeviceToDevice, nullptr) != cudaSuccess)
+                                            cudaMemcpyDeviceToDevice, kvsh_stream_for(k)) != cudaSuccess)
                             return false;
                     }
-                if (cudaDeviceSynchronize() != cudaSuccess) return false;
+                if (cudaStreamSynchronize(kvsh_stream_for(k)) != cudaSuccess) return false;
             }
             return true;
         };
@@ -16504,6 +16518,21 @@ int main(int argc, char** argv) {
                     // flight (on the reader's thread a capture, an allocation or a free takes the driver's lock and
                     // can wait for the device, #31)
                     if (use_mtp && !mtp.reserve_prefill(C, e)) return false;
+                    // a staged expert source (STRATA_PIPED_CONCURRENT_STAGED): its pool of assembled blobs is sized
+                    // here, with nothing in flight, so no thread of the read ever allocates a pinned buffer (the
+                    // driver's lock; #31), and what it still has to add during the read is pageable
+                    if (srcp == &src && src.stages_blobs()) {
+                        static const size_t reserve_n = [] {
+                            const char* v = std::getenv("STRATA_PIPED_CONCURRENT_STAGE_BUFS");
+                            return (size_t) std::max(64, v != nullptr ? std::atoi(v) : 768);
+                        }();
+                        if (src.stage_buffers() < reserve_n) {
+                            src.stage_reserve(reserve_n);
+                            std::fprintf(stderr, "strata batch: the staged blob pool holds %zu buffers for the reads beside the slots\n",
+                                         src.stage_buffers());
+                        }
+                        src.set_stage_no_pin(true);
+                    }
                     if (!sp.reserve_uploads(C))
                         std::fprintf(stderr, "strata batch: the prompt path's pinned upload slots could not be "
                                              "reserved (they grow at first use)\n");
@@ -16690,6 +16719,7 @@ int main(int argc, char** argv) {
                         reader.join();   // (a failed window leaves the read to finish: it is not stopped mid-run)
                         sp.stop_at_chunk = nullptr;
                         in_prompt_read = false;
+                        if (srcp == &src) src.set_stage_no_pin(false);
                         if (!pump_ok || !pipe_drain()) {
                             batch_fatal = true;
                             e = "a pipelined batch window failed";
