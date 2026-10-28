@@ -10812,8 +10812,12 @@ int main(int argc, char** argv) {
         } kvshs;
         strata::core::PageCache kv_pages;   ///< the pool's pages: free, cached (keyed), or pinned by sessions
         const int64_t kvsh_ps = strata::kernels::qsa_real_shapes().page_size;
+        // one session entry per batch session whether the pool is on or not: the serve loop reads the main
+        // session's mapping sizes (kvsh_held, kvsh_skip, the restore's cached count) without asking first, and
+        // with the pool off those must read as empty, not as sess[0] of an empty table (a null data pointer:
+        // the stock-model arm of the agent benchmark died on every park restore, 2026-10-27)
+        kvshs.sess.assign((size_t) (1 + std::max<int>(o.batch, 0)), {});
         if (kvsh) {
-            kvshs.sess.assign((size_t) (1 + std::max<int>(o.batch, 0)), {});
             if (kvsh_pages_per_extent > 1 && !kvsh_range.empty()) {
                 // extent e of the page space = chunk j*cpl+e inside EVERY layer j's slice of EVERY device's
                 // range (all devices share the page ids; each holds its own layers).  A map failure part way
