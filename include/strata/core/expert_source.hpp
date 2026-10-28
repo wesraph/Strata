@@ -914,6 +914,9 @@ public:
     bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
     /// CS-T: advances the assembled blobs' age (see staged_blob).
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
+    /// The calling thread hands blobs out as consumer `cid` from now on: 0 the decode (the default), 1 the thread
+    /// reading a prompt beside the decoding slots (see stage_cid_).
+    static void set_stage_consumer(int cid) { stage_cid_ = cid; }
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
     int64_t prefetch_begin(int64_t layer, const int64_t* experts, int64_t n, uint8_t* pending) override;
@@ -1099,7 +1102,16 @@ private:
     std::mutex stage_mu_;
     std::vector<std::unique_ptr<uint8_t[], StageBufFree>> stage_buf_;
     std::vector<int64_t> stage_key_;
-    std::vector<uint64_t> stage_epoch_, stage_used_;
+    std::vector<uint64_t> stage_epoch_, stage_used_;   ///< stage_used_: the last touch by anyone (victim order)
+    // Two consumers hand blobs out of this pool at once when a prompt is read beside the decoding slots
+    // (STRATA_PIPED_CONCURRENT): the decode (its doorbell thread, the fetch and read-ahead threads: consumer 0,
+    // the default) and the prompt reader's thread (consumer 1, set_stage_consumer).  Each consumer ages the
+    // buffers it asked for on its own clock, so the reader's thousands of hand-outs per chunk can never retire
+    // a buffer the decode's CPU workers are still reading (the global sequence did: one thread at a time was
+    // the rule before).  A buffer is a victim only when every consumer that touched it has moved on.
+    static thread_local int stage_cid_;
+    uint64_t stage_seq_d_ = 0, stage_seq_p_ = 0;     ///< hand-outs per consumer
+    std::vector<uint64_t> stage_used_d_, stage_used_p_;   ///< per buffer: that consumer's last hand-out (0: never)
     std::vector<char> stage_busy_;            ///< being filled (outside stage_mu_): never a victim
     std::condition_variable stage_cv_;
     int fetch_threads_ = 8;

@@ -1593,6 +1593,8 @@ void FileExpertSource::close() {
         stage_key_.clear();
         stage_epoch_.clear();
         stage_used_.clear();
+        stage_used_d_.clear();
+        stage_used_p_.clear();
         stage_busy_.clear();
         stage_pf_.clear();
         stage_of_.clear();
@@ -1803,15 +1805,29 @@ void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
 //
 // `claim_stage` finds or reserves the buffer of `key` (stage_mu_ held): true when the blob is already there (or
 // being filled by another thread - the caller then waits), false when the caller must fill buffer `v`.
+thread_local int FileExpertSource::stage_cid_ = 0;
+
 bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahead) {
     constexpr uint64_t kStageSeq = 256;
     const uint64_t seq = ++stage_seq_;
+    const int cid = stage_cid_;
+    const uint64_t cseq = cid == 0 ? ++stage_seq_d_ : ++stage_seq_p_;
+    // this consumer has moved on from buffer i: never touched it, or kStageAge layers (the decode's clock) or
+    // kStageSeq of its own hand-outs have passed since
+    auto moved_on = [&](size_t i) {
+        const bool d = stage_used_d_[i] == 0 || stage_epoch_[i] + kStageAge <= epoch_ || stage_used_d_[i] + kStageSeq <= stage_seq_d_;
+        const bool p = stage_used_p_[i] == 0 || stage_used_p_[i] + kStageSeq <= stage_seq_p_;
+        return d && p;
+    };
+    auto stamp = [&](size_t i) {
+        stage_used_[i] = seq;
+        if (cid == 0) { stage_epoch_[i] = epoch_; stage_used_d_[i] = cseq; } else stage_used_p_[i] = cseq;
+    };
     auto it = stage_of_.find(key);
     fill = false;
     if (it != stage_of_.end()) {
         v = it->second;
-        stage_epoch_[v] = epoch_;
-        stage_used_[v] = seq;
+        stamp(v);
         if (!ahead && stage_pf_[v]) {   // a layer asked for what was read ahead
             stage_pf_[v] = 0;
             io_pf_used_.fetch_add(1, std::memory_order_relaxed);
@@ -1822,8 +1838,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
     v = stage_buf_.size();
     uint64_t oldest = std::numeric_limits<uint64_t>::max();
     for (size_t i = 0; i < stage_buf_.size(); ++i)
-        if (!stage_busy_[i] && (stage_epoch_[i] + kStageAge <= epoch_ || stage_used_[i] + kStageSeq <= seq) &&
-            stage_used_[i] < oldest) {
+        if (!stage_busy_[i] && moved_on(i) && stage_used_[i] < oldest) {
             oldest = stage_used_[i];
             v = i;
         }
@@ -1862,6 +1877,8 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         stage_key_.push_back(-1);
         stage_epoch_.push_back(0);
         stage_used_.push_back(0);
+        stage_used_d_.push_back(0);
+        stage_used_p_.push_back(0);
         stage_busy_.push_back(0);
         stage_pf_.push_back(0);
         if (stage_buf_.size() == 512 && !stage_grew_) {
@@ -1887,8 +1904,8 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
         }
     }
     stage_key_[v] = key;
-    stage_epoch_[v] = epoch_;
-    stage_used_[v] = seq;
+    stage_used_d_[v] = stage_used_p_[v] = 0;   // a fresh blob: only its claimant has touched it
+    stamp(v);
     stage_busy_[v] = 1;
     stage_of_[key] = v;
     fill = true;
@@ -2650,6 +2667,8 @@ bool FileExpertSource::end_startup_unbuffered(std::string& why) {
         stage_key_.clear();
         stage_epoch_.clear();
         stage_used_.clear();
+        stage_used_d_.clear();
+        stage_used_p_.clear();
         stage_busy_.clear();
         stage_pf_.clear();
         stage_of_.clear();

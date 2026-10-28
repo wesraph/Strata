@@ -250,9 +250,13 @@ so the slots never wait for the read and the read is one run with no drain insid
   there, the pipeline is drained and the part read waits in a slot, as off the pipeline. A read nobody waits for is not cut.
 - Off, said once, where the read's thread would allocate or free (`STRATA_PREFILL_HELP=1`, `STRATA_SPLIT_MTP_BATCH=1`),
   where serving a doorbell makes a CUDA call (`--pcie-mode dma`, `STRATA_FS_SLOTS`, the helper caches
-  `--expert-cache-device1..3`), and with an expert source that hands out buffers it recycles (the GGUF in place, an
-  unbuffered source, `STRATA_IO_PREFETCH`): the experts come from the RAM arena or the mapped file. A prompt with
-  pictures is read the usual way.
+  `--expert-cache-device1..3`), and with an expert source that stages its blobs (the GGUF in place, an unbuffered
+  source, `STRATA_IO_PREFETCH`): the experts come from the RAM arena or the mapped file. The pool of assembled blobs
+  now ages what each consumer asked for on that consumer's own clock (the reader's thread, the decode's doorbell
+  and read-ahead threads), so a reader beside the slots no longer retires a buffer the decode still reads;
+  `STRATA_PIPED_CONCURRENT_STAGED=1` tries the mode with such a source, but on 2x RTX 3090 with three agents it
+  still hung within minutes (the prompt chunk waiting for the GPU, a window waiting for its doorbell), so it
+  stays off by itself. A prompt with pictures is read the usual way.
 
 One log line per read (`strata batch: read N tokens on a thread of its own in X ms (concurrent, to Q of T); the slots
 decoded R rows meanwhile (S rows/s; stage k: W windows, H ms host each)`). Built for CUDA and HIP (HIP keeps the default

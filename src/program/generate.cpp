@@ -16484,7 +16484,13 @@ int main(int argc, char** argv) {
                     // (--remote-expert-opt works only through a helper cache, so without one it does not count)
                     s.helper_caches = prefill_src != srcp;
                     for (int r = 0; r < 3; ++r) s.helper_caches |= o.expert_cache_remote[(size_t) r] > 0;
-                    s.staged_source = srcp == &src && src.stages_blobs();
+                    // The staged pool hands blobs out per consumer now (FileExpertSource::stage_cid_), so the GGUF in
+                    // place no longer corrupts a read beside the slots - but on 2x RTX 3090 with three agents the mode
+                    // still hung twice in five minutes (the prompt chunk waiting for the GPU at a mid layer, the stage
+                    // threads on its events, the doorbell thread asleep between windows: a window spinning for a
+                    // doorbell starves the prompt's kernels, upstream's #31 pattern).  Until that is found, a staged
+                    // source keeps the mode off unless STRATA_PIPED_CONCURRENT_STAGED=1 asks for it (a debugging opt-in).
+                    s.staged_source = srcp == &src && src.stages_blobs() && !env_on("STRATA_PIPED_CONCURRENT_STAGED");
                     s.other_source = srcp != &src && srcp != &arena_src;
                     if (const char* why = strata::program::concurrent_read_off(s)) {
                         std::fprintf(stderr, "strata batch: STRATA_PIPED_CONCURRENT is off beside %s\n", why);
@@ -16629,6 +16635,7 @@ int main(int argc, char** argv) {
                         in_prompt_read = true;
                         sp.stop_at_chunk = [&] { return want_yield.load(std::memory_order_acquire) >= 0; };
                         std::thread reader([&] {
+                            strata::core::FileExpertSource::set_stage_consumer(1);   // its blob hand-outs age on their own clock
                             conc_thread_cpus();
                             try {   // (an exception leaving a std::thread ends the process: a failed read instead)
                                 if (planned) sp.force_chunk(plan.chunk, plan_single, plan.chunked);

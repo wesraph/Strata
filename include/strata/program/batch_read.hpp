@@ -48,7 +48,7 @@ inline const char* concurrent_read_off(const ConcurrentReadSetup& s) {
     if (s.pcie_dma) return "--pcie-mode dma";
     if (s.helper_caches) return "the helper caches (--expert-cache-device1..3)";
     if (s.staged_source)
-        return "an expert source that stages its blobs (the GGUF in place, unbuffered, STRATA_IO_PREFETCH)";
+        return "an expert source that stages its blobs (the GGUF in place, unbuffered, STRATA_IO_PREFETCH; STRATA_PIPED_CONCURRENT_STAGED=1 tries it anyway)";
     if (s.other_source) return "this expert source";
     return nullptr;
 }
