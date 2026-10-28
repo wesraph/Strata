@@ -70,6 +70,10 @@ and tool waits included - what an agent experiences.
 The agents choose their own tool calls (temperature 0.6), so two runs of the same arm do different work: the
 aggregate moves with how many long modules the run happened to write, the decode and the hit rate do not.
 
+Two pipelined proposals per slot (`STRATA_PIPED_MTP=2`) pay on this traffic: three of four proposals are accepted
+when agents write code, and the same build measured 85 tok/s aggregate at two agents and 72 tok/s at three (67-83
+and 30-67 tok/s on the long answers), unchanged at one. It is the setting the fork's own config runs.
+
 Prefill is unchanged (about 3.6K tok/s for 46K to 237K-token first reads). The three-agent aggregate is even
 because three different coding tasks keep the engine's prompt path and expert reads busy either way; the pool's
 gain there is the hit rate: upstream's model carves four 262K sessions out of VRAM up front and keeps 3,805 expert
