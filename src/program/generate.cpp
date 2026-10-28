@@ -11418,6 +11418,21 @@ int main(int argc, char** argv) {
         // failed): a request cancelled here keeps them as the live conversation instead of dropping what it restored
         bool pp_exact = false;
         Clock::time_point pp_t0 = Clock::now();
+        // THE STATS LINE (STRATA_STATS_EVERY_S, 1 s; 0 off), as vLLM's: over the last interval the prompt tokens
+        // read and the tokens generated as rates, the slots running and reading, the expert cache's hit rate and
+        // the pool's use.  Printed while something happens; one line says idle, then nothing until the next token.
+        const double stats_every_s = [] { const char* v = std::getenv("STRATA_STATS_EVERY_S"); return v != nullptr ? std::atof(v) : 1.0; }();
+        int64_t stats_pp = 0, stats_tg = 0;              // tokens since the last line
+        int64_t stats_pp_pos = 0;                        // the last PP position, and the read it belongs to
+        Clock::time_point stats_pp_t0{};
+        std::function<void()> stats_tick;                // defined beside the pump (it reads the slots and the drive)
+        auto stats_pp_add = [&](int64_t pos) {           // a PP line: the fresh tokens since the last one of this read
+            const int64_t from = pp_t0 == stats_pp_t0 ? std::max(stats_pp_pos, pp_from) : pp_from;
+            if (pos > from) stats_pp += pos - from;
+            stats_pp_pos = pos;
+            stats_pp_t0 = pp_t0;
+            if (stats_tick) stats_tick();
+        };
         // #879: this request met a window whose head logits were not all finite (nonfinite_hit): it ends with
         // DONE ... nonfinite, emitting none of that window's tokens
         bool nf_hit = false;
@@ -11674,6 +11689,7 @@ int main(int argc, char** argv) {
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
                         ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
+            stats_pp_add(done);
             strata::core::progress_at("reading the prompt (batched), done up to token", done);
             strata::core::progress_beat();
             std::fflush(stdout);
@@ -13965,6 +13981,7 @@ int main(int argc, char** argv) {
                     sl.ids.push_back(tok[first[t] + j]);
                     std::printf("BT %d %d\n", b, (int) y);
                     ++sl.produced;
+                    ++stats_tg;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
@@ -14217,6 +14234,7 @@ int main(int argc, char** argv) {
                     const int32_t y = outb[blk.f + j];
                     std::printf("BT %d %d\n", blk.b, (int) y);
                     ++sl.produced;
+                    ++stats_tg;
                     ++bt_rows;
                     ++pipe_rows;
                     const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
@@ -14306,8 +14324,54 @@ int main(int argc, char** argv) {
         // point).  stage_batch writes keep-all commit words for every window it launches, so a commit graph queued
         // earlier would read clobbered words at execution: running the queue before the next launch keeps them
         // valid, and the group's next window queues behind its commit on every stream.
+        bool kvsh_need_quiet = false;        // a slot outgrew the reserve under a window in flight: empty the pipeline, refill
+        bool kvsh_quiet_failed = false;      // ... and the refill brought nothing (the pool is full until the extents change)
+        int64_t kvsh_quiet_failed_ext = -1;
+        int64_t stats_hits0 = drive.d.cache_hits, stats_miss0 = drive.d.multi_misses;
+        Clock::time_point stats_t = Clock::now();
+        bool stats_idle_said = false;
+        stats_tick = [&]() {
+            if (stats_every_s <= 0.0) return;
+            const auto now = Clock::now();
+            const double sec = std::chrono::duration<double>(now - stats_t).count();
+            if (sec < stats_every_s) return;
+            int running = 0;
+            for (const BSlot& sb : bs) running += sb.active ? 1 : 0;
+            const int reading = in_prompt_read ? 1 : 0;
+            const int64_t hits = drive.d.cache_hits - stats_hits0, miss = drive.d.multi_misses - stats_miss0;
+            const bool busy = stats_pp > 0 || stats_tg > 0 || running > 0 || reading > 0;
+            if (busy || !stats_idle_said) {
+                char hit[32] = "-", pool[160] = "";
+                if (hits + miss > 0) std::snprintf(hit, sizeof hit, "%.1f%%", 100.0 * (double) hits / (double) (hits + miss));
+                if (kvsh && kv_pages.total() > 0) {
+                    const double T = (double) kv_pages.total();
+                    const int64_t mapped = kvsh_pages_per_extent > 0
+                                               ? std::min<int64_t>(kv_pages.total(), kv_pages.mapped_extents() * kvsh_pages_per_extent)
+                                               : kv_pages.total();
+                    std::snprintf(pool, sizeof pool, ", K/V pool %.1f%% live, %.1f%% cached, %.1f%% mapped",
+                                  100.0 * (double) kv_pages.pinned_count() / T, 100.0 * (double) kv_pages.evictable_count() / T,
+                                  100.0 * (double) mapped / T);
+                }
+                std::fprintf(stderr, "strata serve: stats: %sprompt %.1f tok/s, generation %.1f tok/s, running %d, reading %d, "
+                                     "expert cache %s hit%s\n", busy ? "" : "idle: ", (double) stats_pp / sec,
+                             (double) stats_tg / sec, running, reading, hit, pool);
+                stats_idle_said = !busy;
+            }
+            stats_pp = stats_tg = 0;
+            stats_hits0 = drive.d.cache_hits;
+            stats_miss0 = drive.d.multi_misses;
+            stats_t = now;
+        };
         auto pump = [&](bool may_start) -> bool {
             ++pipe_tick;
+            stats_tick();
+            if (kvsh_need_quiet && !pipe_inflight()) {   // the pipeline emptied for a slot's growth: the reserve refills
+                const int64_t free0 = kv_pages.free_count();
+                if (kvsh_topup) kvsh_topup();
+                kvsh_quiet_failed = kv_pages.free_count() <= free0;
+                kvsh_quiet_failed_ext = kv_pages.mapped_extents();
+                kvsh_need_quiet = false;
+            }
             if (bt_windows == 0 && !pipe_inflight()) {
                 bt_start = Clock::now();
                 bt_wait0 = ver.ms_wait; bt_pool0 = ver.ms_pool;
@@ -14345,6 +14409,7 @@ int main(int argc, char** argv) {
                     const int32_t y = outb[t];
                     std::printf("BT %d %d\n", gi * GS + t, (int) y);
                     ++sl.produced;
+                    ++stats_tg;
                     ++bt_rows;
                     ++pipe_rows;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
@@ -14387,6 +14452,7 @@ int main(int argc, char** argv) {
                     if (pick < 0) continue;
                 } else {
                     if (!may_start || pa_due()) continue;   // STRATA_PIPE_ADAPT_EVERY: a round is due, the pipeline empties first
+                    if (kvsh_need_quiet) continue;          // a slot's growth waits for an empty pipeline (the reserve refills there)
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
                         if (pg[(size_t) gi].inflight || !group_active(gi)) continue;
@@ -14419,14 +14485,24 @@ int main(int argc, char** argv) {
                             if (kvsh) {
                                 const size_t si = (size_t) b + 1;
                                 const int64_t want = sl.p + 1 + pm_drafts + 8;
-                                if (kvshs.sess[si].mapped() * kvsh_ps < want &&
-                                    !kvsh_extend(si, want + 4096) && !kvsh_extend(si, want)) {
-                                    // another group's window is in flight: the cache lends nothing now (a quiesce
-                                    // would wait on that window), so the slot sits this window out and asks again
-                                    // at the next build - a quiet one serves it.  With nothing in flight the pool
-                                    // is simply full: the answer ends after this window (length).
-                                    if (pipe_inflight()) continue;
-                                    bs[(size_t) b].max_new = bs[(size_t) b].produced;
+                                if (kvshs.sess[si].mapped() * kvsh_ps < want && !kvsh_extend(si, want + 4096)) {
+                                    // the extension ahead found no pages.  Another group's window is in flight,
+                                    // so the cache lends nothing now (a quiesce would wait on that window), and
+                                    // under steady decoding a group is always in flight: the slot went on by the
+                                    // page or two the pool had left, one per window, until none (measured: 259
+                                    // and 277 "no pages to extend" lines in two 7-minute runs of three agents).
+                                    // Now no new window starts until the pipeline is empty, the reserve refills
+                                    // there (one quiesce, as at a request's drain) and the slot grows at its next
+                                    // window.  When a refill brought nothing the pool is simply full until its
+                                    // extents change: the slot takes what is left, sits out while others fly,
+                                    // and its answer ends after a quiet window (length).
+                                    if (pipe_inflight() && kvsh_xc && !kvsh_share_given &&
+                                        !(kvsh_quiet_failed && kv_pages.mapped_extents() == kvsh_quiet_failed_ext))
+                                        kvsh_need_quiet = true;
+                                    if (!kvsh_extend(si, want)) {
+                                        if (pipe_inflight()) continue;
+                                        bs[(size_t) b].max_new = bs[(size_t) b].produced;
+                                    }
                                 }
                                 kv_room = kvshs.sess[si].mapped() * kvsh_ps - 1 - sl.p;
                             }
@@ -14787,6 +14863,7 @@ int main(int argc, char** argv) {
         };
         for (;;) {
             line_drain_ms = 0.0;
+            stats_tick();
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
@@ -16261,6 +16338,7 @@ int main(int argc, char** argv) {
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
+                stats_pp_add(b);
                 strata::core::progress_beat();
                 std::fflush(stdout);
                 return true;
@@ -16322,6 +16400,7 @@ int main(int argc, char** argv) {
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
+                stats_pp_add(b);
                 strata::core::progress_beat();
                 std::fflush(stdout);
                 return true;
@@ -17293,6 +17372,7 @@ int main(int argc, char** argv) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                     std::printf("PP %lld %lld %.0f %.1f\n", (long long) to, (long long) pp_total, ms,
                                 ms > 0.0 ? 1000.0 * (double) (to - pp_from) / ms : 0.0);
+                    stats_pp_add(to);
                     std::fflush(stdout);
                 }
                 if (!sp_ok) {
@@ -18854,6 +18934,7 @@ int main(int argc, char** argv) {
                     sl.x = x;
                     sl.p = p;
                     sl.produced = 1;
+                    ++stats_tg;
                     sl.max_new = admit_max_new;
                     sl.t0 = Clock::now();
                     sl.ids = live;
