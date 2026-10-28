@@ -12864,7 +12864,10 @@ int main(int argc, char** argv) {
                             return false;
                         }
                     }
-                    if (!lent.empty()) xc_give(k, lent);   // more than it turned out to need
+                    // more than it turned out to need: the cache's spare keeps it for the next take (xc_take serves
+                    // a spare quietly); giving it back mapped it into the cache again, which refilled those slots
+                    // from the profile and lent them back on the next turn - one round trip per agent turn
+                    if (!lent.empty()) { xcl[k].spare.insert(xcl[k].spare.end(), lent.begin(), lent.end()); lent.clear(); }
                     for (int64_t j = 0; j < q_n; ++j)
                         for (int64_t a = 0; a < kvsh_lay.arrays; ++a) {
                             const auto span = kvsh_lay.extent_span(Gr, (size_t) a, e, kvsh_pages_per_extent, cpl);
@@ -13797,7 +13800,7 @@ int main(int argc, char** argv) {
             if (ajob && !in_prompt_read) {
                 const Clock::time_point ta = Clock::now();
                 if (!adapt_tick(false)) {
-                    std::printf("ERR an adaptive refill failed\n");
+                    std::printf("ERR an adaptive refill failed\n"); std::fprintf(stderr, "strata serve: ERR an adaptive refill failed\n");
                     return false;
                 }
                 bt_adapt_wait += std::chrono::duration<double, std::milli>(Clock::now() - ta).count();
@@ -13861,7 +13864,7 @@ int main(int argc, char** argv) {
                           sl.produced + 2 <= sl.max_new && sl.p + 3 <= o.max_context ? 2 : 1;
             }
             if (!(batch_mtp ? ver.commit_slot_prefixes(keep.data(), err) : ver.commit_slots(err))) {
-                std::printf("ERR %s\n", err.c_str());
+                std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                 return false;
             }
             const Clock::time_point w2 = Clock::now();
@@ -13922,7 +13925,7 @@ int main(int argc, char** argv) {
                                         slot_mtp[(size_t) b]->stream()) != cudaSuccess ||
                         !slot_mtp[(size_t) b]->draft(2, outb + first[t], pos[first[t]], keep[b] - 1,
                                                     sl.draft.data(), err)) {
-                        std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str());
+                        std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str()); std::fprintf(stderr, "strata serve: ERR batch MTP slot %d: %s\n", b, err.c_str());
                         return false;
                     }
                     sl.draft_ready = true;
@@ -13934,7 +13937,7 @@ int main(int argc, char** argv) {
                 const Clock::time_point wa = Clock::now();
                 adapt_run.th.join();
                 if (!adapt_run.ok) {
-                    std::printf("ERR an adaptive refill failed\n");
+                    std::printf("ERR an adaptive refill failed\n"); std::fprintf(stderr, "strata serve: ERR an adaptive refill failed\n");
                     return false;
                 }
                 ++bt_adapt_rounds;
@@ -14068,7 +14071,7 @@ int main(int argc, char** argv) {
             if (!pm_drafting[(size_t) b]) return 1;
             for (;;) {
                 const int r = slot_mtp[(size_t) b]->chain_poll(err);
-                if (r < 0) { std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str()); return -1; }
+                if (r < 0) { std::printf("ERR batch MTP slot %d: %s\n", b, err.c_str()); std::fprintf(stderr, "strata serve: ERR batch MTP slot %d: %s\n", b, err.c_str()); return -1; }
                 if (r == 1) break;
                 if (!wait) return 0;
             }
@@ -14119,7 +14122,7 @@ int main(int argc, char** argv) {
             }
             for (int k = 0; k < n_pipe; ++k)
                 if (!stage_verifier(k).batch_commit_rows(G.rows, G.S, G.hbase, keep.data(), G.tok, G.pos, err)) {
-                    std::printf("ERR %s\n", err.c_str());
+                    std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                     return false;
                 }
             // #879: a row with non-finite logits: the slot that owns it ends, nothing of it is emitted
@@ -14198,7 +14201,7 @@ int main(int argc, char** argv) {
                 strata::core::Verifier& vk = stage_verifier(k);
                 const strata::core::OnDevice on_k(vk.device());
                 if (cudaStreamSynchronize(vk.stream()) != cudaSuccess) {
-                    std::printf("ERR a pipelined commit failed on stage %d\n", k + 1);
+                    std::printf("ERR a pipelined commit failed on stage %d\n", k + 1); std::fprintf(stderr, "strata serve: ERR a pipelined commit failed on stage %d\n", k + 1);
                     return false;
                 }
             }
@@ -14244,7 +14247,7 @@ int main(int argc, char** argv) {
                 if (gi < 0) continue;
                 strata::core::Verifier& vk = stage_verifier(k);
                 const int r = vk.batch_poll(win_pool_fn, win_pool_user, err);
-                if (r < 0) { std::printf("ERR %s\n", err.c_str()); return false; }
+                if (r < 0) { std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str()); return false; }
                 if (r == 0) continue;
                 if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
                 stage_group[(size_t) k] = -1;
@@ -14392,7 +14395,7 @@ int main(int argc, char** argv) {
                     // (with the doorbells on their own thread, a failure it set for a window that left this stage is
                     // not cleared unseen)
                     if (conc_serving && drive.d.failed) {
-                        std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed");
+                        std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); std::fprintf(stderr, "strata serve: ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed");
                         return false;
                     }
                     drive.d.failed = false;
@@ -14403,7 +14406,7 @@ int main(int argc, char** argv) {
                 if (batch_telemetry_enabled) stage_in_flight.launch(k, Clock::now());
                 if (!(pmtp ? stage_verifier(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err)
                            : stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err))) {
-                    std::printf("ERR %s\n", err.c_str());
+                    std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                     return false;
                 }
                 stage_group[(size_t) k] = pick;
@@ -14415,13 +14418,13 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
+            if (drive.d.failed) { std::printf("ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); std::fprintf(stderr, "strata serve: ERR %s\n", drive.d.fail ? drive.d.fail : "the expert pool failed"); return false; }
             if (pa_due() && !pipe_inflight()) {   // STRATA_PIPE_ADAPT_EVERY: the pipeline is empty - one round, as batch_step
                 if (pmtp && !pmtp_settle()) return false;   // STRATA_PIPED_MTP: the queued commits and draft chains are done first
                 const Clock::time_point ta = Clock::now();
                 pa_last = pa_windows;
                 if (!adapt()) {
-                    std::printf("ERR an adaptive refill failed\n");
+                    std::printf("ERR an adaptive refill failed\n"); std::fprintf(stderr, "strata serve: ERR an adaptive refill failed\n");
                     return false;
                 }
                 ++pa_rounds;
@@ -14630,7 +14633,7 @@ int main(int argc, char** argv) {
                     const int in_flight = trace ? (int) std::count_if(pg.begin(), pg.end(), [](const PGroup& G) {
                                                       return G.inflight; }) : 0;
                     const auto td = Clock::now();
-                    if (!pipe_drain()) return 1;
+                    if (!pipe_drain()) { std::fprintf(stderr, "strata serve: the serve loop ends: the pipelined drain failed (see the ERR above)\n"); return 1; }
                     if (trace) {   // STRATA_TRACE: what the drain before this line cost (BGEN: an admission's first phase)
                         line_drain_ms = std::chrono::duration<double, std::milli>(Clock::now() - td).count();
                         std::fprintf(stderr, "strata trace: drain for %.*s: %d groups in flight, %.1f ms\n",
@@ -14644,7 +14647,7 @@ int main(int argc, char** argv) {
             } else {
                 // nothing busy: the pipelined drafts' queued commits settle before a slot's state is read or
                 // written from elsewhere (the next line may admit, hand back or save one)
-                if (pmtp && !pmtp_settle()) return 1;
+                if (pmtp && !pmtp_settle()) { std::fprintf(stderr, "strata serve: the serve loop ends: the pipelined drafts did not settle (see the ERR above)\n"); return 1; }
                 if (!next_line(line))
                     break;
             }
@@ -14672,7 +14675,7 @@ int main(int argc, char** argv) {
             // a command may touch the expert cache (a request lends slots, a K/V growth moves them, a session restore
             // quiesces it): a round of the asynchronous tier that the batch windows left in flight lands first
             if (!adapt_tick(true)) {
-                std::printf("ERR an adaptive refill failed\n");
+                std::printf("ERR an adaptive refill failed\n"); std::fprintf(stderr, "strata serve: ERR an adaptive refill failed\n");
                 return 1;
             }
             admit_slot = -1;
@@ -14781,7 +14784,7 @@ int main(int argc, char** argv) {
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
                 if (!ver.wait_commit(err)) {
-                    std::printf("ERR %s\n", err.c_str());
+                    std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                     return 1;
                 }
                 strata::core::SessionFileIdentity id;
@@ -15236,7 +15239,7 @@ int main(int argc, char** argv) {
             // everything below reads, restores or zeroes the session from other streams and the host (the end of the
             // last request waited already; this covers a request that ended on an error path)
             if (!ver.wait_commit(err)) {
-                std::printf("ERR %s\n", err.c_str());
+                std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                 return 1;
             }
             if (o.prefill_head_alias && native_head.loaded()) {
@@ -15559,7 +15562,7 @@ int main(int argc, char** argv) {
                 const bool blocked = conversations.guard_blocked();
                 conversations.unguard();
                 if (!parked_ok) {
-                    std::printf("ERR %s\n", err.c_str());
+                    std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                     return 1;
                 }
                 if (blocked) {
@@ -15571,13 +15574,13 @@ int main(int argc, char** argv) {
                     if (const size_t at = conversations.index_of(parked.serial); at != SIZE_MAX)
                         incoming.emplace(conversations.take(at));
                     if (!park_current(incoming ? incoming->bytes() : 0)) {
-                        std::printf("ERR %s\n", err.c_str());
+                        std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                         return 1;
                     }
                 }
             } else if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && park_worth && !slot_holds_live() &&
                        !park_current(incoming ? incoming->bytes() : 0)) {
-                std::printf("ERR %s\n", err.c_str());
+                std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                 return 1;
             }
             if (slot_source >= 0) {
@@ -16837,7 +16840,7 @@ int main(int argc, char** argv) {
             // 149: how long the request waited for the adaptive round still in flight (in the prompt's time)
             serve_adapt_drain_ms = std::chrono::duration<double, std::milli>(Clock::now() - drain_t0).count();
             if (!drained_ok) {   // --adapt-async: the round in flight lands before the prompt lends any slot
-                std::printf("ERR an adaptive refill failed\n");
+                std::printf("ERR an adaptive refill failed\n"); std::fprintf(stderr, "strata serve: ERR an adaptive refill failed\n");
                 return 1;
             }
             // per-request sampling for the verify window's head (greedy when temperature is absent)
@@ -16855,7 +16858,7 @@ int main(int argc, char** argv) {
             req_sp.penalty_present = req_penalty_present;
             req_sp.counter = 0;
             if (!ver.set_logit_bias(req_bias, err) || (pipe && !ver_b.set_logit_bias(req_bias, err))) {
-                std::printf("ERR %s\n", err.c_str());
+                std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                 return 1;
             }
             ver.set_sampling(req_sp);
@@ -17093,7 +17096,7 @@ int main(int argc, char** argv) {
                 if (!sp_ok) {
                     if (yielded_at < 0 && (batch_fatal || !stop_req.load())) {
                         std::fprintf(stderr, "strata serve: %s\n", err.c_str());
-                        std::printf("ERR %s\n", err.c_str());
+                        std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                         // #224: a CUDA fault (an illegal address) poisons the context for the whole process, and
                         // unwinding the destructors on it could hang until the 60 s watchdog: leave at once
                         if (cudaPeekAtLastError() != cudaSuccess) {
@@ -17325,7 +17328,7 @@ int main(int argc, char** argv) {
             if (pl_want && pl_serial == nullptr && !cancelled && produced_n < max_new) {
                 pl_ran = true;
                 if (!pl_prepare(err)) {
-                    std::printf("ERR %s\n", err.c_str());
+                    std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                     return 1;
                 }
                 struct PW {
@@ -17938,7 +17941,7 @@ int main(int argc, char** argv) {
                 // the odd windows' counters and GPU profiles into the verifiers that report them
                 for (int st = 0; st < n_stages; ++st) stage_ver_p(st, 0).absorb_stats(stage_ver_p(st, 1));
                 if (!pl_adapt_ok) {
-                    std::printf("ERR an adaptive refill failed\n");
+                    std::printf("ERR an adaptive refill failed\n"); std::fprintf(stderr, "strata serve: ERR an adaptive refill failed\n");
                     return 1;
                 }
                 while (mtp.chain_live() && mtp.chain_poll(err) == 0) {}
@@ -17981,7 +17984,7 @@ int main(int argc, char** argv) {
                     if (!prepare_gated_window(proposal, generation, sfx, source_policy, o.suffix_draft > 0,
                                                first_window, room, S_mtp, (int) ver.vocab(), (float) req_spec_min_p,
                                                mtp.spec_q(), drafts.data(), dprob.data(), sbuf.data(), sfx_match, err)) {
-                        std::printf("ERR %s\n", err.c_str()); return 1;
+                        std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str()); return 1;
                     }
                     T = proposal.T; from_sfx = proposal.from_sfx;
                     if (first_window && merge_T > 0) T = merge_T;   // STRATA_ADMIT_MERGE_FIRST: the prompt's last tokens ride in this window
@@ -18198,7 +18201,7 @@ int main(int argc, char** argv) {
                 }
                 if (wt_f) wt_ra1 = Clock::now();
                 if (!adapt_tick(false)) {   // --adapt-async: the round in flight moves on a step when it can
-                    std::printf("ERR an adaptive refill failed\n");
+                    std::printf("ERR an adaptive refill failed\n"); std::fprintf(stderr, "strata serve: ERR an adaptive refill failed\n");
                     return 1;
                 }
                 asw_wait_ms = std::chrono::duration<double, std::milli>(Clock::now() - taw0).count();
@@ -18266,13 +18269,13 @@ int main(int argc, char** argv) {
                     adapt_thr = std::thread([&] { strata::platform::name_this_thread("strata-adapt"); strata::aux_cpus::pin_current_thread(); adapt_ok = adapt(); });
                 if (!ver.commit(a + 1, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
-                    std::printf("ERR %s\n", err.c_str());
+                    std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                     return 1;
                 }
                 if (nonfinite_hit(ver, first_window ? "first decode" : "decode")) {   // #879: none of its tokens goes out
                     if (adapt_thr.joinable()) adapt_thr.join();
                     if (!adapt_ok) {
-                        std::printf("ERR an adaptive refill failed\n");
+                        std::printf("ERR an adaptive refill failed\n"); std::fprintf(stderr, "strata serve: ERR an adaptive refill failed\n");
                         return 1;
                     }
                     finish = "nonfinite";
@@ -18281,7 +18284,7 @@ int main(int argc, char** argv) {
                 // a merged window: the drafter's rows of the prompt tokens in it, as the prompt windows give them
                 if (merged && use_mtp && !mtp.prefill(ver.final_R_all(), window.data() + 1, T - 1, p, err)) {
                     if (adapt_thr.joinable()) adapt_thr.join();
-                    std::printf("ERR %s\n", err.c_str());
+                    std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                     return 1;
                 }
                 // the window's first a + 1 tokens are in the session now (the last output is not: it is next x)
@@ -18344,7 +18347,7 @@ int main(int argc, char** argv) {
                     std::fwrite(&r, sizeof r, 1, wt_f);
                 }
                 if (!adapt_ok) {
-                    std::printf("ERR an adaptive refill failed\n");
+                    std::printf("ERR an adaptive refill failed\n"); std::fprintf(stderr, "strata serve: ERR an adaptive refill failed\n");
                     return 1;
                 }
                 // the session's choice of the adaptive tier (adapt_async_default.hpp): ~64 windows on the blocking tier, then
@@ -18370,7 +18373,7 @@ int main(int argc, char** argv) {
                     }
                 }
                 if (!drafted) {
-                    std::printf("ERR %s\n", err.c_str());
+                    std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                     return 1;
                 }
                 if (gated_proposal && !eos && !initial_round)
@@ -18395,7 +18398,7 @@ int main(int argc, char** argv) {
             if (wt_f) std::fflush(wt_f);
             // the last commit (set_commit_async): the session is complete before anything reads or copies it
             if (!ver.wait_commit(err)) {
-                std::printf("ERR %s\n", err.c_str());
+                std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                 return 1;
             }
             if (dec_timing && dec_windows > 0) {
