@@ -12640,6 +12640,10 @@ int main(int argc, char** argv) {
             int64_t taken = 0, given = 0, evicted = 0, refilled = 0;
         };
         std::vector<XcLoan> xcl;
+        // true while a pipelined group's window is in flight: the cache may not evict then (the quiesce below
+        // would wait on a window that spins for the host, which is busy here - the 60 s hangs of 2026-10-28);
+        // a take serves from the spare and the freeable chunks only, and the caller waits for a quiet moment
+        std::function<bool()> kvsh_pipe_busy;
         bool kvsh_xc = kvsh && kvsh_xc_wanted && !kvsh_range.empty() && !host_res.empty() && srcp != nullptr;
         if (kvsh_xc) {
             for (size_t k = 0; k < kvsh_range.size() && kvsh_xc; ++k) {
@@ -12718,7 +12722,8 @@ int main(int argc, char** argv) {
             // a quiesce (both GPUs drained, an adaptive round, a residency upload) is worth more than one
             // extent: once the cache must lend, it lends for several (the spare serves the next takes quietly)
             const int64_t n_batch = (int64_t) L.spare.size() + freeable() < n ? std::max<int64_t>(n, 48) : n;
-            while ((int64_t) L.spare.size() + freeable() < n_batch && L.lo > L.floor) {
+            const bool busy = kvsh_pipe_busy && kvsh_pipe_busy();   // no eviction (no quiesce) under a window in flight
+            while (!busy && (int64_t) L.spare.size() + freeable() < n_batch && L.lo > L.floor) {
                 if (!quiet) {
                     adapt_quiesce();
                     for (size_t kk = 0; kk < xcl.size(); ++kk) { const strata::core::OnDevice on_q(xcl[kk].dev); cudaDeviceSynchronize(); }
@@ -14038,6 +14043,7 @@ int main(int argc, char** argv) {
         // (the error follows the second group through the pipe) from a hand-off-base bug (it follows base != 0)
         int64_t pipe_tick = 0, rr = std::getenv("STRATA_PIPE_MTP_RR1") != nullptr ? 1 : 0;
         auto pipe_inflight = [&] { for (const PGroup& x : pg) if (x.inflight) return true; return false; };
+        kvsh_pipe_busy = pipe_inflight;
         auto group_active = [&](int gi) {
             for (int t = 0; t < GS; ++t) if (bs[(size_t) (gi * GS + t)].active) return true;
             return false;
@@ -14349,8 +14355,14 @@ int main(int argc, char** argv) {
                                 const size_t si = (size_t) b + 1;
                                 const int64_t want = sl.p + 1 + pm_drafts + 8;
                                 if (kvshs.sess[si].mapped() * kvsh_ps < want &&
-                                    !kvsh_extend(si, want + 4096) && !kvsh_extend(si, want))
+                                    !kvsh_extend(si, want + 4096) && !kvsh_extend(si, want)) {
+                                    // another group's window is in flight: the cache lends nothing now (a quiesce
+                                    // would wait on that window), so the slot sits this window out and asks again
+                                    // at the next build - a quiet one serves it.  With nothing in flight the pool
+                                    // is simply full: the answer ends after this window (length).
+                                    if (pipe_inflight()) continue;
                                     bs[(size_t) b].max_new = bs[(size_t) b].produced;
+                                }
                                 kv_room = kvshs.sess[si].mapped() * kvsh_ps - 1 - sl.p;
                             }
                             ++G.active;
