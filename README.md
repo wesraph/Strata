@@ -72,7 +72,8 @@ aggregate moves with how many long modules the run happened to write, the decode
 
 Two pipelined proposals per slot (`STRATA_PIPED_MTP=2`) pay on this traffic: three of four proposals are accepted
 when agents write code, and the same build measured 85 tok/s aggregate at two agents and 72 tok/s at three (67-83
-and 30-67 tok/s on the long answers), unchanged at one. It is the setting the fork's own config runs.
+and 30-67 tok/s on the long answers), unchanged at one. It is the setting the fork's own config runs. Three
+proposals (the most two slots fit in a window) lose again: 73 and 64 tok/s at two and three agents, with 69-77% kept.
 
 Prefill is unchanged (about 3.6K tok/s for 46K to 237K-token first reads). The three-agent aggregate is even
 because three different coding tasks keep the engine's prompt path and expert reads busy either way; the pool's
