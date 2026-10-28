@@ -11425,9 +11425,31 @@ int main(int argc, char** argv) {
         // and refreshes the snapshot between windows, between requests and at every chunk.
         struct Stats {
             std::atomic<int64_t> pp{0}, tg{0}, hits{0}, miss{0}, pool_live{0}, pool_cached{0}, pool_mapped{0}, pool_total{0};
-            std::atomic<int> running{0}, reading{0};
+            std::atomic<int64_t> read_mark_us{0};   // when the serve thread last was outside a read, or committed a chunk
+            std::atomic<int> running{0}, reading{0}, main_gen{0};   // main_gen: the non-batch path is decoding
+            struct Chunk { int64_t start_us, end_us, tokens; };   // a prompt chunk read: its tokens over the time it took
+            std::mutex mu;
+            std::vector<Chunk> chunks;
         } stats;
+        auto stats_us = []() { return (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count(); };
+        stats.read_mark_us = stats_us();
+        // a prompt chunk committed: its tokens, spread over the time it took (since the previous chunk or the read's
+        // start).  The prompt rate is tokens read per wall second, averaged over the window: a chunk of 16K tokens
+        // lands whole every few seconds, so counted at its commit the per-second figure read 14,886 then 0, 0, 0
+        // and a 10 s window swung from 1.6K to 4.6K around a true 3.0K; spread over its own reading time it is
+        // what it was: 3.0K while the read runs, 0 when nothing is read.
+        auto stats_read_add = [&](int64_t T) {
+            const int64_t now_us = stats_us();
+            const int64_t mark = stats.read_mark_us.exchange(now_us);
+            stats.pp += T;
+            stats.reading = 1;
+            std::lock_guard<std::mutex> lk(stats.mu);
+            stats.chunks.push_back({std::min(mark, now_us - 1), now_us, T});
+        };
         const double stats_every_s = [] { const char* v = std::getenv("STRATA_STATS_EVERY_S"); return v != nullptr ? std::atof(v) : 1.0; }();
+        // the rates are over the last STRATA_STATS_WINDOW_S seconds (10): a prompt chunk's tokens land whole when it
+        // commits (16K tokens at once every few seconds), so a one-second rate read 14,886 then 0, 0, 0
+        const double stats_window_s = [] { const char* v = std::getenv("STRATA_STATS_WINDOW_S"); return v != nullptr ? std::atof(v) : 10.0; }();
         std::function<void()> stats_refresh;   // the snapshot (defined beside the pump: it reads the slots and the drive)
         struct StatsThread {
             std::thread t;
@@ -11684,8 +11706,7 @@ int main(int argc, char** argv) {
             if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
                              batched ? "batched" : "token", mtp.kv_state().kv_mode, (long long) T);
-            stats.pp += T;   // the stats line: fresh tokens read
-            stats.reading = 1;
+            stats_read_add(T);   // the stats line: fresh tokens read
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
             pp_reached = done;
@@ -14332,12 +14353,13 @@ int main(int argc, char** argv) {
         auto stats_refresh_t = Clock::now();
         stats_refresh = [&]() {
             if (stats_every_s <= 0.0) return;
+            if (!in_prompt_read) stats.read_mark_us = stats_us();   // outside a read: the next chunk's time starts here
             const auto now = Clock::now();
             if (std::chrono::duration<double>(now - stats_refresh_t).count() < 0.25) return;
             stats_refresh_t = now;
             int running = 0;
             for (const BSlot& sb : bs) running += sb.active ? 1 : 0;
-            stats.running = running;
+            stats.running = running + stats.main_gen;
             stats.reading = in_prompt_read ? 1 : 0;
             stats.hits = drive.d.cache_hits;
             stats.miss = drive.d.multi_misses;
@@ -14634,19 +14656,37 @@ int main(int argc, char** argv) {
         }
         kvsh_idle_t0 = std::chrono::steady_clock::now();   // the idle clock starts with serving, not the process
         if (stats_every_s > 0.0)
-            stats_thread.t = std::thread([&stats, &stats_thread, stats_every_s]() {
-                int64_t pp0 = 0, tg0 = 0, h0 = 0, m0 = 0;
-                auto t0 = Clock::now();
+            stats_thread.t = std::thread([&stats, &stats_thread, stats_every_s, stats_window_s]() {
+                struct Sample { Clock::time_point t; int64_t pp, tg, h, m; };
+                std::deque<Sample> ring;   // the counters at every tick of the last window
+                ring.push_back({Clock::now(), 0, 0, 0, 0});
+                auto us_of = [](Clock::time_point t) { return (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(t.time_since_epoch()).count(); };
                 while (!stats_thread.stop) {
                     for (double w = 0.0; w < stats_every_s && !stats_thread.stop; w += 0.1)
                         std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     if (stats_thread.stop) break;
                     const auto now = Clock::now();
-                    const double sec = std::max(1e-3, std::chrono::duration<double>(now - t0).count());
-                    t0 = now;
-                    const int64_t pp = stats.pp, tg = stats.tg, h = stats.hits, m = stats.miss;
-                    const int64_t dpp = pp - pp0, dtg = tg - tg0, dh = h - h0, dm = m - m0;
-                    pp0 = pp; tg0 = tg; h0 = h; m0 = m;
+                    ring.push_back({now, stats.pp, stats.tg, stats.hits, stats.miss});
+                    while (ring.size() > 2 && std::chrono::duration<double>(now - ring[1].t).count() >= stats_window_s) ring.pop_front();
+                    const Sample& a = ring.front();
+                    const Sample& b = ring.back();
+                    const double sec = std::max(1e-3, std::chrono::duration<double>(b.t - a.t).count());
+                    const int64_t dtg = b.tg - a.tg, dh = b.h - a.h, dm = b.m - a.m;
+                    // the prompt tokens in the window: each chunk's share of the part of its reading time inside it
+                    double pp_in = 0.0;
+                    {
+                        const int64_t w0 = us_of(a.t), w1 = us_of(b.t);
+                        std::lock_guard<std::mutex> lk(stats.mu);
+                        size_t keep = 0;
+                        for (const auto& c : stats.chunks) {
+                            if (c.end_us < w0) continue;   // before the window: dropped
+                            stats.chunks[keep++] = c;
+                            const int64_t o0 = std::max(c.start_us, w0), o1 = std::min(c.end_us, w1);
+                            if (o1 > o0 && c.end_us > c.start_us) pp_in += (double) c.tokens * (double) (o1 - o0) / (double) (c.end_us - c.start_us);
+                        }
+                        stats.chunks.resize(keep);
+                    }
+                    const double pp_rate = pp_in / sec;
                     char hit[32] = "-", pool[160] = "";
                     if (dh + dm > 0) std::snprintf(hit, sizeof hit, "%.1f%%", 100.0 * (double) dh / (double) (dh + dm));
                     const int64_t T = stats.pool_total;
@@ -14655,7 +14695,7 @@ int main(int argc, char** argv) {
                                       100.0 * (double) stats.pool_live / (double) T, 100.0 * (double) stats.pool_cached / (double) T,
                                       100.0 * (double) stats.pool_mapped / (double) T);
                     std::fprintf(stderr, "strata serve: stats: prompt %.1f tok/s, generation %.1f tok/s, running %d, reading %d, "
-                                         "expert cache %s hit%s\n", (double) dpp / sec, (double) dtg / sec, (int) stats.running,
+                                         "expert cache %s hit%s\n", pp_rate, (double) dtg / sec, (int) stats.running,
                                  (int) stats.reading, hit, pool);
                 }
             });
@@ -14877,6 +14917,7 @@ int main(int argc, char** argv) {
         };
         for (;;) {
             line_drain_ms = 0.0;
+            stats.main_gen = 0;   // between requests: the non-batch path is not decoding
             stats_refresh();
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
@@ -14905,9 +14946,13 @@ int main(int argc, char** argv) {
             } else {
                 // nothing busy: the pipelined drafts' queued commits settle before a slot's state is read or
                 // written from elsewhere (the next line may admit, hand back or save one)
+                stats.main_gen = 0;   // nothing busy: the snapshot says so before the wait for the next line
+                stats_refresh_t = Clock::time_point{};
+                stats_refresh();
                 if (pmtp && !pmtp_settle()) { std::fprintf(stderr, "strata serve: the serve loop ends: the pipelined drafts did not settle (see the ERR above)\n"); return 1; }
                 if (!next_line(line))
                     break;
+                stats.read_mark_us = stats_us();   // the wait for the line is not reading time
             }
             // --batch: BSTOP <slot> ends that slot at its next batch window; BGEN <slot> <max_new> ... reads the
             // request's prompt and first token as a GEN 1, then continues it in that slot
@@ -16209,6 +16254,7 @@ int main(int argc, char** argv) {
             pp_reached = read_from;
             pp_exact = true;   // a restore, a checkpoint mount or a zeroed session: the state is exactly at read_from
             pp_t0 = r0;
+            stats.read_mark_us = stats_us();   // the stats line: this read's time starts here, not at the wait for the line
             pp_next_check = reread_to > 0 || !req_ckpt ? INT64_MAX : resume + o.prompt_cache_every;   // ckpt=0: none
             pp_tail_saved = reread_to > 0 || !req_ckpt;   // ckpt=0 (#861): no tail checkpoint either
             {
@@ -16313,8 +16359,6 @@ int main(int argc, char** argv) {
                         if (v.service(win_pool_fn, PSD[f0 & 1], e) < 0) return fail(e);
                         if (v.done(e)) {
                             if (!v.pl_finish(nullptr, e)) return fail(e);
-                            stats.pp += wins[f0].T;   // the stats line: fresh tokens read
-                            stats.reading = 1;
                             ++f0;
                         } else if (!e.empty()) return fail(e);
                     }
@@ -16344,6 +16388,7 @@ int main(int argc, char** argv) {
                             }
                             pl_mtp_live[f1 & 1] = true;
                             pp_reached = w.q + w.T;   // #471
+                            stats_read_add(w.T);   // the stats line: fresh tokens read (the window's last stage)
                             ++f1;
                         } else if (!e.empty()) return fail(e);
                     }
@@ -16406,8 +16451,7 @@ int main(int argc, char** argv) {
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
                     if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
-                    stats.pp += T;   // the stats line: fresh tokens read
-                    stats.reading = 1;
+                    stats_read_add(T);   // the stats line: fresh tokens read
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
@@ -18133,6 +18177,8 @@ int main(int argc, char** argv) {
                     for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
                         ++stats.tg;
+                        stats.main_gen = 1;
+                        stats_refresh();
                         if (req_logprobs >= 0) emit_lp_line(V1(A), i, outp[(size_t) i], req_logprobs, req_allowed);
                         strata::core::progress_beat();
                         ++produced_n;
@@ -18604,6 +18650,8 @@ int main(int argc, char** argv) {
                 for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
                     std::printf("T %d\n", (int) outv[(size_t) i]);
                     ++stats.tg;
+                    stats.main_gen = 1;
+                    stats_refresh();
                     if (req_logprobs >= 0) emit_lp_line(ver, i, outv[(size_t) i], req_logprobs, req_allowed);
                     strata::core::progress_beat();
                     ++produced_n;
@@ -18917,6 +18965,7 @@ int main(int argc, char** argv) {
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
+            stats.main_gen = 0;   // the non-batch answer ended
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
                         "experts_streamed=%lld\n",
                         (long long) produced_n,
