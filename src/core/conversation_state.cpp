@@ -685,11 +685,18 @@ bool conversation_snapshot_validate(const SavedConversation& image, const Sessio
     const ConversationView view{image.live.ids, image.live.imgs, image.checkpoints, image.cvec};
     if (!view_validate(view, ss, g, error) || !conversation_checkpoint_validate(image.live, ss, g, error)) return false;
     const size_t layers = owned_qsa(ss);
-    if (image.kv.size() != layers + (draft ? 1 : 0)) return fail(error, "invalid K/V layer count");
+    // an image parked by a slot without a drafter of its own carries no draft ring: it validates and restores
+    // beside a drafter (the caller then clears the drafter's ring for the resumed range)
+    const bool with_draft = draft != nullptr && image.kv.size() == layers + 1;
+    if (image.kv.size() != layers + (with_draft ? 1 : 0)) return fail(error, "invalid K/V layer count");
     const int64_t upto = (int64_t) image.live.ids.size();
     for (size_t j = 0; j < layers; ++j)
         if (!conversation_kv_validate(image.kv[j], owned(ss, j), g, upto, true, error)) return false;
-    return !draft || conversation_kv_validate(image.kv.back(), *draft, g, upto, false, error);
+    return !with_draft || conversation_kv_validate(image.kv.back(), *draft, g, upto, false, error);
+}
+
+bool conversation_snapshot_has_draft(const SavedConversation& image, const SessionState& ss) {
+    return image.kv.size() > owned_qsa(ss);
 }
 
 bool conversation_copy_stream_ready(int device) { return conversation_detail::copy_stream_ready(device); }
@@ -706,7 +713,7 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
     for (size_t j = 0; j < owned_qsa(ss); ++j)
         if (!conversation_kv_restore(image.kv[j], owned(ss, j), g, upto, true, error, table, skip_pages))
             return ConversationRestore::transfer_failed;
-    if ((draft && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error, nullptr, 0)) ||
+    if ((draft && image.kv.size() > owned_qsa(ss) && !conversation_kv_restore(image.kv.back(), *draft, g, upto, false, error, nullptr, 0)) ||
         !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
     return ConversationRestore::restored;
 }

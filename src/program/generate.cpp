@@ -10529,7 +10529,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
                 // STRATA_PIPED_MTP: the rows a group's commit replays after the verdict, one hand-off row each
-                if (piped_mtp && bslot_ss.size() > 1 &&
+                if ((piped_mtp || (o.batch_groups > 1 && !stages.empty())) && bslot_ss.size() > 1 &&
                     !vk.init_deferred_commit(std::max<int>(strata::kernels::kVerifyMaxT, (1 + pm_drafts) * o.batch), err)) {
                     std::fprintf(stderr, "strata serve: STRATA_PIPED_MTP, stage %zu: %s\n", k + 1, err.c_str());
                     return 1;
@@ -13730,11 +13730,8 @@ int main(int argc, char** argv) {
             const bool in_main = live_ok && cvec_cached == sl.cvec && prefix_of(live) &&
                                  imgs_below(live_imgs, (int64_t) sl.ids.size()).empty();
             if (in_main || conversations.holds(sl.ids, {}, sl.cvec)) return;
-            if (use_mtp && !batch_mtp) {   // no draft K/V of its own: an image without it would not restore beside the drafter
-                std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (its %zu tokens "
-                                     "have no per-slot draft K/V without --batch-mtp)\n", b, sl.ids.size());
-                return;
-            }
+            // (a slot without a drafter of its own parks without a draft ring: the restore beside the main drafter clears
+            // the drafter's ring for the resumed range, mtp_after_restore)
             if (cudaDeviceSynchronize() != cudaSuccess) {
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (device sync "
                                      "failed)\n", b);
@@ -14023,8 +14020,11 @@ int main(int argc, char** argv) {
         // their commit replays
         const int pmtp_rows_per_slot = 1 + pm_drafts;              // the slot's token + its proposals
         const int pmtp_rows_per_group = GS * pmtp_rows_per_slot;    // the group's slots
-        const bool pmtp = piped && piped_mtp && ver.deferred_commit_on() &&
-                          pmtp_rows_per_group <= batch_max_t();
+        // the rows API (one row per ACTIVE slot, deferred commits): the pipelined groups use it whether they draft
+        // or not - a plain group build carried a pad row for every idle slot, which wrote that slot's state (the
+        // conversation it held was lost, and under the K/V pool its page 0 is a shared keyed page)
+        const bool prows = piped && ver.deferred_commit_on() && pmtp_rows_per_group <= batch_max_t();
+        const bool pmtp = prows && piped_mtp;
         if (piped && batch_mtp && !pmtp)   // #1413: said, not silent
             std::fprintf(stderr,
                          "strata generate: WARNING: --batch-groups %d runs the pipelined path, which builds one row per slot: "
@@ -14192,6 +14192,7 @@ int main(int argc, char** argv) {
             // rewrites them, runs after the copy; the chain waits for the copy.
             const size_t stride = (size_t) g.hc * (size_t) g.n_embd;
             for (const Blk& blk : blks) {
+                if (!pmtp) break;   // the rows API without drafts (no drafters, no events): nothing to chain
                 BSlot& sl = bs[(size_t) blk.b];
                 if (!sl.active) continue;   // it ended: no more drafts for it
                 const strata::core::OnDevice on_slot_mtp(slot_mtp[(size_t) blk.b]->device());
@@ -14275,8 +14276,8 @@ int main(int argc, char** argv) {
                 if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
                 // the last stage: the group's picks
                 const int32_t* outb = vk.batch_out();
-                if (pmtp && !pmtp_verdict(G, vk, outb)) return false;
-                for (int t = 0; t < G.S && !pmtp; ++t) {
+                if (prows && !pmtp_verdict(G, vk, outb)) return false;
+                for (int t = 0; t < G.S && !prows; ++t) {
                     BSlot& sl = bs[(size_t) (gi * GS + t)];
                     if (!sl.active) continue;
                     if (vk.nonfinite_in(t)) {   // #879: the slot ends, nothing emitted
@@ -14354,7 +14355,7 @@ int main(int argc, char** argv) {
                     rr = pick + 1;
                     PGroup& G = pg[(size_t) pick];
                     G.S = 0;
-                    if (pmtp) {   // the group's slots: each its token, then its own proposals - as many as could be emitted
+                    if (prows) {   // the group's slots: each its token, then its own proposals - as many as could be emitted
                         G.hbase = pmtp_rows_per_group * pick;
                         G.S = 0;
                         G.active = 0;
@@ -14430,7 +14431,7 @@ int main(int argc, char** argv) {
                 PGroup& G = pg[(size_t) pick];
                 strata::core::progress().busy.store(true);
                 if (batch_telemetry_enabled) stage_in_flight.launch(k, Clock::now());
-                if (!(pmtp ? stage_verifier(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err)
+                if (!(prows ? stage_verifier(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err)
                            : stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err))) {
                     std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
                     return false;
@@ -14644,6 +14645,20 @@ int main(int argc, char** argv) {
                          (double) (ext0 - kv_pages.mapped_extents()) * (double) kvsh_pages_per_extent * (double) kvsh_swap_page_bytes *
                              (double) (kvsh_q_n.empty() ? 0 : kvsh_q_n[0]) / 1073741824.0,
                          std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), (long long) pinned, (long long) keep);
+        };
+        // A parked image without a draft ring (parked by a slot without a drafter, or saved without --mtp) restored
+        // beside the drafter: its ring holds another conversation's cells for the resumed range, so it is cleared
+        // and the drafter goes on from `at` with an empty window (its proposals improve as the new turn fills it;
+        // the verify window decides every token either way).
+        auto mtp_after_restore = [&](const strata::core::SavedConversation& carrier, const strata::core::SessionState& carrier_ss,
+                                     int64_t at) {
+            if (!use_mtp || strata::core::conversation_snapshot_has_draft(carrier, carrier_ss)) return;
+            const strata::core::OnDevice on_m(mtp.device());
+            strata::core::qsa_state_zero(mtp.kv_state(), draft_geometry, nullptr);
+            (void) cudaDeviceSynchronize();
+            mtp.set_prompt_len(at);
+            std::fprintf(stderr, "strata serve: conversation cache: the parked image carried no draft K/V: the drafter's ring "
+                                 "starts empty at %lld\n", (long long) at);
         };
         for (;;) {
             line_drain_ms = 0.0;
@@ -15807,6 +15822,8 @@ int main(int argc, char** argv) {
                     }
                     if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
                 }
+                if (stages.empty() || mtp_first) mtp_after_restore(*incoming, ss, parked.tokens);
+                else mtp_after_restore(incoming->stage_images.back(), stages.back()->ss, parked.tokens);
                 if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr) {
                     uint64_t draft_hash = 0;
                     const auto& draft_kv = stages.empty() || mtp_first ? incoming->kv.back() : incoming->stage_images.back().kv.back();
@@ -16692,9 +16709,19 @@ int main(int argc, char** argv) {
                         } read_end{reader, sp.stop_at_chunk, in_prompt_read};
                         bool pump_ok = true;
                         size_t seen = 0;   // in_lines' length after the last look: a line that comes wakes the wait
+                        // STRATA_PIPED_CONCURRENT_WARMUP_MS=N (an experiment, 0 = off): for the first N ms of a read the
+                        // pump finishes the windows in flight but starts no group, so the prompt's first chunk and its
+                        // hand-off set up without window launches beside them (every stall seen on 2x RTX 3090 sat in a
+                        // read's first chunk)
+                        static const int conc_warmup_ms = [] {
+                            const char* v = std::getenv("STRATA_PIPED_CONCURRENT_WARMUP_MS");
+                            return v != nullptr ? std::max(0, std::atoi(v)) : 0;
+                        }();
                         while (!done.load(std::memory_order_acquire)) {
-                            const bool decoding = pump_ok && (batch_on() || pipe_inflight());
-                            if (decoding) pump_ok = pump(true);
+                            const bool warm = conc_warmup_ms == 0 ||
+                                              std::chrono::duration<double, std::milli>(Clock::now() - tc).count() >= (double) conc_warmup_ms;
+                            const bool decoding = pump_ok && (batch_on() || pipe_inflight() || warm);
+                            if (decoding) pump_ok = pump(warm);
                             std::unique_lock<std::mutex> lk(in_mu);
                             if (!decoding)   // nothing to pump: until the read ends or a line comes (both notify)
                                 in_cv.wait_for(lk, std::chrono::milliseconds(2), [&] {
