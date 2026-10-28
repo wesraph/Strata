@@ -181,6 +181,7 @@ int main() {
         cache_ext.init(12, 4,   // 3 extents of 4 pages; map_fail_at >= 0 blocks every further mapping
                        [&](int64_t) { return map_fail_at < 0; },
                        [&](int64_t) { ++unmapped; });
+        cache_ext.set_eager_extent_release(true);   // this test checks the eager return path (the engine keeps extents until its idle trim)
         std::vector<int32_t> got;
         check(cache_ext.extents() == 3, "twelve pages split into three extents");
         check(cache_ext.free_count() == 0, "nothing mapped yet: nothing free");

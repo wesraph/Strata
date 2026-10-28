@@ -345,7 +345,14 @@ public:
     /// After a page stopped being pinned/cached: an extent whose every page is free of keys and pins
     /// holds nothing - its pages go back and its physical memory drops.  (Counting only pins was wrong:
     /// a cached page's extent must stay mapped or a later hit would read unmapped memory.)
+    void set_eager_extent_release(bool on) { eager_extent_release_ = on; }
     void extent_release(int32_t id) {
+        // Lazy by default: an emptied extent stays mapped, its pages free for the next admission, until the
+        // idle trim (drop_free_extents) returns what the working set does not need.  Eager returns made the
+        // pool and the expert caches trade the same extent on every request of a busy agent (a slot
+        // give-back emptied it, the cache took it back and refilled 42 experts, the next turn took it
+        // again: the three-agent benchmark of 2026-10-28, one such round trip per turn).
+        if (!eager_extent_release_) return;
         const int64_t e = id / per_extent_;
         if (e < 0 || e >= extents_ || !extent_mapped_[(size_t) e] || !unmap_extent_) return;
         for (int64_t p = e * per_extent_; p < (e + 1) * per_extent_ && p < total_pages_; ++p)
@@ -419,6 +426,7 @@ public:
     std::vector<char> extent_mapped_;
     MapExtent map_extent_;
     UnmapExtent unmap_extent_;
+    bool eager_extent_release_ = false;   ///< return an emptied extent at once (tests of that path); off: the idle trim does
     SwapOut swap_out_;
     SwapIn swap_in_;
     SwapOutMany swap_out_many_;
