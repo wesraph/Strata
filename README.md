@@ -49,16 +49,28 @@ The fork replaces that with one flat pool of 4-token pages per card (`--kv-share
 | a conversation that leaves its slot | host image, full restore on return | pages stay in the pool while there is room, else evicted least-recently-used to a host swap sized from free RAM; parks skip every pooled page |
 | VRAM for K/V | fixed carve-out, taken from the expert cache whether used or not | borrowed from the expert caches on demand and returned after a minute idle (the VRAM exchange), so experts get the VRAM back when conversations rest |
 
-Throughput, the same engine build with and without the fork's model, per-request decode of 700-token answers:
+Measured against a real build of upstream 0.2.7 on the rig above, same config minus the pool, with an agent loop:
+each agent has the tool-definition system prompt and a 40K-token repository context, works turn by turn with its
+tool calls executed (read-only shell and file reads, writes into a workspace), and stops after 6K generated tokens;
+contexts grow to 90K-130K tokens. "Aggregate" is tokens generated over the agent's whole wall clock, prompt reads
+and tool waits included - what an agent experiences.
 
-| concurrent answers | upstream model (serial slots) | this fork + v0.2.7 pipelined groups and slot drafts |
-|---|---|---|
-| 1 | 88 tok/s | 95 tok/s |
-| 2 | 44 tok/s each | 68 tok/s each |
-| 4 | 26 tok/s each | 27 tok/s each |
+| agents | | upstream 0.2.7 | this fork |
+|---|---|---|---|
+| 1 | aggregate over the agent loop | 38 tok/s | 69 tok/s |
+| | decode on the long answers | 86 tok/s | 107-126 tok/s |
+| | wait before the first token, later turns | 1.7 s | 1.4 s |
+| 2 | aggregate | 43 tok/s | 66 tok/s |
+| | decode on the long answers, per agent | 31 and 51 tok/s | 34-64 and 80 tok/s |
+| | wait before the first token, later turns | 2.2-2.8 s | 1.5-1.6 s |
+| 3 | aggregate | 56 tok/s | 57 tok/s |
+| | decode on the long answers, per agent | 24-40 tok/s | 40-44 tok/s |
+| | expert cache hit rate at the end | 35-63% | 96-99% |
 
-Prefill is unchanged (about 3.6K tok/s for 46K to 237K-token first reads on this rig). Four concurrent answers are bound by
-expert cache misses, not K/V, on two 24 GB cards.
+Prefill is unchanged (about 3.6K tok/s for 46K to 237K-token first reads). The three-agent aggregate is even
+because three different coding tasks keep the engine's prompt path and expert reads busy either way; the pool's
+gain there is the hit rate: upstream's model carves four 262K sessions out of VRAM up front and keeps 3,805 expert
+slots, the pool leaves 5,648.
 
 **Using it.** `--kv-share auto` sizes the pool from the free VRAM (`STRATA_KV_SHARE_FRAC`, default 0.75 of it); the host
 swap (`--kv-swap-mib`) sizes itself from free RAM when unset; the exchange is on by default (`STRATA_KV_EXCHANGE=0` turns
