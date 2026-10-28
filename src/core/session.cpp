@@ -23,6 +23,7 @@
 
 // The doorbell spin.  x86 pauses, aarch64 yields (include/strata/platform/cpu_relax.hpp).
 #include "strata/platform/cpu_relax.hpp"
+#include "strata/core/stream_trace.hpp"
 #define STRATA_SPIN_PAUSE() strata_cpu_pause()
 
 namespace strata::core {
@@ -365,15 +366,15 @@ bool session_replay_stages_per_layer(const ModelGeometry& g, int64_t pos, int32_
     } frees{&ev};
 
     for (int64_t l = 0; l < n; ++l) {
-        cudaEventRecord(ev[(size_t) (l * 4 + 0)], cs);
+        strata::core::st_record(ev[(size_t) (l * 4 + 0)], cs, STRATA_ST_HERE);
         if (cudaGraphLaunch(gr.preA[l], cs) != cudaSuccess) { err = "stages: preA"; return false; }
-        cudaEventRecord(ev[(size_t) (l * 4 + 1)], cs);
+        strata::core::st_record(ev[(size_t) (l * 4 + 1)], cs, STRATA_ST_HERE);
         if (cudaGraphLaunch(gr.preB[l], cs) != cudaSuccess) { err = "stages: preB"; return false; }
-        cudaEventRecord(ev[(size_t) (l * 4 + 2)], cs);
+        strata::core::st_record(ev[(size_t) (l * 4 + 2)], cs, STRATA_ST_HERE);
         if (cudaGraphLaunch(gr.posts[l], cs) != cudaSuccess) { err = "stages: post"; return false; }
-        cudaEventRecord(ev[(size_t) (l * 4 + 3)], cs);
+        strata::core::st_record(ev[(size_t) (l * 4 + 3)], cs, STRATA_ST_HERE);
     }
-    if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "stages: final sync"; return false; }
+    if (strata::core::st_stream_sync(cs, STRATA_ST_HERE) != cudaSuccess) { err = "stages: final sync"; return false; }
 
     mixer_per_layer.assign((size_t) n, 0.0);
     ms_ffn = 0; ms_post = 0;
@@ -413,7 +414,7 @@ bool session_replay_stage_sweep(const ModelGeometry& g, int64_t pos, int32_t pos
         err = "session_replay_stage_sweep: event create";
         return false;
     }
-    cudaEventRecord(a, cs);
+    strata::core::st_record(a, cs, STRATA_ST_HERE);
     for (int64_t l = 0; l < g.n_layers; ++l) {
         const cudaError_t e = cudaGraphLaunch(gr.preP[k - 1][l], cs);
         if (e != cudaSuccess) {
@@ -423,8 +424,8 @@ bool session_replay_stage_sweep(const ModelGeometry& g, int64_t pos, int32_t pos
             return false;
         }
     }
-    cudaEventRecord(b, cs);
-    if (cudaStreamSynchronize(cs) != cudaSuccess) {
+    strata::core::st_record(b, cs, STRATA_ST_HERE);
+    if (strata::core::st_stream_sync(cs, STRATA_ST_HERE) != cudaSuccess) {
         cudaEventDestroy(a);
         cudaEventDestroy(b);
         err = "session_replay_stage_sweep: sync";
@@ -477,7 +478,7 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
         cudaMemcpyAsync(saved, s.block.R, r_floats * sizeof(float), cudaMemcpyDeviceToDevice, cs);
         for (int k = 1; k <= 5; ++k) {
             if (k > 1) cudaMemcpyAsync(s.block.R, saved, r_floats * sizeof(float), cudaMemcpyDeviceToDevice, cs);
-            cudaEventRecord(ev[(size_t) (l * 6 + k - 1)], cs);
+            strata::core::st_record(ev[(size_t) (l * 6 + k - 1)], cs, STRATA_ST_HERE);
             const cudaGraphExec_t ge = (k == 5) ? gr.execs[l] : gr.preP[k - 1][l];
             const cudaError_t e = cudaGraphLaunch(ge, cs);
             if (e != cudaSuccess) {
@@ -486,9 +487,9 @@ bool session_replay_stage_prefixes(const ModelGeometry& g, int64_t pos, int32_t 
                 return false;
             }
         }
-        cudaEventRecord(ev[(size_t) (l * 6 + 5)], cs);
+        strata::core::st_record(ev[(size_t) (l * 6 + 5)], cs, STRATA_ST_HERE);
     }
-    if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "prefixes: final sync"; return false; }
+    if (strata::core::st_stream_sync(cs, STRATA_ST_HERE) != cudaSuccess) { err = "prefixes: final sync"; return false; }
 
     float t1 = 0, t2 = 0, t3 = 0, t4 = 0, t5 = 0;
     for (int64_t l = 0; l < n; ++l) {
@@ -691,7 +692,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
             err = "session_loop: launch pre[0]: " + std::string(cudaGetErrorString(le));
             return false;
         }
-        cudaEventRecord(probe, cs);
+        strata::core::st_record(probe, cs, STRATA_ST_HERE);
         (void) t0;
     }
 
@@ -784,7 +785,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         if (!overlap) {
             // THE COMPARISON ARM.  The same sequence with the pipeline removed: the CPU does not start until the
             // layer is over, so nothing overlaps and the difference is attributable to the doorbell alone.
-            if (cudaStreamSynchronize(cs) != cudaSuccess) {
+            if (strata::core::st_stream_sync(cs, STRATA_ST_HERE) != cudaSuccess) {
                 err = "session_loop: sync at layer " + std::to_string(l);
                 return false;
             }
@@ -798,7 +799,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
                 err = "session_loop: launch pre[" + std::to_string(l + 1) + "]: " + cudaGetErrorString(ne);
                 return false;
             }
-            cudaEventRecord(probe, cs);
+            strata::core::st_record(probe, cs, STRATA_ST_HERE);
         }
         // ---- **THE SECOND HALF OF THE ROUND TRIP, AND THE HALF NOTHING WAS MEASURING.**
         //
@@ -811,7 +812,7 @@ bool session_loop(const ModelGeometry& g, int64_t pos, int32_t pos_base, Session
         // exists to show what the pipeline is worth, and hiding its cost here would defeat the comparison.
         gr.ms_host += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t_ring).count();
     }
-    if (cudaStreamSynchronize(cs) != cudaSuccess) { err = "session_loop: final sync"; return false; }
+    if (strata::core::st_stream_sync(cs, STRATA_ST_HERE) != cudaSuccess) { err = "session_loop: final sync"; return false; }
     return true;
 }
 
@@ -849,7 +850,7 @@ bool session_token(const WeightTable& tables, const ModelGeometry& g, int64_t po
             // P2.X3 forbids in the fast path.  It exists to turn an ASYNCHRONOUS error - a kernel reading a
             // buffer a later layer wrote, or an out-of-range launch - into a failure AT THE LAYER THAT CAUSED
             // IT, instead of a wrong number 40 layers later or at the end of the token.
-            const cudaError_t e = cudaStreamSynchronize(cs);
+            const cudaError_t e = strata::core::st_stream_sync(cs, STRATA_ST_HERE);
             if (e != cudaSuccess) {
                 err = "layer " + std::to_string(l) + ": " + cudaGetErrorString(e);
                 return false;
@@ -993,7 +994,7 @@ bool session_run_token(const ModelGeometry& g, int64_t pos, int32_t pos_base, Se
         tg.ms_pool += std::chrono::duration<double, std::milli>(t2 - t1).count();
     }
     progress_at("token: waiting for the GPU to finish the token");
-    const cudaError_t se = cudaStreamSynchronize(cs);
+    const cudaError_t se = strata::core::st_stream_sync(cs, STRATA_ST_HERE);
     if (se != cudaSuccess) { err = std::string("session_run_token: ") + cudaGetErrorString(se); return false; }
     progress_at("decode");
     progress_beat();

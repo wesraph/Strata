@@ -11,6 +11,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -376,7 +377,7 @@ void s_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, const 
             std::fprintf(stderr, "s_gemv: unsupported code_bits %d\n", form.code_bits);
             std::exit(1);
     }
-    const cudaError_t e = cudaDeviceSynchronize();
+    const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
     if (e != cudaSuccess) {
         std::fprintf(stderr, "s_gemv: %s\n", cudaGetErrorString(e));
         std::exit(1);
@@ -522,7 +523,7 @@ static void s_gemv_split_impl(const uint16_t* x, const uint8_t* codes, const flo
             std::exit(1);
     }
     if (sync) {
-        const cudaError_t e = cudaDeviceSynchronize();
+        const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
         if (e != cudaSuccess) {
             std::fprintf(stderr, "s_gemv_split: %s\n", cudaGetErrorString(e));
             std::exit(1);
@@ -568,7 +569,7 @@ void finish(const char* who, void* stream) {
         std::exit(1);
     }
     if (stream != nullptr) return;
-    const cudaError_t s = cudaDeviceSynchronize();
+    const cudaError_t s = strata::core::st_device_sync(STRATA_ST_HERE);
     if (s != cudaSuccess) {
         std::fprintf(stderr, "%s: %s\n", who, cudaGetErrorString(s));
         std::exit(1);

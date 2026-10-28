@@ -16,6 +16,7 @@
 #include <cstdlib>
 #include <stdexcept>
 #include <vector>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::core {
 
@@ -97,8 +98,8 @@ void PeerExperts::close() {
     if (device_ < 0) return;
     {
         On on(device_);
-        if (stream_) cudaStreamSynchronize(stream_);
-        if (refill_) cudaStreamSynchronize(refill_);
+        if (stream_) strata::core::st_stream_sync(stream_, STRATA_ST_HERE);
+        if (refill_) strata::core::st_stream_sync(refill_, STRATA_ST_HERE);
         cache_.close();
         if (d_x_) cudaFree(d_x_);
         if (d_out_) cudaFree(d_out_);
@@ -212,7 +213,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     if (!opened) { err = "peer experts: " + err; close(); return false; }
     // open() zeroes the arena with cudaMemset on the legacy stream, which is not ordered against the non-blocking
     // refill stream: wait for it, or the zeroing can land on top of the fills
-    if (!ck(cudaDeviceSynchronize(), "arena zeroing", err)) { close(); return false; }
+    if (!ck(strata::core::st_device_sync(STRATA_ST_HERE), "arena zeroing", err)) { close(); return false; }
     // mapped reads: advise the next kAhead pairs so their reads overlap
     constexpr size_t kAhead = 256;
     const bool advise = src.advise_pairs(pick.data(), (int64_t) std::min(kAhead, pick.size()));
@@ -229,7 +230,7 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
         src.note_async_read(b, refill_);   // #1237
         res_[(size_t) (pr.first * n_expert + pr.second)] = slot;
     }
-    if (!ck(cudaStreamSynchronize(refill_), "fill", err)) { close(); return false; }
+    if (!ck(strata::core::st_stream_sync(refill_, STRATA_ST_HERE), "fill", err)) { close(); return false; }
     const auto& f0 = pick.front();
     if (!cache_.verify_slot(res_[(size_t) (f0.first * n_expert + f0.second)], src.blob(f0.first, f0.second), err,
                             (int64_t) lay.blob_bytes(f0.first))) {
@@ -374,14 +375,14 @@ bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, 
         pending_.emplace_back((int32_t) in, slot);
         ++swaps_;
     }
-    return ck(cudaEventRecord(refill_ev_, refill_), "refill event", err);
+    return ck(strata::core::st_record(refill_ev_, refill_, STRATA_ST_HERE), "refill event", err);
 }
 
 void PeerExperts::apply_pending(bool wait) {
     if (pending_.empty()) return;
     {
         On on(device_);
-        if (wait) cudaEventSynchronize(refill_ev_);
+        if (wait) strata::core::st_event_sync(refill_ev_, STRATA_ST_HERE);
         else if (cudaEventQuery(refill_ev_) != cudaSuccess) return;
     }
     for (const auto& [i, slot] : pending_) res_[(size_t) i] = slot;

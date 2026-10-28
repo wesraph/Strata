@@ -47,6 +47,7 @@
 #endif
 #include <memory>
 #include <vector>
+#include "strata/core/stream_trace.hpp"
 namespace strata::core {
 namespace { bool g_shared_early = true; bool g_fused_gr = false; bool g_fast_attn = true; bool g_publish_kernel = true; bool g_fused_gdn = true; bool g_fast_select = true; }
 namespace {constexpr int Q8K_BYTES_PER_BLOCK = 292;
@@ -702,7 +703,7 @@ int64_t qsa_kv_elastic_need(int64_t cells) {
 bool qsa_kv_elastic_grow(int64_t cells, const std::function<strata::core::VmmChunk()>& take) {
     for (auto& p : g_pools)
         if (!pool_grow(*p, cells, take)) return false;
-    return cudaDeviceSynchronize() == cudaSuccess;
+    return strata::core::st_device_sync(STRATA_ST_HERE) == cudaSuccess;
 }
 int64_t qsa_kv_elastic_shrink(int64_t cells, const std::function<void(strata::core::VmmChunk)>& give) {
     const uint64_t G = strata::core::vmm_granularity();
@@ -1063,7 +1064,7 @@ uint64_t qsa_state_init(const ModelGeometry& g, int64_t max_cells, void* base, Q
     } else {
         strata::kernels::kv_ring_table(st.page_table, pages, p.slots, nullptr);
     }
-    cudaDeviceSynchronize();
+    strata::core::st_device_sync(STRATA_ST_HERE);
     return c.used;
 }
 
@@ -1195,16 +1196,16 @@ void stage_mark_begin(int64_t layer, int slot, void* stream) { st_begin(layer, s
 void stage_mark_end(int64_t layer, int slot, void* stream) { st_end(layer, slot, stream); }
 
 static void st_begin(int64_t layer, int slot, void* stream) {
-    if (g_st.on && layer < 64) cudaEventRecord(g_st.a[layer][slot], (cudaStream_t) stream);
+    if (g_st.on && layer < 64) strata::core::st_record(g_st.a[layer][slot], (cudaStream_t) stream, STRATA_ST_HERE);
 }
 
 static void st_end(int64_t layer, int slot, void* stream) {
-    if (g_st.on && layer < 64) cudaEventRecord(g_st.b[layer][slot], (cudaStream_t) stream);
+    if (g_st.on && layer < 64) strata::core::st_record(g_st.b[layer][slot], (cudaStream_t) stream, STRATA_ST_HERE);
 }
 
 void stage_timing_report(int64_t n_layers) {
     if (!g_st.on) return;
-    cudaDeviceSynchronize();
+    strata::core::st_device_sync(STRATA_ST_HERE);
     double tot[STAGE_SLOTS] = {};
     for (int s = 0; s < g_st.nslots; ++s) {
         for (int64_t l = 0; l < n_layers && l < 64; ++l) {

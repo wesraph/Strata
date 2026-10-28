@@ -24,6 +24,7 @@
 #include <random>
 #include <string>
 #include <vector>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -2592,7 +2593,7 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
         h2.resize(n);
         if (cudaMemcpyAsync(h1.data(), d1, n * 4, cudaMemcpyDeviceToHost, st) != cudaSuccess ||
             cudaMemcpyAsync(h2.data(), d2, n * 4, cudaMemcpyDeviceToHost, st) != cudaSuccess ||
-            cudaStreamSynchronize(st) != cudaSuccess) {
+            strata::core::st_stream_sync(st, STRATA_ST_HERE) != cudaSuccess) {
             why[0] = "reading back the check failed";
             ok = false;
             return false;
@@ -2643,7 +2644,7 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
                 launch_multi(m, v + 1, st, nullptr, 0);
             }
             if (T == 1) fused_gr_read(a[3][0], st);
-            if (cudaGetLastError() != cudaSuccess || cudaStreamSynchronize(st) != cudaSuccess) {
+            if (cudaGetLastError() != cudaSuccess || strata::core::st_stream_sync(st, STRATA_ST_HERE) != cudaSuccess) {
                 why[0] = "a kernel of the check failed";
                 ok = false;
                 break;
@@ -2658,7 +2659,7 @@ bool fused_gr_selftest(bool ok_variant[4], std::string why[4]) {
         ok_variant[2] = ok_variant[3] = false;
     }
     if (st != nullptr) {
-        cudaStreamSynchronize(st);
+        strata::core::st_stream_sync(st, STRATA_ST_HERE);
         cudaStreamDestroy(st);
     }
     cudaFree(base);
@@ -3146,16 +3147,16 @@ void fused_gr_persist_init() {
             cudaMemcpy(dR, R.data(), R.size() * 4, cudaMemcpyHostToDevice);
             cudaMemset(dmix, 0xff, (size_t) TM * N * 4);
             cudaMemset(dio, 0xff, (size_t) TM * HC * 4);
-            cudaDeviceSynchronize();
+            strata::core::st_device_sync(STRATA_ST_HERE);
             if (which == 0) fused_gr_read_multi(a, T, dxn, nullptr);
             else hcp::launch(a, T, st, nullptr, hcp::kTicksCheck);
-            if (cudaDeviceSynchronize() != cudaSuccess) { cudaGetLastError(); return 2; }
+            if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { cudaGetLastError(); return 2; }
             if (which == 1) {
                 unsigned abort_word = 0;
                 cudaMemcpy(&abort_word, st.bar + 48, sizeof abort_word, cudaMemcpyDeviceToHost);
                 if (abort_word != 0u) {
                     cudaMemset(st.bar, 0, 64 * sizeof(unsigned));
-                    cudaDeviceSynchronize();
+                    strata::core::st_device_sync(STRATA_ST_HERE);
                     return 1;
                 }
             }
@@ -3185,7 +3186,7 @@ void fused_gr_persist_init() {
     cudaFree(dR); cudaFree(dbo); cudaFree(dinj); cudaFree(dwn); cudaFree(dxn); cudaFree(dlo); cudaFree(drs);
     cudaFree(dio); cudaFree(dmix); cudaFree(dwd); cudaFree(dwu); cudaFree(dwi);
     cudaMemset(st.bar, 0, 64 * sizeof(unsigned));
-    cudaDeviceSynchronize();
+    strata::core::st_device_sync(STRATA_ST_HERE);
     cudaGetLastError();
     if (!ok) {
         std::fprintf(stderr, "strata hc: CUDA%d: STRATA_HC_PERSIST=1 is off here: the check failed at %d tokens "

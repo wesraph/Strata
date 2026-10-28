@@ -19,6 +19,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <cuda_runtime.h>
+#include "strata/core/stream_trace.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1587,7 +1588,7 @@ void FileExpertSource::close() {
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         // the buffers' last copies end before they are freed (#1237)
-        if (!stage_ev_.empty()) (void) cudaDeviceSynchronize();
+        if (!stage_ev_.empty()) (void) strata::core::st_device_sync(STRATA_ST_HERE);
         stage_free_events();
         stage_buf_.clear();
         stage_key_.clear();
@@ -1913,7 +1914,7 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
             if (stage_ev_[v] != nullptr) {
                 if (cudaEventQuery((cudaEvent_t) stage_ev_[v]) == cudaErrorNotReady) {
                     stage_fence_waits_.fetch_add(1, std::memory_order_relaxed);
-                    (void) cudaEventSynchronize((cudaEvent_t) stage_ev_[v]);
+                    (void) strata::core::st_event_sync((cudaEvent_t) stage_ev_[v], STRATA_ST_HERE);
                 }
                 (void) cudaGetLastError();
             }
@@ -2073,14 +2074,14 @@ void FileExpertSource::note_async_read(const uint8_t* blob, void* stream) {
         cudaEvent_t ev = nullptr;
         if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
             (void) cudaGetLastError();
-            (void) cudaStreamSynchronize((cudaStream_t) stream);   // no event: wait for the copy itself
+            (void) strata::core::st_stream_sync((cudaStream_t) stream, STRATA_ST_HERE);   // no event: wait for the copy itself
             return;
         }
         stage_ev_[v] = ev;
     }
-    if (cudaEventRecord((cudaEvent_t) stage_ev_[v], (cudaStream_t) stream) != cudaSuccess) {
+    if (strata::core::st_record((cudaEvent_t) stage_ev_[v], (cudaStream_t) stream, STRATA_ST_HERE) != cudaSuccess) {
         (void) cudaGetLastError();
-        (void) cudaStreamSynchronize((cudaStream_t) stream);
+        (void) strata::core::st_stream_sync((cudaStream_t) stream, STRATA_ST_HERE);
         return;
     }
     stage_ev_live_[v] = 1;
@@ -3508,7 +3509,7 @@ bool FileExpertSource::pin_cache_complement(
         err = "FileExpertSource: the GPU expert cache is not fully filled";
         return false;
     }
-    const cudaError_t sync = cudaDeviceSynchronize();
+    const cudaError_t sync = strata::core::st_device_sync(STRATA_ST_HERE);
     if (sync != cudaSuccess) {
         err = std::string("FileExpertSource: GPU expert cache is not ready: ") + cudaGetErrorString(sync);
         (void) cudaGetLastError();
@@ -5375,7 +5376,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
             strata::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
                 d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
         d.hit_pending = true;
-        if (d.hit_done != nullptr) cudaEventRecord((cudaEvent_t) d.hit_done, cs);
+        if (d.hit_done != nullptr) strata::core::st_record((cudaEvent_t) d.hit_done, cs, STRATA_ST_HERE);
         // The A/B arm: ONE driver entry here, and nothing else changes.  If the work was waiting for the host
         // to enter the driver, this is what lets it start while the pool runs.
         if (d.hit_poke && d.hit_done != nullptr) (void) cudaEventQuery((cudaEvent_t) d.hit_done);
@@ -6264,7 +6265,7 @@ ForesightSwap::~ForesightSwap() {
     if (filler_.joinable()) filler_.join();
     for (size_t c = 0; c < card_dev.size(); ++c) {
         const OnDevice on(card_dev[c]);
-        if (card_stream[c]) cudaStreamSynchronize((cudaStream_t) card_stream[c]);
+        if (card_stream[c]) strata::core::st_stream_sync((cudaStream_t) card_stream[c], STRATA_ST_HERE);
         if (card_mem[c]) cudaFree(card_mem[c]);
         if (card_stream[c]) cudaStreamDestroy((cudaStream_t) card_stream[c]);
     }
@@ -6291,7 +6292,7 @@ void ForesightSwap::fill_loop() {
         if (dev != cur_dev) { cudaSetDevice(dev); cur_dev = dev; }
         cudaStream_t s = (cudaStream_t) card_stream[(size_t) layer_card[(size_t) l]];
         if (cudaMemcpyAsync((void*) sl.dptr, sl.src, sl.bytes, cudaMemcpyHostToDevice, s) != cudaSuccess ||
-            cudaEventRecord((cudaEvent_t) sl.ev, s) != cudaSuccess) {
+            strata::core::st_record((cudaEvent_t) sl.ev, s, STRATA_ST_HERE) != cudaSuccess) {
             cudaGetLastError();
             if (!failed.exchange(true)) std::fprintf(stderr, "strata serve: foresight swap: a copy failed - swap space off\n");
             continue;   // never marked issued: the slot is never used

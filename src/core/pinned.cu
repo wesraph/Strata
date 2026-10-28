@@ -4,6 +4,7 @@
 #include "strata/core/pin_budget.hpp"
 
 #include <cuda_runtime.h>
+#include "strata/core/stream_trace.hpp"
 
 #include <atomic>
 #include <climits>
@@ -965,7 +966,7 @@ StreamStats stream_bandwidth(const uint8_t* src, uint64_t bytes, uint64_t chunk,
     for (uint64_t off = 0; off + chunk <= bytes; off += chunk) {
         cudaMemcpyAsync(dst, src + off, (size_t) chunk, cudaMemcpyHostToDevice, s);
     }
-    cudaStreamSynchronize(s);
+    strata::core::st_stream_sync(s, STRATA_ST_HERE);
 
     const auto t0 = std::chrono::steady_clock::now();
     for (int it = 0; it < iters; ++it) {
@@ -973,7 +974,7 @@ StreamStats stream_bandwidth(const uint8_t* src, uint64_t bytes, uint64_t chunk,
             cudaMemcpyAsync(dst, src + off, (size_t) chunk, cudaMemcpyHostToDevice, s);
         }
     }
-    cudaStreamSynchronize(s);
+    strata::core::st_stream_sync(s, STRATA_ST_HERE);
     st.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
 
     cudaStreamDestroy(s);

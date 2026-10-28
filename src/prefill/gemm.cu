@@ -15,6 +15,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include "strata/core/stream_trace.hpp"
 
 #if defined(__HIPCC__) && defined(STRATA_HIPBLASLT_AVAILABLE)
 // The HIP compatibility shim maps CUDA shuffle spellings to Strata helpers.
@@ -729,7 +730,7 @@ bool Gemm::set_dequant_side(uint16_t* scratch2, std::string& err) {
     // both scratches are free once what the compute stream holds now is done (a rebind follows a stream sync, so
     // this is belt and braces; a wait on an event never recorded would pass anyway)
     for (int i = 0; i < 2; ++i)
-        (void) cudaEventRecord((cudaEvent_t) side_free_[i], (cudaStream_t) stream_);
+        (void) strata::core::st_record((cudaEvent_t) side_free_[i], (cudaStream_t) stream_, STRATA_ST_HERE);
     return true;
 }
 
@@ -1192,7 +1193,7 @@ void Gemm::f16(const uint16_t* X, const uint16_t* W, float* Y, int64_t T, int64_
         const int64_t n_sl = (T * K + kXSliceElems - 1) / kXSliceElems;   // even slices of at most 64 MiB as fp32
         const int64_t x_rows = (T + n_sl - 1) / n_sl;
         // grow() frees a buffer an earlier GEMM on this stream may still read
-        if (tc_w_elems_ < 2 * N * K || tc_x_elems_ < 2 * x_rows * K) cudaStreamSynchronize((cudaStream_t) stream_);
+        if (tc_w_elems_ < 2 * N * K || tc_x_elems_ < 2 * x_rows * K) strata::core::st_stream_sync((cudaStream_t) stream_, STRATA_ST_HERE);
         if (grow(tc_w_, tc_w_elems_, 2 * N * K) && grow(tc_x_, tc_x_elems_, 2 * x_rows * K)) {
             static bool said = false;
             if (!said) {
@@ -1403,7 +1404,7 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
             f16(X, scratch_, Y + r0, T, n, K, ldy, beta);
         }
         // the side stream's next dequant into scratch_ waits for these slices' reads and writes of it
-        if (side_scratch_) (void) cudaEventRecord((cudaEvent_t) side_free_[0], (cudaStream_t) stream_);
+        if (side_scratch_) (void) strata::core::st_record((cudaEvent_t) side_free_[0], (cudaStream_t) stream_, STRATA_ST_HERE);
         return;
     }
     if (side_scratch_) {
@@ -1413,12 +1414,12 @@ void Gemm::native(const uint16_t* X, int ggml_type, const void* W_blocks, float*
         // the serial form had it - the same kernels, the same bits - and the dequant runs while the kernels queued
         // ahead of this GEMM do.
         uint16_t* const s = side_cur_ == 0 ? scratch_ : side_scratch_;
-        (void) cudaStreamWaitEvent((cudaStream_t) side_stream_, (cudaEvent_t) side_free_[side_cur_], 0);
+        (void) strata::core::st_wait((cudaStream_t) side_stream_, (cudaEvent_t) side_free_[side_cur_], STRATA_ST_HERE);
         strata::kernels::dequant_f16(ggml_type, W_blocks, 0, N, K, s, side_stream_);
-        (void) cudaEventRecord((cudaEvent_t) side_ready_[side_cur_], (cudaStream_t) side_stream_);
-        (void) cudaStreamWaitEvent((cudaStream_t) stream_, (cudaEvent_t) side_ready_[side_cur_], 0);
+        (void) strata::core::st_record((cudaEvent_t) side_ready_[side_cur_], (cudaStream_t) side_stream_, STRATA_ST_HERE);
+        (void) strata::core::st_wait((cudaStream_t) stream_, (cudaEvent_t) side_ready_[side_cur_], STRATA_ST_HERE);
         f16(X, s, Y, T, N, K, ldy, beta);
-        (void) cudaEventRecord((cudaEvent_t) side_free_[side_cur_], (cudaStream_t) stream_);
+        (void) strata::core::st_record((cudaEvent_t) side_free_[side_cur_], (cudaStream_t) stream_, STRATA_ST_HERE);
         side_cur_ ^= 1;
         return;
     }

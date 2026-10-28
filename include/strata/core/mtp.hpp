@@ -31,6 +31,7 @@
 #include <functional>
 #include <string>
 #include <vector>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::core {
 
@@ -193,7 +194,7 @@ public:
     int64_t cell_floor() const { return cell_floor_; }
     int device() const { return device_; }
     bool idle(std::string& err) {
-        if (cs_ && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
+        if (cs_ && strata::core::st_stream_sync(cs_, STRATA_ST_HERE) != cudaSuccess) { err = "mtp: its stream failed"; return false; }
         return true;
     }
 

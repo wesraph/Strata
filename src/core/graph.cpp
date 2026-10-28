@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::core {
 namespace {
@@ -76,7 +77,7 @@ bool CapturedGraph::launch(void* stream, std::string& err) const {
     if (!exec_) { err = "launch: not recorded"; return false; }
     cudaError_t e = cudaGraphLaunch(exec_, (cudaStream_t) stream);
     if (e != cudaSuccess) return fail(err, "cudaGraphLaunch", e);
-    e = cudaEventRecord(done_, (cudaStream_t) stream);
+    e = strata::core::st_record(done_, (cudaStream_t) stream, STRATA_ST_HERE);
     if (e != cudaSuccess) return fail(err, "cudaEventRecord", e);
     return true;
 }

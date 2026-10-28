@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::prefill {
 namespace {
@@ -2508,7 +2509,7 @@ void kv_append(const float* K, const float* V, int64_t T, int64_t pos0, const in
         // The sync runs only under the env: it makes every append synchronous and the serve watchdog
         // ends the engine on a long prefill.
         if (std::getenv("STRATA_KV_FAULT_DUMP") == nullptr) { check("kv_append"); return; }
-        const cudaError_t fe = cudaStreamSynchronize((cudaStream_t) stream);
+        const cudaError_t fe = strata::core::st_stream_sync((cudaStream_t) stream, STRATA_ST_HERE);
         if (fe != cudaSuccess) {
             int32_t t4[4] = {-9, -9, -9, -9};
             (void) cudaMemcpy(t4, page_table, sizeof t4, cudaMemcpyDeviceToHost);

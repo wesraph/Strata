@@ -10,6 +10,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -53,7 +54,7 @@ void s2_gemv(const uint16_t* x, const uint8_t* codes, const float* scales, float
     const int threads = 128;
     const long long blocks = (n_out + threads - 1) / threads;
     s2_gemv_kernel<<<(unsigned) blocks, threads>>>(x, codes, scales, y, n_in, n_out);
-    const cudaError_t e = cudaDeviceSynchronize();
+    const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
     if (e != cudaSuccess) {
         std::fprintf(stderr, "s2_gemv: %s\n", cudaGetErrorString(e));
         std::exit(1);

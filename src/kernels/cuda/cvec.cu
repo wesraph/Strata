@@ -4,6 +4,7 @@
 #include <cuda_runtime.h>
 
 #include <stdexcept>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -107,7 +108,7 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
     for (int d = 0; d < kDevices; ++d) {
         if (g_dev[d].dir == nullptr) continue;
         cudaSetDevice(d);
-        cudaDeviceSynchronize();
+        strata::core::st_device_sync(STRATA_ST_HERE);
         cudaFree(g_dev[d].dir);
         cudaFree(g_dev[d].s);
         cudaFree(g_dev[d].on);
@@ -142,7 +143,7 @@ void cvec_set_enabled(bool on) {
     for (int d = 0; d < kDevices; ++d) {
         if (g_dev[d].on == nullptr) continue;
         cudaSetDevice(d);
-        cudaDeviceSynchronize();   // nothing in flight may still read the flag
+        strata::core::st_device_sync(STRATA_ST_HERE);   // nothing in flight may still read the flag
         cudaMemcpy(g_dev[d].on, &v, sizeof(int), cudaMemcpyHostToDevice);
     }
     cudaSetDevice(prev);

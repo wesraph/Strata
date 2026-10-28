@@ -32,6 +32,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -238,7 +239,7 @@ void swilu_quantize_q8_0_launch(const float* gate, const float* up, float* gate_
         std::fprintf(stderr, "swilu_quantize_q8_0 launch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) strata::core::st_device_sync(STRATA_ST_HERE);
 }
 
 // ===================== every activation image of x in ONE pass =====================
@@ -318,7 +319,7 @@ void swilu_quantize_q8_K(const float* gate, const float* up, float* gate_out, in
         std::fprintf(stderr, "swilu_quantize_q8_K launch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) strata::core::st_device_sync(STRATA_ST_HERE);
 }
 
 void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
@@ -336,7 +337,7 @@ void quantize_q8_0(const float* x, uint8_t* blocks, int64_t n, void* stream) {
         std::fprintf(stderr, "quantize_q8_0 launch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) strata::core::st_device_sync(STRATA_ST_HERE);
 }
 
 /// See `quantize_q8_0_scaled_kernel`.  Writes the same 34-byte `block_q8_0` layout as `quantize_q8_0`, plus
@@ -365,7 +366,7 @@ void quantize_q8_0_scaled(const float* x, uint8_t* blocks, float* scales, int64_
         std::fprintf(stderr, "quantize_q8_0_scaled launch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) strata::core::st_device_sync(STRATA_ST_HERE);
 }
 
 void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
@@ -379,7 +380,7 @@ void dequant_q8_0(const uint8_t* blocks, float* x, int64_t n, void* stream) {
         std::fprintf(stderr, "dequant_q8_0 launch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) strata::core::st_device_sync(STRATA_ST_HERE);
 }
 
 void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
@@ -397,7 +398,7 @@ void quantize_q8_K(const float* x, uint8_t* blocks, int64_t n, void* stream) {
         std::fprintf(stderr, "quantize_q8_K launch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) strata::core::st_device_sync(STRATA_ST_HERE);
 }
 
 void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
@@ -411,7 +412,7 @@ void dequant_q8_K(const uint8_t* blocks, float* x, int64_t n, void* stream) {
         std::fprintf(stderr, "dequant_q8_K launch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) strata::core::st_device_sync(STRATA_ST_HERE);
 }
 
 void quantize_act_images(const float* x, int64_t n, uint8_t* q8_0_blocks, uint8_t* q8_K_blocks,
@@ -432,7 +433,7 @@ void quantize_act_images(const float* x, int64_t n, uint8_t* q8_0_blocks, uint8_
         std::fprintf(stderr, "quantize_act_images launch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) strata::core::st_device_sync(STRATA_ST_HERE);
 }
 
 }  // namespace strata::kernels

@@ -55,6 +55,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -78,7 +79,7 @@ void check_launch(const char* what) {
 /// faulted becomes visible only at the NEXT call's `cudaGetLastError()`, which then names the wrong kernel -
 /// exactly the mis-attribution that made round 198's first `kv_append` failure look like a later one.
 void check_sync(const char* what) {
-    const cudaError_t e = cudaDeviceSynchronize();
+    const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
     if (e != cudaSuccess) {
         std::fprintf(stderr, "qsa: %s (synchronise): %s\n", what, cudaGetErrorString(e));
         std::exit(1);

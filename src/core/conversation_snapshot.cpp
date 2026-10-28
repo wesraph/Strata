@@ -13,6 +13,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::core {
 namespace {
@@ -880,7 +881,7 @@ void conversation_park_async_abandon() {
     a.active = false;
     a.items.clear();
     cudaStream_t s = nullptr;
-    if (conversation_detail::private_stream(s) == cudaSuccess) (void) cudaStreamSynchronize(s);   // nothing reads the stage after
+    if (conversation_detail::private_stream(s) == cudaSuccess) (void) strata::core::st_stream_sync(s, STRATA_ST_HERE);   // nothing reads the stage after
     (void) cudaGetLastError();
     if (a.slot != nullptr) { vram_kv_release(*a.slot); a.slot = nullptr; a.slot_tag = 0; }   // (STRATA_PARK_VRAM_MIB)
 }
@@ -891,7 +892,7 @@ bool conversation_park_async_launch(std::string& error) {
     a.active = false;
     cudaStream_t s = nullptr;
     cudaError_t e = conversation_detail::private_stream(s);
-    if (e == cudaSuccess) e = cudaStreamSynchronize(s);   // the device-to-device copies into the stage
+    if (e == cudaSuccess) e = strata::core::st_stream_sync(s, STRATA_ST_HERE);   // the device-to-device copies into the stage
     if (e != cudaSuccess) {
         a.items.clear();
         if (a.slot != nullptr) { vram_kv_release(*a.slot); a.slot = nullptr; a.slot_tag = 0; }   // (STRATA_PARK_VRAM_MIB)
@@ -920,7 +921,7 @@ bool conversation_park_async_launch(std::string& error) {
         int b = 0;
         auto land = [&](int k) {
             if (held[k].dst == nullptr || e != cudaSuccess) return;
-            e = cudaEventSynchronize(done[k]);
+            e = strata::core::st_event_sync(done[k], STRATA_ST_HERE);
             if (e == cudaSuccess) std::memcpy(held[k].dst, host[k], held[k].n);
             held[k] = {nullptr, 0};
         };
@@ -929,7 +930,7 @@ bool conversation_park_async_launch(std::string& error) {
                 const size_t n = std::min(kParkPiece, it.n - o);
                 land(b);
                 if (e == cudaSuccess) e = cudaMemcpyAsync(host[b], stage + it.at + o, n, cudaMemcpyDeviceToHost, st);
-                if (e == cudaSuccess) e = cudaEventRecord(done[b], st);
+                if (e == cudaSuccess) e = strata::core::st_record(done[b], st, STRATA_ST_HERE);
                 if (e == cudaSuccess) held[b] = {it.dst + o, n};
                 b ^= 1;
             }

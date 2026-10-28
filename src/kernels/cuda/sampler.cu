@@ -33,6 +33,7 @@
 #include <cstring>
 #include <mutex>
 #include <vector>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -1315,7 +1316,7 @@ void sample_tokens(const float* logits, int n_tokens, int n_vocab, const int* hi
         std::fprintf(stderr, "sample_tokens launch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) strata::core::st_device_sync(STRATA_ST_HERE);
 }
 
 namespace {
@@ -1393,7 +1394,7 @@ static bool sample_tokens_spec_impl(const float* logits, int n_tokens, int n_voc
         std::exit(1);
     }
     if (stream == nullptr) {
-        const cudaError_t sync = cudaDeviceSynchronize();
+        const cudaError_t sync = strata::core::st_device_sync(STRATA_ST_HERE);
         if constexpr (Augmented) { if (sync != cudaSuccess) return false; }
     }
     return true;

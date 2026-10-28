@@ -8,6 +8,7 @@
 
 #include <cinttypes>
 #include <cuda_runtime.h>
+#include "strata/core/stream_trace.hpp"
 
 #include <chrono>
 #include <algorithm>
@@ -506,7 +507,7 @@ bool WeightTable::load(const std::string& pack_dir, void* arena_base, uint64_t a
     report_.arena_bytes = pool;
     report_.read_ms = now_ms() - t_read0 - upload_ms;
     report_.upload_ms = upload_ms;
-    if (cudaDeviceSynchronize() != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
+    if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { err = "cudaDeviceSynchronize after the load failed"; return false; }
     return true;
 }
 

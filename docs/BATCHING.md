@@ -257,6 +257,24 @@ so the slots never wait for the read and the read is one run with no drain insid
   `STRATA_PIPED_CONCURRENT_STAGED=1` tries the mode with such a source, but on 2x RTX 3090 with three agents it
   still hung within minutes (the prompt chunk waiting for the GPU, a window waiting for its doorbell), so it
   stays off by itself. A prompt with pictures is read the usual way.
+- What the hang is (measured on 2x RTX 3090, PCIe x8, driver 610.57, 2026-10-28, twelve traced runs): not a
+  dependency cycle. A shadow log of every stream wait, event record, synchronize, kernel and graph launch
+  (`stream_trace.hpp`, dumped by the stall report) replays each stream's queue and finds every traced wait
+  satisfied. What the cards show is the second card at 100% utilization for the whole minute while the first
+  idles and every host thread is parked: a kernel on the card of the stage decoding beside the read never ends,
+  and the read's synchronize waits behind it. The stuck stream is the window stream of that stage (the stall
+  report's `cudaStreamQuery` line names it), after a window that finished and a commit that did not. The same
+  stall, at the same place (`waiting for the GPU (attention, router) at layer 33`, the second card at 100%),
+  came from the unmodified upstream engine (0.2.7, the experts.bin pack) with `STRATA_PIPED_CONCURRENT=1` after
+  six reads, so it is the mode itself on this rig, not the pool or the pipelined drafts. `cuda-gdb` could not
+  name the kernel: attached to the stalled process, its CUDA side times out against the wedged card, and one
+  attempt left the card's firmware with a task watchdog timeout (`GSP-CrashCat`). The mode stays off.
+- The diagnosis knobs stay, all off by default: `STRATA_STREAM_TRACE=1` logs kernel and graph launches into the
+  shadow log too (the waits, records and synchronizes are always logged; a ring of 65,536 entries, lock-free);
+  `STRATA_STALL_HOLD_S=N` keeps a stalled process alive N seconds after the stall report, with ptrace allowed for
+  this user, so a debugger can attach from outside (`cuda-gdb -p <pid>`); `STRATA_ABORT_ON_GPU_STALL=1` aborts
+  when a verify window's GPU does not drain after its waits were released, so a debugger running the engine
+  takes every thread's backtrace at that moment.
 
 One log line per read (`strata batch: read N tokens on a thread of its own in X ms (concurrent, to Q of T); the slots
 decoded R rows meanwhile (S rows/s; stage k: W windows, H ms host each)`). Built for CUDA and HIP (HIP keeps the default

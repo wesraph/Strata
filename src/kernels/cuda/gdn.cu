@@ -9,6 +9,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -163,7 +164,7 @@ void gdn_step(float* state, const float* q, const float* k, const float* v, cons
     gdn_step_kernel<<<grid, JTHREADS, 0, (cudaStream_t) stream>>>(state, q, k, v, gate, beta, o, (int) s.S,
                                                                   (int) s.h_k, (int) s.h_v);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
+        const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gdn_step: %s\n", cudaGetErrorString(e));
             std::exit(1);
@@ -178,7 +179,7 @@ void gdn_conv_step(float* conv_state, const float* x, const float* kW, float* ou
     gdn_conv_kernel<<<blocks, 256, 0, (cudaStream_t) stream>>>(conv_state, x, kW, out, (int) channels,
                                                                (int) d_conv);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
+        const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gdn_conv_step: %s\n", cudaGetErrorString(e));
             std::exit(1);
@@ -194,7 +195,7 @@ void gdn_l2_norm(float* x, int64_t rows, int64_t cols, float eps, void* stream) 
     }
     gdn_l2_kernel<<<(unsigned) rows, 32, 0, (cudaStream_t) stream>>>(x, (int) cols, eps);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
+        const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gdn_l2_norm: %s\n", cudaGetErrorString(e));
             std::exit(1);
@@ -224,7 +225,7 @@ void gdn_beta_gate(float* beta, int64_t h_v, void* stream) {
     const int n = (int) h_v;
     gdn_beta_gate_kernel<<<(unsigned) ((n + 127) / 128), 128, 0, (cudaStream_t) stream>>>(beta, n);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
+        const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gdn_beta_gate: %s\n", cudaGetErrorString(e));
             std::exit(1);
@@ -237,7 +238,7 @@ void gdn_out_norm(const float* o, const float* z, const float* ssm_norm, float* 
     if (h_v <= 0 || S <= 0) return;
     gdn_out_norm_kernel<<<(unsigned) h_v, 32, 0, (cudaStream_t) stream>>>(o, z, ssm_norm, y, (int) S, eps);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
+        const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gdn_out_norm: %s\n", cudaGetErrorString(e));
             std::exit(1);

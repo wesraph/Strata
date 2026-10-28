@@ -14,6 +14,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -41,7 +42,7 @@ void dequant_s2(const uint8_t* codes, const float* scales, float* out, int64_t n
     const int threads = 256;
     const long long blocks = (n_blocks + threads - 1) / threads;
     dequant_s2_kernel<<<(unsigned) blocks, threads>>>(codes, scales, out, n_blocks);
-    const cudaError_t e = cudaDeviceSynchronize();
+    const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
     if (e != cudaSuccess) {
         std::fprintf(stderr, "dequant_s2: %s\n", cudaGetErrorString(e));
         std::exit(1);

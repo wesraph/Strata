@@ -7,6 +7,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -106,7 +107,7 @@ inline void finish(void* stream, const char* what) {
         std::exit(1);
     }
     if (stream != nullptr) return;
-    const cudaError_t s = cudaDeviceSynchronize();
+    const cudaError_t s = strata::core::st_device_sync(STRATA_ST_HERE);
     if (s != cudaSuccess) {
         std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(s));
         std::exit(1);

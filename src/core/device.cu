@@ -5,6 +5,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::core {
 
@@ -349,7 +350,7 @@ DeviceArena::DeviceArena(uint64_t bytes, int ordinal, bool poison)
             poison_kernel<<<(unsigned) chunk, threads>>>((float*) base_ + b * threads, n - b * threads);
             check(cudaGetLastError(), "poison_kernel");
         }
-        check(cudaDeviceSynchronize(), "poison sync");
+        check(strata::core::st_device_sync(STRATA_ST_HERE), "poison sync");
     }
 #endif
 }

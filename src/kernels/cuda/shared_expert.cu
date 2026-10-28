@@ -38,6 +38,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -473,7 +474,7 @@ void shared_expert(const uint8_t* x_q8_0, const uint8_t* x_q8k, const uint16_t* 
     }
 
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
+        const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
         if (e != cudaSuccess) {
             std::fprintf(stderr, "shared_expert: %s\n", cudaGetErrorString(e));
             std::exit(1);
@@ -494,7 +495,7 @@ void moe_combine(const float* parts, const float* weights, const float* shared, 
     moe_combine_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(parts, weights, shared, y, (int) n_embd,
                                                                    (int) k, shared != nullptr);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
+        const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
         if (e != cudaSuccess) {
             std::fprintf(stderr, "moe_combine: %s\n", cudaGetErrorString(e));
             std::exit(1);

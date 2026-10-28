@@ -10,6 +10,7 @@
 #include <thread>
 #include <mutex>
 #include <cuda_runtime.h>
+#include "strata/core/stream_trace.hpp"
 #if !defined(STRATA_EC_NO_VMM)
 #include <cuda.h>   // #533: the virtual memory management types (the functions come through the runtime's entry points)
 #endif
@@ -439,7 +440,7 @@ bool ExpertCache::open_segmented(uint64_t want, std::string& err) {
 void ExpertCache::release_segmented() {
 #if !defined(STRATA_EC_NO_VMM)
     const Vmm& v = vmm();
-    if (base_ != nullptr) cudaDeviceSynchronize();
+    if (base_ != nullptr) strata::core::st_device_sync(STRATA_ST_HERE);
     const CUdeviceptr va = reinterpret_cast<CUdeviceptr>(base_);
     for (size_t i = 0; i < segs_.size(); ++i)
         if (segs_[i] != 0) {
@@ -483,7 +484,7 @@ bool ExpertCache::shrink(int64_t keep_bytes, std::string& err) {
     int64_t keep = 0, at = 0;   // the segments [0, keep) hold the first keep_bytes
     while (keep < (int64_t) segs_.size() && at < keep_bytes) at += seg_size_[(size_t) keep++];
     if (keep >= mapped_segs_) return true;
-    if (cudaDeviceSynchronize() != cudaSuccess) {
+    if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) {
         err = std::string("the device failed before the cache shrank: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
@@ -862,7 +863,7 @@ bool ExpertCache::fill_slot_queued_parts(int32_t slot, const BlobPart* parts, in
 }
 
 bool ExpertCache::sync_queued(std::string& err) {
-    const cudaError_t e = cudaStreamSynchronize((cudaStream_t) 0);
+    const cudaError_t e = strata::core::st_stream_sync((cudaStream_t) 0, STRATA_ST_HERE);
     if (e != cudaSuccess) {
         err = std::string("ExpertCache::sync_queued: ") + cudaGetErrorString(e);
         return false;

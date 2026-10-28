@@ -5,6 +5,7 @@
 #include "strata/platform/aux_cpus.hpp"
 
 #include <cuda_runtime.h>
+#include "strata/core/stream_trace.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -147,7 +148,7 @@ inline cudaError_t copy_nonblocking(void* dst, const void* src, size_t bytes, bo
     if (e != cudaSuccess) return e;
     e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDefault, s);
     if (e != cudaSuccess || queued) return e;
-    e = cudaStreamSynchronize(s);
+    e = strata::core::st_stream_sync(s, STRATA_ST_HERE);
     core::progress_beat();   // #2049: a parked conversation is many of these; each one that lands is progress
     return e;
 }
@@ -267,9 +268,9 @@ inline cudaError_t order_after_queued() {
             ++p.events_created;
         }
     }
-    e = cudaEventRecord(events[(size_t) dev], s);
+    e = strata::core::st_record(events[(size_t) dev], s, STRATA_ST_HERE);
     if (e != cudaSuccess) return e;
-    return cudaStreamWaitEvent(nullptr, events[(size_t) dev], 0);
+    return strata::core::st_wait(nullptr, events[(size_t) dev], STRATA_ST_HERE);
 }
 
 } // namespace strata::core::conversation_detail

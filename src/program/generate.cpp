@@ -1,4 +1,15 @@
 #include "strata/core/logit_bias.hpp"
+#include "strata/core/stream_trace.hpp"
+#if defined(_WIN32)
+#include <process.h>
+static long long strata_stall_pid() { return (long long) _getpid(); }
+#else
+#include <unistd.h>
+#if defined(__linux__)
+#include <sys/prctl.h>
+#endif
+static long long strata_stall_pid() { return (long long) getpid(); }
+#endif
 // src/program/generate.cpp - P2.S6: `strata generate`.
 //
 // THE DRIVER, and the first program in this project that answers a question.  Everything below it is a
@@ -476,7 +487,7 @@ bool resident_stage_swaps(strata::core::FileExpertSource& src, const std::vector
     if (!staged.empty()) {
         for (const SwapHome& u : used) {
             const strata::core::OnDevice on(u.dev);
-            if (const cudaError_t e = cudaStreamSynchronize(u.stream); e != cudaSuccess) {
+            if (const cudaError_t e = strata::core::st_stream_sync(u.stream, STRATA_ST_HERE); e != cudaSuccess) {
                 std::fprintf(stderr, "strata: copy back sync (device %d) failed: %s\n", u.dev, cudaGetErrorString(e));
                 return false;
             }
@@ -1554,6 +1565,7 @@ constexpr int64_t kVramSafeMib =
 #endif
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
+    strata::core::stream_trace_dump(f);   // the streams' waits and records before the stall (stream_trace.hpp)
     strata::core::Progress& p = strata::core::progress();
     std::fprintf(f, "strata serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
                     "last finished step (0 = stopped, more = slow)\n", STRATA_VERSION, stage_text().c_str(),
@@ -1621,7 +1633,7 @@ void mem_mark(const char* where) {
     // "sticky" failure (#2013: unspecified launch failure surfacing in a later, unrelated call) is then pinned to
     // the step that ran the faulting work.  Only a diagnostic: it adds a synchronisation per mark.
     if (env[0] == '2') {
-        const cudaError_t sync_e = cudaDeviceSynchronize();
+        const cudaError_t sync_e = strata::core::st_device_sync(STRATA_ST_HERE);
         const cudaError_t last_e = cudaGetLastError();
         std::fprintf(stderr, "strata trace: device %s after %s (sync: %s, last error: %s)\n",
                      sync_e == cudaSuccess && last_e == cudaSuccess ? "ok" : "ERROR", where, cudaGetErrorString(sync_e),
@@ -1894,7 +1906,7 @@ bool checkpoint_save(ConvCheckpoint& c, const strata::core::SessionState& ss, co
 /// the request as before.
 bool checkpoint_failure_is_survivable() {
     (void) cudaGetLastError();   // clears a failed allocation; a sticky error is not cleared and is returned again below
-    return cudaDeviceSynchronize() == cudaSuccess;
+    return strata::core::st_device_sync(STRATA_ST_HERE) == cudaSuccess;
 }
 
 /// Puts a checkpoint's running state back; the positional cells below it are the caller's to guarantee.
@@ -2200,11 +2212,11 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
     // Windows HIP: the events do not bracket the copies there (an RX 6800 read 3,300-26,000 GB/s, so every link kept
     // the x16 share), so each burst is timed on the host between two synchronizes: 256 MiB takes ~10 ms, so the
     // synchronize around it hardly matters
-    bool ok = cudaDeviceSynchronize() == cudaSuccess;
+    bool ok = strata::core::st_device_sync(STRATA_ST_HERE) == cudaSuccess;
     for (int b = 0; b < kBursts && ok; ++b) {
         const Clock::time_point t0 = Clock::now();
         cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);
-        ok = cudaDeviceSynchronize() == cudaSuccess;
+        ok = strata::core::st_device_sync(STRATA_ST_HERE) == cudaSuccess;
         ms[b] = (float) std::chrono::duration<double, std::milli>(Clock::now() - t0).count();
     }
 #else
@@ -2219,7 +2231,7 @@ double probe_pcie_h2d_gbps(std::string* samples = nullptr) {
             cudaMemcpyAsync(d, h, kBytes, cudaMemcpyHostToDevice);
             cudaEventRecord(ev[b + 1]);
         }
-        ok = cudaEventSynchronize(ev[kBursts]) == cudaSuccess;
+        ok = strata::core::st_event_sync(ev[kBursts], STRATA_ST_HERE) == cudaSuccess;
         for (int b = 0; b < kBursts && ok; ++b) ok = cudaEventElapsedTime(&ms[b], ev[b], ev[b + 1]) == cudaSuccess;
     }
     for (int i = 0; i < n_ev; ++i) cudaEventDestroy(ev[i]);
@@ -2539,7 +2551,7 @@ struct NibbleCache {
         for (int32_t l = 0; l < (int32_t) pending.size(); ++l)
             if (!flush(l, err)) return false;
         const auto t0 = std::chrono::steady_clock::now();
-        cudaError_t e = cudaStreamSynchronize(stream);
+        cudaError_t e = strata::core::st_stream_sync(stream, STRATA_ST_HERE);
         std::vector<unsigned long long> bad(pending.size(), 0);
         if (e == cudaSuccess) e = cudaMemcpy(bad.data(), d_bad, bad.size() * 8, cudaMemcpyDeviceToHost);
         if (staging != nullptr) (void) cudaFree(staging);
@@ -2611,7 +2623,7 @@ struct NibbleCache {
             }
         }
         std::vector<unsigned long long> ref((size_t) n), now((size_t) n);
-        cudaError_t e = cudaStreamSynchronize(stream);
+        cudaError_t e = strata::core::st_stream_sync(stream, STRATA_ST_HERE);
         if (e == cudaSuccess) e = cudaMemcpy(ref.data(), d_ref, (size_t) n * 8, cudaMemcpyDeviceToHost);
         if (e == cudaSuccess) e = cudaMemcpy(now.data(), d_now, (size_t) n * 8, cudaMemcpyDeviceToHost);
         if (e != cudaSuccess) {
@@ -2768,7 +2780,7 @@ static void prime_hw_queues() {
                                                  : cudaStreamCreateWithFlags(&s, cudaStreamNonBlocking) == cudaSuccess;
         if (!ok) continue;
         cudaMemsetAsync(buf, 0, 256, s);
-        cudaStreamSynchronize(s);
+        strata::core::st_stream_sync(s, STRATA_ST_HERE);
         ss.push_back(s);
     }
     for (cudaStream_t s : ss) cudaStreamDestroy(s);
@@ -6241,7 +6253,7 @@ int main(int argc, char** argv) {
                                 uint8_t* at = pr.base() + j * lay.stride + lay.arr_off[a];
                                 if (cudaMemset(at, 0x5A, lay.arr_tight[a]) == cudaSuccess) ++ok; else ++bad;
                             }
-                        cudaDeviceSynchronize();
+                        strata::core::st_device_sync(STRATA_ST_HERE);
                         std::fprintf(stderr, "kvshare-floor: range %zu (dev %d) base=%p chunks=%lld/%lld "
                                              "probe ok=%d bad=%d\n", r, rdev, pr.base(),
                                      (long long) pr.mapped_count(), (long long) pr.chunks(), ok, bad);
@@ -6269,7 +6281,7 @@ int main(int argc, char** argv) {
         // (#167) generate mode starts from an empty sequence, and nothing else zeroes this state before the prompt
         // path or the verifier reads it (--serve zeroes it per request when nothing is reused)
         strata::core::session_zero(ss, g, nullptr, main_cs);
-        if (cudaDeviceSynchronize() != cudaSuccess) {
+        if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: zeroing the session state failed\n");
             return 1;
         }
@@ -6483,7 +6495,7 @@ int main(int argc, char** argv) {
                 strata::core::session_zero(*u, g, nullptr, nullptr);
                 bslot_ss[k].push_back(std::move(u));
             }
-            cudaDeviceSynchronize();
+            strata::core::st_device_sync(STRATA_ST_HERE);
             size_t fb = 0, tb = 0;
             cudaMemGetInfo(&fb, &tb);
             std::fprintf(stderr, "strata generate: --batch: %d slot sessions on CUDA%d (%.2f GiB each); %.2f GiB free\n",
@@ -7101,7 +7113,7 @@ int main(int argc, char** argv) {
     if (const char* e = std::getenv("STRATA_ADAPT_CALLBACK_WARMUP"); !(e && e[0] == '0')) {
         // The driver creates its host-callback thread lazily. Create it before ExpertPool pins this thread.
         if (cudaLaunchHostFunc(nullptr, [](void*) {}, nullptr) != cudaSuccess ||
-            cudaStreamSynchronize(nullptr) != cudaSuccess) {
+            strata::core::st_stream_sync(nullptr, STRATA_ST_HERE) != cudaSuccess) {
             (void) cudaGetLastError();
             std::fprintf(stderr, "strata generate: could not warm up the GPU host-callback thread (continuing)\n");
         } else {
@@ -7532,7 +7544,7 @@ int main(int argc, char** argv) {
             }
             if (!auto_cache || attempt - failed >= 6) break;
             cudaMemset(xcache.device_slot(0), 0, (size_t) xcache.bytes());
-            cudaDeviceSynchronize();
+            strata::core::st_device_sync(STRATA_ST_HERE);
             size_t free_b = 0, total_b = 0;
             free_b = strata::core::device_free_bytes(); (void) total_b;
             const int64_t want = ((int64_t) o.vram_reserve_mib << 20) + pipe_first;
@@ -8281,7 +8293,7 @@ int main(int argc, char** argv) {
                     return false;
                 }
         }
-        return o.stream_token || cudaDeviceSynchronize() == cudaSuccess;
+        return o.stream_token || strata::core::st_device_sync(STRATA_ST_HERE) == cudaSuccess;
     };
 
     strata::kernels::SamplerParams sp;
@@ -8533,7 +8545,7 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata generate: session_replay warm: %s\n", err.c_str());
             return 1;
         }
-        if (cudaDeviceSynchronize() != cudaSuccess) {
+        if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session_replay warm faulted\n");
             return 1;
         }
@@ -8545,7 +8557,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
         }
-        if (cudaDeviceSynchronize() != cudaSuccess) {
+        if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: session_replay faulted: %s\n", cudaGetErrorString(cudaGetLastError()));
             return 1;
         }
@@ -8577,7 +8589,7 @@ int main(int argc, char** argv) {
                 return 1;
             }
             // The sync is INSIDE the interval on purpose: it is the wait for the GPU, so t1 - t0 is GPU time.
-            if (cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
+            if (strata::core::st_stream_sync((cudaStream_t) main_cs, STRATA_ST_HERE) != cudaSuccess) {
                 std::fprintf(stderr, "strata generate: gpu-only-full layers faulted: %s\n",
                              cudaGetErrorString(cudaGetLastError()));
                 return 1;
@@ -8587,7 +8599,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: gpu-only-full lm_head: %s\n", err.c_str());
                 return 1;
             }
-            if (cudaStreamSynchronize((cudaStream_t) main_cs) != cudaSuccess) {
+            if (strata::core::st_stream_sync((cudaStream_t) main_cs, STRATA_ST_HERE) != cudaSuccess) {
                 std::fprintf(stderr, "strata generate: gpu-only-full head faulted: %s\n",
                              cudaGetErrorString(cudaGetLastError()));
                 return 1;
@@ -8641,7 +8653,7 @@ int main(int argc, char** argv) {
     // (the current device's legacy stream, stream 0 - nothing else; HIP has no cudaStreamLegacy name, #550).
     auto res_put = [&host_res](int32_t* dst) -> cudaError_t {
         const cudaError_t e = cudaMemcpy(dst, host_res.data(), host_res.size() * sizeof(int32_t), cudaMemcpyHostToDevice);
-        return e != cudaSuccess ? e : cudaStreamSynchronize(nullptr);
+        return e != cudaSuccess ? e : strata::core::st_stream_sync(nullptr, STRATA_ST_HERE);
     };
     int32_t* d_res = nullptr;
     int32_t* d_hit_count = nullptr;
@@ -9194,7 +9206,7 @@ int main(int argc, char** argv) {
         }
         // a device-to-device cudaMemcpy does not wait for the copy: the moves still read the slots given up, and a
         // chunk unmapped under a copy faults it (the error then sticks to whatever runs next)
-        if (gave > 0 && cudaDeviceSynchronize() != cudaSuccess) {
+        if (gave > 0 && strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) {
             std::fprintf(stderr, "strata: moving experts for the K/V failed: %s\n", cudaGetErrorString(cudaGetLastError()));
             return false;
         }
@@ -9293,7 +9305,7 @@ int main(int argc, char** argv) {
                 break;
             }
         }
-        if (cudaDeviceSynchronize() != cudaSuccess) {
+        if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) {
             std::fprintf(stderr, "strata: refilling the expert cache failed: %s\n", cudaGetErrorString(cudaGetLastError()));
             return false;
         }
@@ -10664,10 +10676,10 @@ int main(int argc, char** argv) {
             }
             for (int st = 0; st < n_stages && pipe; ++st) {
                 const strata::core::OnDevice on(stage_ver_p(st, 0).device());
-                cudaStreamSynchronize(stage_ver_p(st, 0).stream());
+                strata::core::st_stream_sync(stage_ver_p(st, 0).stream(), STRATA_ST_HERE);
             }
             const strata::core::OnDevice on(mtp.device());
-            cudaStreamSynchronize(mtp.stream());
+            strata::core::st_stream_sync(mtp.stream(), STRATA_ST_HERE);
         };
         std::vector<int64_t> cur;
         // ---- the conversation cache (see ConvCheckpoint).  `live` is what the session holds right now: the tokens
@@ -10837,7 +10849,7 @@ int main(int argc, char** argv) {
                 // leaves what mapped mapped - the next attempt of the same extent completes it.
                 kv_pages.init(kvsh_pool_pages, kvsh_pages_per_extent,
                     [this0 = &kvsh_map_extent](int64_t e) -> bool {
-                        cudaDeviceSynchronize();   // the elastic rule: mapping runs on a quiet device
+                        strata::core::st_device_sync(STRATA_ST_HERE);   // the elastic rule: mapping runs on a quiet device
                         return (*this0)(e);
                     },
                     [this1 = &kvsh_unmap_extent](int64_t e) { (*this1)(e); });
@@ -10907,7 +10919,7 @@ int main(int argc, char** argv) {
                                     i = e + 1;
                                 }
                             }
-                        if (ok) ok = cudaStreamSynchronize(kvsh_stream_for(r)) == cudaSuccess;
+                        if (ok) ok = strata::core::st_stream_sync(kvsh_stream_for(r), STRATA_ST_HERE) == cudaSuccess;
                         if (!ok) break;
                         for (int64_t j = 0; j < kvsh_q_n[r]; ++j)
                             for (int64_t a = 0; a < kvsh_lay.arrays; ++a) {
@@ -10966,7 +10978,7 @@ int main(int argc, char** argv) {
                                     i = e + 1;
                                 }
                             }
-                        if (ok) ok = cudaStreamSynchronize(kvsh_stream_for(r)) == cudaSuccess;
+                        if (ok) ok = strata::core::st_stream_sync(kvsh_stream_for(r), STRATA_ST_HERE) == cudaSuccess;
                     }
                     if (!ok) {
                         std::fprintf(stderr, "kvshare-swap: the batched copy in failed\n");
@@ -10988,7 +11000,7 @@ int main(int argc, char** argv) {
                 cudaStream_t cs = kvsh_stream_for(r);
                 for (int64_t j = 0; j < s.qsa_alloc; ++j)
                     strata::core::qsa_state_set_table(s.qsa_states[s.qsa_ord0 + j], g, tab.data(), cs);
-                cudaStreamSynchronize(cs);   // (the table's host copy may change right after this call)
+                strata::core::st_stream_sync(cs, STRATA_ST_HERE);   // (the table's host copy may change right after this call)
             };
             if (si > 0) {   // a batch slot: its session on every stage
                 for (size_t k = 0; k < bslot_ss.size(); ++k)
@@ -11020,7 +11032,7 @@ int main(int argc, char** argv) {
                                             cudaMemcpyDeviceToDevice, kvsh_stream_for(k)) != cudaSuccess)
                             return false;
                     }
-                if (cudaStreamSynchronize(kvsh_stream_for(k)) != cudaSuccess) return false;
+                if (strata::core::st_stream_sync(kvsh_stream_for(k), STRATA_ST_HERE) != cudaSuccess) return false;
             }
             return true;
         };
@@ -11321,7 +11333,7 @@ int main(int argc, char** argv) {
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
                     const strata::core::OnDevice on(st->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) { err = "stage sync failed"; return false; }
+                    if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { err = "stage sync failed"; return false; }
                     const strata::core::ConversationView view_k{src.ids, src.imgs, cs.parts[k], src.cvec};
                     strata::core::SavedConversation part;
                     if (!strata::core::conversation_snapshot_save(part, view_k, *src.stage_sessions[k], g, draft_of(k), err,
@@ -11421,7 +11433,7 @@ int main(int argc, char** argv) {
             double sync_ms = 0.0, save_ms = 0.0, evict_ms = 0.0, read_ms = 0.0, windows_ms = 0.0;
         } req_times;
         auto gpu_sync_ok = [&]() -> bool {
-            const cudaError_t e = cudaDeviceSynchronize();
+            const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
             if (e == cudaSuccess) return true;
             ckpt_why = std::string(": the GPU stopped responding before it (") + cudaGetErrorString(e) +
                        ") - a GPU hang; on Windows the driver is then reset";
@@ -11465,7 +11477,7 @@ int main(int argc, char** argv) {
                     try {
                         const Clock::time_point p0 = Clock::now();
                         const strata::core::OnDevice on(k == 0 ? -1 : stages[k - 1]->dev);
-                        const cudaError_t e = cudaDeviceSynchronize();
+                        const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
                         if (e != cudaSuccess) {
                             why[k] = std::string(": the GPU stopped responding before it (") + cudaGetErrorString(e) +
                                      ") - a GPU hang; on Windows the driver is then reset";
@@ -11924,11 +11936,11 @@ int main(int argc, char** argv) {
         auto apply_pending = [&](bool wait) {
             if (peer.valid()) peer.apply_pending(wait);
             if (pending.empty()) return;
-            if (wait) cudaEventSynchronize(adapt_ev);
+            if (wait) strata::core::st_event_sync(adapt_ev, STRATA_ST_HERE);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) return;
             for (auto& st : stages)
                 if (st->adapt_live) {
-                    if (wait) cudaEventSynchronize(st->adapt_ev);
+                    if (wait) strata::core::st_event_sync(st->adapt_ev, STRATA_ST_HERE);
                     else if (cudaEventQuery(st->adapt_ev) != cudaSuccess) return;
                 }
             for (auto& st : stages) st->adapt_live = false;
@@ -12010,10 +12022,10 @@ int main(int argc, char** argv) {
                 drive.d.res_dirty_idx.clear();
             }
             if (!check) return true;
-            cudaStreamSynchronize(ver.stream());   // the patches landed (the verifier streams do not block the read)
+            strata::core::st_stream_sync(ver.stream(), STRATA_ST_HERE);   // the patches landed (the verifier streams do not block the read)
             for (auto& st : stages) {
                 const strata::core::OnDevice on(st->dev);
-                cudaStreamSynchronize(st->ver.stream());
+                strata::core::st_stream_sync(st->ver.stream(), STRATA_ST_HERE);
             }
             int64_t bad = 0;
             for (auto& st : stages) {   // the later stages' copies first: res_back ends with CUDA0's (the pool's check)
@@ -12175,7 +12187,7 @@ int main(int argc, char** argv) {
                         while (cur < t->layer && !t->gate->landed.compare_exchange_weak(cur, t->layer, std::memory_order_release)) {}
                     }, &agate.ticks[(size_t) s.layer])) != cudaSuccess) {
                     (void) cudaGetLastError();
-                    cudaStreamSynchronize(adapt_stream);   // no callback: wait here, the gate opens at once
+                    strata::core::st_stream_sync(adapt_stream, STRATA_ST_HERE);   // no callback: wait here, the gate opens at once
                     agate.landed.store((int32_t) g.n_layers, std::memory_order_release);
                 }
             }
@@ -12189,7 +12201,7 @@ int main(int argc, char** argv) {
                              cudaGetErrorString(cudaGetLastError()));
                 return false;
             }
-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            if (!swaps.empty()) strata::core::st_record(adapt_ev, adapt_stream, STRATA_ST_HERE);
             // #2188: hand the copies and their landing signals to the GPU now.  WDDM batches a stream's work until a
             // driver call flushes it, and the verify window only spins on the pinned int (Linux submits at once: no-op)
             if (aov && agate.hland != nullptr && !swaps.empty()) (void) cudaStreamQuery(adapt_stream);
@@ -12197,7 +12209,7 @@ int main(int argc, char** argv) {
             for (auto& st : stages)
                 if (st->adapt_live) {
                     const strata::core::OnDevice on(st->dev);
-                    cudaEventRecord(st->adapt_ev, st->adapt_stream);
+                    strata::core::st_record(st->adapt_ev, st->adapt_stream, STRATA_ST_HERE);
                 }
             // #477: the routing counted since the start (each count adds up to 1 / (1 - --adapt-decay) over its
             // decays: the sum is proportional to the routing itself) - only with --expert-profile-save, else `heat`
@@ -12327,7 +12339,7 @@ int main(int argc, char** argv) {
         };
         auto a_mark = [&](AHome& h) {   // an event after the copies just queued on h's stream, submitted now (WDDM)
             const strata::core::OnDevice on(h.dev);
-            if (cudaEventRecord(h.ev, h.stream) != cudaSuccess) a_err = true;
+            if (strata::core::st_record(h.ev, h.stream, STRATA_ST_HERE) != cudaSuccess) a_err = true;
             (void) cudaStreamQuery(h.stream);
             h.used = true;
         };
@@ -12462,7 +12474,7 @@ int main(int argc, char** argv) {
             for (AHome& h : ahomes)
                 if (h.used) {
                     const strata::core::OnDevice on(h.dev);
-                    if (wait) { if (cudaEventSynchronize(h.ev) != cudaSuccess) a_err = true; }
+                    if (wait) { if (strata::core::st_event_sync(h.ev, STRATA_ST_HERE) != cudaSuccess) a_err = true; }
                     else if (const cudaError_t q = cudaEventQuery(h.ev); q == cudaErrorNotReady) return false;
                     else if (q != cudaSuccess) a_err = true;
                 }
@@ -12626,12 +12638,12 @@ int main(int argc, char** argv) {
         // tier's swaps have landed AND the asynchronous round in flight is finished - a swap still copying could write a
         // slot the K/V is lent.  A failed refill is surfaced as ERR at the next tick (a_err).
         auto adapt_quiesce = [&] {
-            cudaDeviceSynchronize();
+            strata::core::st_device_sync(STRATA_ST_HERE);
             apply_pending(true);
             if (!adapt_tick(true)) {   // a failed round still has copies in flight: they land before any slot moves
                 a_err = true;
                 if (ajob) ajob->wait();
-                cudaDeviceSynchronize();
+                strata::core::st_device_sync(STRATA_ST_HERE);
             }
         };
         // ---- --kv-share: THE VRAM EXCHANGE with the expert caches (one chunk loan per GPU, --kv-grow's model) ----
@@ -12740,7 +12752,7 @@ int main(int argc, char** argv) {
             while (!busy && (int64_t) L.spare.size() + freeable() < n_batch && L.lo > L.floor) {
                 if (!quiet) {
                     adapt_quiesce();
-                    for (size_t kk = 0; kk < xcl.size(); ++kk) { const strata::core::OnDevice on_q(xcl[kk].dev); cudaDeviceSynchronize(); }
+                    for (size_t kk = 0; kk < xcl.size(); ++kk) { const strata::core::OnDevice on_q(xcl[kk].dev); strata::core::st_device_sync(STRATA_ST_HERE); }
                     quiet = true;
                 }
                 --L.lo;
@@ -12753,7 +12765,7 @@ int main(int argc, char** argv) {
             const strata::core::OnDevice on_k(L.dev);
             if (dirty && res_put(L.d_res) != cudaSuccess)
                 std::fprintf(stderr, "strata serve: --kv-share: the residency table upload failed after lending slots\n");
-            if (dirty) cudaDeviceSynchronize();
+            if (dirty) strata::core::st_device_sync(STRATA_ST_HERE);
             {
                 const int64_t c0 = (int64_t) ((L.cache->slot_offset(L.lo) + G - 1) / G);
                 const int64_t c1 = (int64_t) (L.cache->slot_offset(L.top) / G);
@@ -12816,7 +12828,7 @@ int main(int argc, char** argv) {
                         break;
                     }
                 }
-                if (cudaDeviceSynchronize() == cudaSuccess) {
+                if (strata::core::st_device_sync(STRATA_ST_HERE) == cudaSuccess) {
                     for (const auto& [i, sl] : filled) host_res[i] = sl;
                     L.refilled += (int64_t) filled.size();
                     if (!filled.empty() && res_put(L.d_res) != cudaSuccess)
@@ -13227,6 +13239,17 @@ int main(int argc, char** argv) {
                                      launch_blocking() ? "; CUDA_LAUNCH_BLOCKING=1 is set, and no verify window can "
                                                          "finish with it (#1341)" : "");
                         stall_report(stderr, p.ticks.load() - ticks_at);
+                        // STRATA_STALL_HOLD_S=N (a diagnosis): keep the stalled process alive N s first, so a debugger can
+                        // attach from outside and list the kernels still running on the cards (cuda-gdb -p <pid>)
+                        if (const char* hold = std::getenv("STRATA_STALL_HOLD_S"); hold != nullptr && std::atoi(hold) > 0) {
+                            std::fprintf(stderr, "strata serve: STRATA_STALL_HOLD_S: holding %d s for a debugger to attach (pid %lld)\n",
+                                         std::atoi(hold), (long long) strata_stall_pid());
+                            std::fflush(stderr);
+#if defined(__linux__)
+                            (void) prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);   // Yama: let a debugger of this user attach
+#endif
+                            std::this_thread::sleep_for(std::chrono::seconds(std::atoi(hold)));
+                        }
                         strata::core::release_gpu_waits(stderr);   // #267: no spin kernel outlives the process
                         std::fflush(stderr);
                         std::abort();
@@ -13307,7 +13330,7 @@ int main(int argc, char** argv) {
                 if (!p.lent.empty()) { e = "VRAM: a prompt's loan is still out"; return false; }
             if (!ver.wait_commit(e)) return false;
             adapt_quiesce();                         // the adaptive tier's swaps in flight land first (async too)
-            if (cudaDeviceSynchronize() != cudaSuccess) {
+            if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) {
                 e = std::string("VRAM: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -13526,7 +13549,7 @@ int main(int argc, char** argv) {
                 bool ok = true;
                 for (size_t k = 0; k < bslot_ss.size(); ++k) {
                     const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                    ok = cudaDeviceSynchronize() == cudaSuccess && ok;
+                    ok = strata::core::st_device_sync(STRATA_ST_HERE) == cudaSuccess && ok;
                 }
                 return ok;
             };
@@ -13584,7 +13607,7 @@ int main(int argc, char** argv) {
                     strata::core::SessionState& from = k == 0 ? ss : stages[k - 1]->ss;
                     strata::core::SessionState& to = *bslot_ss[k][(size_t) b];
                     const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch admission: device sync failed"; return false; }
+                    if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { se = "batch admission: device sync failed"; return false; }
                     strata::core::ConversationCheckpoint ck;
                     ck.ids = ids;
                     if (!strata::core::conversation_checkpoint_save(ck, from, g, se) ||
@@ -13597,13 +13620,13 @@ int main(int argc, char** argv) {
                         if (!strata::core::conversation_kv_save(*img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, se,
                                                                 0, nullptr, kvshs.t()))
                             return false;
-                        if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch admission: device sync failed"; return false; }
+                        if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { se = "batch admission: device sync failed"; return false; }
                         if (!strata::core::conversation_kv_restore(*img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, se,
                                                                    kvshs.st(b),
                                                                    (int64_t) kvshs.sess[(size_t) b + 1].cached.size()))
                             return false;
                     }
-                    if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch admission: device sync failed"; return false; }
+                    if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { se = "batch admission: device sync failed"; return false; }
                     return true;
                 };
                 if (stage_pool) {
@@ -13628,7 +13651,7 @@ int main(int argc, char** argv) {
                     !strata::core::conversation_kv_save(*image, mtp.kv_state(), draft_geometry, upto, false, e) ||
                     !strata::core::conversation_kv_restore(*image, slot_mtp[(size_t) b]->kv_state(),
                                                            draft_geometry, upto, false, e) ||
-                    cudaDeviceSynchronize() != cudaSuccess)
+                    strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess)
                     return false;
                 slot_mtp[(size_t) b]->set_prompt_len(upto);
             }
@@ -13658,7 +13681,7 @@ int main(int argc, char** argv) {
                     strata::core::SessionState& from = *bslot_ss[k][(size_t) b];
                     strata::core::SessionState& to = k == 0 ? ss : stages[k - 1]->ss;
                     const strata::core::OnDevice on_k(k == 0 ? 0 : stages[k - 1]->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch slot restore: device sync failed"; return false; }
+                    if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { se = "batch slot restore: device sync failed"; return false; }
                     if (at != nullptr) {
                         if (!strata::core::conversation_checkpoint_restore(k == 0 ? *at : at->stage_parts[k - 1], to, g, se))
                             return false;
@@ -13676,12 +13699,12 @@ int main(int argc, char** argv) {
                         if (!strata::core::conversation_kv_save(*img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, se,
                                                                 0, nullptr, kvshs.st(b)))
                             return false;
-                        if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch slot restore: device sync failed"; return false; }
+                        if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { se = "batch slot restore: device sync failed"; return false; }
                         if (!strata::core::conversation_kv_restore(*img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, se,
                                                                    kvshs.t(), (int64_t) kvshs.sess[0].cached.size()))
                             return false;
                     }
-                    if (cudaDeviceSynchronize() != cudaSuccess) { se = "batch slot restore: device sync failed"; return false; }
+                    if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { se = "batch slot restore: device sync failed"; return false; }
                     return true;
                 };
                 if (stage_pool) {
@@ -13704,7 +13727,7 @@ int main(int argc, char** argv) {
                     !strata::core::conversation_kv_save(*image, slot_mtp[(size_t) b]->kv_state(),
                                                         draft_geometry, upto, false, e) ||
                     !strata::core::conversation_kv_restore(*image, mtp.kv_state(), draft_geometry, upto, false, e) ||
-                    cudaDeviceSynchronize() != cudaSuccess)
+                    strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess)
                     return false;
                 mtp.set_prompt_len(upto);
             }
@@ -13732,7 +13755,7 @@ int main(int argc, char** argv) {
             if (in_main || conversations.holds(sl.ids, {}, sl.cvec)) return;
             // (a slot without a drafter of its own parks without a draft ring: the restore beside the main drafter clears
             // the drafter's ring for the resumed range, mtp_after_restore)
-            if (cudaDeviceSynchronize() != cudaSuccess) {
+            if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) {
                 std::fprintf(stderr, "strata serve: conversation cache: slot %d not parked before its overwrite (device sync "
                                      "failed)\n", b);
                 return;
@@ -14200,8 +14223,8 @@ int main(int argc, char** argv) {
                 const float* src = vk.final_R_all() + (size_t) blk.f * stride;
                 if (cudaMemcpyAsync(slot_mtp_rows[(size_t) blk.b].get(), src, (size_t) blk.n * stride * sizeof(float),
                                     cudaMemcpyDeviceToDevice, vk.stream()) != cudaSuccess ||
-                    cudaEventRecord(pm_copied[(size_t) blk.b], vk.stream()) != cudaSuccess ||
-                    cudaStreamWaitEvent(slot_mtp[(size_t) blk.b]->stream(), pm_copied[(size_t) blk.b], 0) != cudaSuccess ||
+                    strata::core::st_record(pm_copied[(size_t) blk.b], vk.stream(), STRATA_ST_HERE) != cudaSuccess ||
+                    strata::core::st_wait(slot_mtp[(size_t) blk.b]->stream(), pm_copied[(size_t) blk.b], STRATA_ST_HERE) != cudaSuccess ||
                     !slot_mtp[(size_t) blk.b]->chain_launch(blk.n, outb + blk.f, G.pos[blk.f], blk.keep - 1, nullptr, 0,
                                                             pm_drafts, 0, err)) {
                     std::printf("ERR batch MTP slot %d: %s\n", blk.b,
@@ -14221,7 +14244,7 @@ int main(int argc, char** argv) {
             for (int k = 0; k < n_pipe; ++k) {
                 strata::core::Verifier& vk = stage_verifier(k);
                 const strata::core::OnDevice on_k(vk.device());
-                if (cudaStreamSynchronize(vk.stream()) != cudaSuccess) {
+                if (strata::core::st_stream_sync(vk.stream(), STRATA_ST_HERE) != cudaSuccess) {
                     std::printf("ERR a pipelined commit failed on stage %d\n", k + 1); std::fprintf(stderr, "strata serve: ERR a pipelined commit failed on stage %d\n", k + 1);
                     return false;
                 }
@@ -14556,14 +14579,14 @@ int main(int argc, char** argv) {
                 for (size_t k = 0; ok && k < stages.size(); ++k) {
                     const strata::core::ConversationView view_k{sl.ids, no_imgs, csplit.parts[k], sl.cvec};
                     const strata::core::OnDevice on_k(stages[k]->dev);
-                    if (cudaDeviceSynchronize() != cudaSuccess) { perr = "stage sync failed"; ok = false; break; }
+                    if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { perr = "stage sync failed"; ok = false; break; }
                     size_t part = 0;
                     if (!strata::core::conversation_snapshot_capture_bytes({}, view_k, *bslot_ss[k + 1][(size_t) b],
                                                                             g, nullptr, part, perr)) { ok = false; break; }
                     estimate += part;
                 }
                 if (ok) ok = conversations.make_room(estimate, 0);
-                if (ok && cudaDeviceSynchronize() == cudaSuccess &&
+                if (ok && strata::core::st_device_sync(STRATA_ST_HERE) == cudaSuccess &&
                     strata::core::conversation_snapshot_save(image, view0, *bslot_ss[0][(size_t) b], g, nullptr,
                                                              perr, {}, nullptr, nullptr, nullptr, kvshs.st(b),
                                                              kvshs.sess[(size_t) b + 1].last_reg)) {
@@ -14571,7 +14594,7 @@ int main(int argc, char** argv) {
                         const strata::core::ConversationView view_k{sl.ids, no_imgs, csplit.parts[k], sl.cvec};
                         const strata::core::OnDevice on_k(stages[k]->dev);
                         strata::core::SavedConversation part;
-                        if (cudaDeviceSynchronize() != cudaSuccess ||
+                        if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess ||
                             !strata::core::conversation_snapshot_save(part, view_k, *bslot_ss[k + 1][(size_t) b], g,
                                                                       nullptr, perr, {}, nullptr, nullptr, nullptr, kvshs.st(b),
                                                                       kvshs.sess[(size_t) b + 1].last_reg)) {
@@ -14655,7 +14678,7 @@ int main(int argc, char** argv) {
             if (!use_mtp || strata::core::conversation_snapshot_has_draft(carrier, carrier_ss)) return;
             const strata::core::OnDevice on_m(mtp.device());
             strata::core::qsa_state_zero(mtp.kv_state(), draft_geometry, nullptr);
-            (void) cudaDeviceSynchronize();
+            (void) strata::core::st_device_sync(STRATA_ST_HERE);
             mtp.set_prompt_len(at);
             std::fprintf(stderr, "strata serve: conversation cache: the parked image carried no draft K/V: the drafter's ring "
                                  "starts empty at %lld\n", (long long) at);
@@ -15211,7 +15234,7 @@ int main(int argc, char** argv) {
                     for (int64_t c = n; ve.empty() && c < cells; ++c) put(c, p + (c - n), p + (c - n), p + (c - n));
                 }
                 tr("positions built", (long long) img_rows.size());
-                cudaDeviceSynchronize();
+                strata::core::st_device_sync(STRATA_ST_HERE);
                 tr("device idle");
                 // CUDA0's table and, with a layer split, every later stage's (each device reads its own)
                 auto upload_mrope = [&]() -> bool {
@@ -15219,7 +15242,7 @@ int main(int argc, char** argv) {
                                          cudaMemcpyHostToDevice) == cudaSuccess;
                     for (auto& st : stages) {
                         const strata::core::OnDevice on(st->dev);
-                        cudaDeviceSynchronize();
+                        strata::core::st_device_sync(STRATA_ST_HERE);
                         ok = ok && cudaMemcpy(st->mrope, mrope_host.data(), mrope_host.size() * sizeof(int32_t),
                                               cudaMemcpyHostToDevice) == cudaSuccess;
                     }
@@ -15820,7 +15843,7 @@ int main(int argc, char** argv) {
                                     err.c_str());
                         return 1;
                     }
-                    if (cudaDeviceSynchronize() != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
+                    if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { std::printf("ERR stage sync\n"); return 1; }
                 }
                 if (stages.empty() || mtp_first) mtp_after_restore(*incoming, ss, parked.tokens);
                 else mtp_after_restore(incoming->stage_images.back(), stages.back()->ss, parked.tokens);
@@ -15894,11 +15917,11 @@ int main(int argc, char** argv) {
             int64_t reread_to = -1;   // STRATA_CKPT_REREAD only: read [0, reread_to) again instead of restoring
             if (resume == 0) {
                 strata::core::session_zero(ss, g, nullptr, main_cs);
-                cudaStreamSynchronize(main_stream);
+                strata::core::st_stream_sync(main_stream, STRATA_ST_HERE);
                 for (auto& st : stages) {
                     const strata::core::OnDevice on(st->dev);
                     strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
-                    cudaStreamSynchronize(st->stream);
+                    strata::core::st_stream_sync(st->stream, STRATA_ST_HERE);
                 }
                 checks.clear();
             } else if (!from_live) {
@@ -15918,11 +15941,11 @@ int main(int argc, char** argv) {
                     // (--adapt-swaps 0) the answer must match the restored one token for token; anything the
                     // checkpoint missed shows up as a difference.
                     strata::core::session_zero(ss, g, nullptr, main_cs);
-                    cudaStreamSynchronize(main_stream);
+                    strata::core::st_stream_sync(main_stream, STRATA_ST_HERE);
                     for (auto& st : stages) {
                         const strata::core::OnDevice on(st->dev);
                         strata::core::session_zero(st->ss, g, nullptr, (void*) st->stream);
-                        cudaStreamSynchronize(st->stream);
+                        strata::core::st_stream_sync(st->stream, STRATA_ST_HERE);
                     }
                     reread_to = resume;
                     std::fprintf(stderr, "strata serve: STRATA_CKPT_REREAD: reading %lld tokens again instead of "
@@ -16105,7 +16128,7 @@ int main(int argc, char** argv) {
                         strata::core::Verifier& v = *PV[1][l1 & 1];
                         if (pl_mtp_live[l1 & 1]) {   // the drafter has read this parity's previous rows first
                             const strata::core::OnDevice on(mtp.device());
-                            cudaStreamWaitEvent(v.stream(), pl_mtp_ev[l1 & 1], 0);
+                            strata::core::st_wait(v.stream(), pl_mtp_ev[l1 & 1], STRATA_ST_HERE);
                         }
                         if (!v.pl_launch(w.T, w1.data(), w.q, e) || !v.pl_commit_async(w.T, e)) return fail(e);
                         ++l1;
@@ -16121,7 +16144,7 @@ int main(int argc, char** argv) {
                             if (!mtp.prefill(v.final_R(0), nx.data(), w.T, w.q, e, false)) return fail(e);
                             {
                                 const strata::core::OnDevice on(mtp.device());
-                                cudaEventRecord(pl_mtp_ev[f1 & 1], mtp.stream());
+                                strata::core::st_record(pl_mtp_ev[f1 & 1], mtp.stream(), STRATA_ST_HERE);
                             }
                             pl_mtp_live[f1 & 1] = true;
                             pp_reached = w.q + w.T;   // #471
@@ -17445,10 +17468,10 @@ int main(int argc, char** argv) {
                     const strata::core::OnDevice on(sn.dev);
                     cudaStream_t cs = pl_stream[(size_t) st];
                     const int q = seq & 1;
-                    return cudaEventRecord(sn.pre[q], cs) == cudaSuccess &&
-                           cudaStreamWaitEvent(sn.side, sn.pre[q], 0) == cudaSuccess &&
+                    return strata::core::st_record(sn.pre[q], cs, STRATA_ST_HERE) == cudaSuccess &&
+                           strata::core::st_wait(sn.side, sn.pre[q], STRATA_ST_HERE) == cudaSuccess &&
                            cudaMemcpyAsync(sn.buf[q], sn.state, sn.bytes, cudaMemcpyDeviceToDevice, sn.side) == cudaSuccess &&
-                           cudaEventRecord(sn.ev[q], sn.side) == cudaSuccess &&
+                           strata::core::st_record(sn.ev[q], sn.side, STRATA_ST_HERE) == cudaSuccess &&
                            (cudaStreamQuery(sn.side), true);
                 };
                 PW A, B, D;              // A: the oldest window not verified; B: the next; D: a wrong speculative window
@@ -17556,7 +17579,7 @@ int main(int argc, char** argv) {
                 auto stage_record = [&](std::vector<cudaEvent_t>& ev) {   // after the work every stage's stream holds now
                     for (int st = 0; st < n_stages; ++st) {
                         const strata::core::OnDevice on(stage_ver_p(st, 0).device());
-                        cudaEventRecord(ev[(size_t) st], pl_stream[(size_t) st]);
+                        strata::core::st_record(ev[(size_t) st], pl_stream[(size_t) st], STRATA_ST_HERE);
                         (void) cudaStreamQuery(pl_stream[(size_t) st]);
                     }
                 };
@@ -17855,7 +17878,7 @@ int main(int argc, char** argv) {
                             cudaStream_t cs = pl_stream[(size_t) st];
                             {
                                 const strata::core::OnDevice on(sn.dev);
-                                if (pl_snap_overlap ? cudaStreamWaitEvent(cs, sn.ev[A.seq & 1], 0) != cudaSuccess
+                                if (pl_snap_overlap ? strata::core::st_wait(cs, sn.ev[A.seq & 1], STRATA_ST_HERE) != cudaSuccess
                                                     : cudaMemcpyAsync(sn.buf[0], sn.state, sn.bytes,
                                                                       cudaMemcpyDeviceToDevice, cs) != cudaSuccess)
                                     return die("the GDN snapshot failed");
@@ -18568,7 +18591,7 @@ int main(int argc, char** argv) {
             if (state_hash && !cancelled && o.prompt_cache > 0) {   // every finished request, ckpt=0 too (parity gates)
                 // DEBUG: a fingerprint of every part of the session over the positions it holds ([0, L)), and
                 // separately of what lies past them in the last KV page (stale cells, fine unless something reads them)
-                if (cudaDeviceSynchronize() != cudaSuccess) {
+                if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) {
                     std::printf("ERR synchronizing state fingerprint\n");
                     return 1;
                 }
@@ -19094,7 +19117,7 @@ int main(int argc, char** argv) {
                 // the elastic K/V first: its hot experts move into slots of the loan, which are refilled after it
                 kvg_started = true;
                 kvg_start(first);
-                if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+                if (!kvg_ensure(n_prompt + o.max_new + 64, [] { strata::core::st_device_sync(STRATA_ST_HERE); })) return 1;
                 for (size_t i = 0; i < host_res.size(); ++i)
                     if (host_res[i] >= first) {
                         lent.emplace_back((int32_t) i, host_res[i]);
@@ -19141,7 +19164,7 @@ int main(int argc, char** argv) {
         if (!kvg_started) {   // the elastic K/V: every cell this run can reach (no loan)
             kvg_started = true;
             kvg_start(xcache.slots());
-            if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+            if (!kvg_ensure(n_prompt + o.max_new + 64, [] { strata::core::st_device_sync(STRATA_ST_HERE); })) return 1;
         }
         const Clock::time_point tp0 = Clock::now();
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
@@ -19199,7 +19222,7 @@ int main(int argc, char** argv) {
     if (!kvg_started) {   // the elastic K/V of a prompt that was not read in batches
         kvg_started = true;
         kvg_start(xcache.slots());
-        if (!kvg_ensure(n_prompt + o.max_new + 64, [] { cudaDeviceSynchronize(); })) return 1;
+        if (!kvg_ensure(n_prompt + o.max_new + 64, [] { strata::core::st_device_sync(STRATA_ST_HERE); })) return 1;
     }
     for (int64_t pos = pos_start;; ++pos) {
         // plan v0.3 P6: a native pack's last prompt token is the first verify window (T = 1)
@@ -19312,7 +19335,7 @@ int main(int argc, char** argv) {
         // memory access" at a plane offset that has nothing to do with the fault, and the layer that actually
         // faulted had completed its own error checks successfully - because its kernels had not run yet.  A
         // sticky error surfaces at the next SYNCHRONISING call, which is whatever happens to come next.
-        if (!o.stream_token && cudaDeviceSynchronize() != cudaSuccess) {
+        if (!o.stream_token && strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: the device faulted in lm_head at position %lld: %s\n",
                          (long long) pos, cudaGetErrorString(cudaGetLastError()));
             return 1;
@@ -19327,7 +19350,7 @@ int main(int argc, char** argv) {
         const bool read_logits = !o.stream_token || o.check_logits || emit_logits;
         if (read_logits && (cudaMemcpyAsync(logits.data(), d_logits, (size_t) n_vocab * 4,
                                            cudaMemcpyDeviceToHost, (cudaStream_t) token_stream) != cudaSuccess ||
-                            cudaStreamSynchronize((cudaStream_t) token_stream) != cudaSuccess)) {
+                            strata::core::st_stream_sync((cudaStream_t) token_stream, STRATA_ST_HERE) != cudaSuccess)) {
             std::fprintf(stderr, "strata generate: reading the logits back failed\n");
             return 1;
         }
@@ -19369,7 +19392,7 @@ int main(int argc, char** argv) {
         strata::kernels::sample_tokens(d_logits, 1, (int) n_vocab, nullptr, 0, sp, d_next, token_stream);
         if (cudaMemcpyAsync(&next, d_next, sizeof(int), cudaMemcpyDeviceToHost,
                             (cudaStream_t) token_stream) != cudaSuccess ||
-            cudaStreamSynchronize((cudaStream_t) token_stream) != cudaSuccess) {
+            strata::core::st_stream_sync((cudaStream_t) token_stream, STRATA_ST_HERE) != cudaSuccess) {
             std::fprintf(stderr, "strata generate: reading the sampled token back failed: %s\n",
                          cudaGetErrorString(cudaGetLastError()));
             return 1;
@@ -19558,7 +19581,7 @@ int main(int argc, char** argv) {
                     drive.d.res_dirty_idx.clear();
                 }
                 if (!res_checking) return true;
-                cudaStreamSynchronize(cs);   // the patch landed
+                strata::core::st_stream_sync(cs, STRATA_ST_HERE);   // the patch landed
                 const int64_t bad = res_check(d_res, host_res, res_back, g.n_expert, res_windows);
                 ++res_windows;
                 res_bad += bad;
@@ -19583,7 +19606,7 @@ int main(int argc, char** argv) {
             if (pending.empty()) return;
             // STRATA_TRACE_ADAPT=1: whether a round's copies had landed when the next window read the table
             static const bool trace_pending = std::getenv("STRATA_TRACE_ADAPT") != nullptr;
-            if (wait) cudaEventSynchronize(adapt_ev);
+            if (wait) strata::core::st_event_sync(adapt_ev, STRATA_ST_HERE);
             else if (cudaEventQuery(adapt_ev) != cudaSuccess) {
                 if (trace_pending)
                     std::fprintf(stderr, "strata: PENDING not landed, %zu stay non-resident this window\n",
@@ -19701,7 +19724,7 @@ int main(int argc, char** argv) {
                 std::fprintf(stderr, "strata generate: an adaptive refill failed\n");
                 return false;
             }
-            if (!swaps.empty()) cudaEventRecord(adapt_ev, adapt_stream);
+            if (!swaps.empty()) strata::core::st_record(adapt_ev, adapt_stream, STRATA_ST_HERE);
             if (trace_adapt)
                 std::fprintf(stderr, "strata: ADAPT round=%lld swapped %zu of %d slots, usage decayed\n",
                              (long long) adapt_rounds, swaps.size(), o.adapt_swaps);

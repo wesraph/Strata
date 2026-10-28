@@ -11,6 +11,7 @@
 #include <future>
 #include <limits>
 #include <mutex>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::core {
 namespace {
@@ -30,7 +31,7 @@ bool fail(std::string& error, const char* message) {
 }
 
 bool sync(std::string& error) {
-    const auto status = cudaDeviceSynchronize();
+    const auto status = strata::core::st_device_sync(STRATA_ST_HERE);
     if (status == cudaSuccess) return true;
     error = std::string("conversation snapshot synchronize: ") + cudaGetErrorString(status);
     return false;
@@ -350,8 +351,8 @@ bool checkpoint_save(ConversationCheckpoint& c, const SessionState& ss, const Mo
                 for (size_t o = 0; e == cudaSuccess && o < n; o += PIECE) {
                     const size_t k = std::min(PIECE, n - o);
                     e = cudaMemcpyAsync((uint8_t*) host + o, stage + o, k, cudaMemcpyDeviceToHost, st);
-                    if (e == cudaSuccess) e = cudaEventRecord(done, st);
-                    if (e == cudaSuccess) e = cudaEventSynchronize(done);
+                    if (e == cudaSuccess) e = strata::core::st_record(done, st, STRATA_ST_HERE);
+                    if (e == cudaSuccess) e = strata::core::st_event_sync(done, STRATA_ST_HERE);
                     if (e == cudaSuccess) std::memcpy(dst + o, (const uint8_t*) host + o, k);
                 }
                 if (done) (void) cudaEventDestroy(done);

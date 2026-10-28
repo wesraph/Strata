@@ -22,6 +22,7 @@
 #include <mutex>
 #include <thread>
 #include <vector>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::core {
 namespace {
@@ -455,7 +456,7 @@ bool NativeDense::load(const std::vector<std::string>& shards, WeightTable& tabl
                 allocated += alloc_bytes(bytes);
                 ++made;
             }
-            if (made && (cudaGetLastError() != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess)) {
+            if (made && (cudaGetLastError() != cudaSuccess || strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess)) {
                 err = "native dense (STRATA_HC_Q8): quantizing the projections failed"; return false;
             }
         }
@@ -541,7 +542,7 @@ const uint16_t* NativeDense::hc_bf16_view(const WeightRef& w, void* stream, int 
     void* buf = g_hc_scratch[dev][cls][slot];
     if (buf == nullptr) return nullptr;
     // the prompt path: the scratch may still be read by a GEMM another stream enqueued (batch serving: several slots' prompts)
-    if (cls == 0 && g_hc_ev_set[dev][slot]) cudaStreamWaitEvent((cudaStream_t) stream, g_hc_ev[dev][slot], 0);
+    if (cls == 0 && g_hc_ev_set[dev][slot]) strata::core::st_wait((cudaStream_t) stream, g_hc_ev[dev][slot], STRATA_ST_HERE);
     strata::kernels::fused_gr_dequant_q8_0((const uint8_t*) w.hc_q8, (uint16_t*) buf, w.elements / 32, stream);
     return (const uint16_t*) buf;
 }
@@ -549,7 +550,7 @@ const uint16_t* NativeDense::hc_bf16_view(const WeightRef& w, void* stream, int 
 void NativeDense::hc_bf16_release(void* stream, int slot, int cls) {
     int dev = 0;
     if (cls != 0 || slot < 0 || slot > 1 || cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64 || g_hc_ev[dev][slot] == nullptr) return;
-    cudaEventRecord(g_hc_ev[dev][slot], (cudaStream_t) stream);
+    strata::core::st_record(g_hc_ev[dev][slot], (cudaStream_t) stream, STRATA_ST_HERE);
     g_hc_ev_set[dev][slot] = true;
 }
 } // namespace strata::core

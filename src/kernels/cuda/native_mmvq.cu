@@ -51,6 +51,7 @@
 #include <unordered_map>
 #include <cstdio>
 #include <vector>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -2788,7 +2789,7 @@ bool q8_sm60_pack_impl(const void* weights, int n_in, int n_out, const char* wha
     auto* qs = static_cast<int8_t*>(packed);
     auto* d = reinterpret_cast<half*>(qs + std::size_t(n_in) * n_out);
     q8sm60::pack_kernel<<<unsigned((count + 255) / 256), 256>>>(static_cast<const Q80Block*>(weights), qs, d, count);
-    if (cudaDeviceSynchronize() != cudaSuccess) {
+    if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) {
         cudaGetLastError();
         cudaFree(packed);
         std::fprintf(stderr, "strata q8 sm60: packing the %s failed; it keeps the GGUF layout\n", what);
@@ -2932,7 +2933,7 @@ bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what
             native_q6_k_mmvq(weights, dx, (float*) ya, n_in, n_out, nc, s);
             g_q6_bypass = false;
             native_q6_k_mmvq(weights, dx, (float*) yb, n_in, n_out, nc, s);
-            cudaStreamSynchronize(s);
+            strata::core::st_stream_sync(s, STRATA_ST_HERE);
             cudaMemcpy(a.data(), ya, std::size_t(nc) * n_out * 4, cudaMemcpyDeviceToHost);
             cudaMemcpy(c.data(), yb, std::size_t(nc) * n_out * 4, cudaMemcpyDeviceToHost);
             same = same && std::memcmp(a.data(), c.data(), std::size_t(nc) * n_out * 4) == 0;
@@ -2945,10 +2946,10 @@ bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what
                 for (int pass = 0; pass < 2; ++pass) {
                     const bool cand = (pass == 0) == (k % 2 == 1);
                     g_q6_bypass = !cand;
-                    cudaEventRecord(e0, s);
+                    strata::core::st_record(e0, s, STRATA_ST_HERE);
                     for (int it = 0; it < 5; ++it) native_q6_k_mmvq(weights, dx, (float*) (cand ? yb : ya), n_in, n_out, nc, s);
-                    cudaEventRecord(e1, s);
-                    cudaEventSynchronize(e1);
+                    strata::core::st_record(e1, s, STRATA_ST_HERE);
+                    strata::core::st_event_sync(e1, STRATA_ST_HERE);
                     float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
                     (cand ? tc : tb).push_back(ms * 1000.0f / 5);
                 }
@@ -2966,10 +2967,10 @@ bool native_q6_k_pack(const void* weights, int n_in, int n_out, const char* what
                 for (int nc : {1, 2, 4}) {
                     std::vector<float> tc;
                     for (int k = 0; k < 7; ++k) {
-                        cudaEventRecord(e0, s);
+                        strata::core::st_record(e0, s, STRATA_ST_HERE);
                         for (int it = 0; it < 5; ++it) native_q6_k_mmvq(weights, dx, (float*) yb, n_in, n_out, nc, s);
-                        cudaEventRecord(e1, s);
-                        cudaEventSynchronize(e1);
+                        strata::core::st_record(e1, s, STRATA_ST_HERE);
+                        strata::core::st_event_sync(e1, STRATA_ST_HERE);
                         float ms = 0; cudaEventElapsedTime(&ms, e0, e1);
                         tc.push_back(ms * 1000.0f / 5);
                     }
