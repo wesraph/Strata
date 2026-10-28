@@ -11418,21 +11418,22 @@ int main(int argc, char** argv) {
         // failed): a request cancelled here keeps them as the live conversation instead of dropping what it restored
         bool pp_exact = false;
         Clock::time_point pp_t0 = Clock::now();
-        // THE STATS LINE (STRATA_STATS_EVERY_S, 1 s; 0 off), as vLLM's: over the last interval the prompt tokens
-        // read and the tokens generated as rates, the slots running and reading, the expert cache's hit rate and
-        // the pool's use.  Printed while something happens; one line says idle, then nothing until the next token.
+        // THE STATS LINE (STRATA_STATS_EVERY_S, 1 s; 0 off), as vLLM's, printed by a thread of its own so that a long
+        // prompt chunk delays nothing: over the last interval the prompt tokens read and the tokens generated, summed
+        // over every slot, as rates; the slots running and reading; the expert cache's hit rate; the pool's use.  The
+        // serve thread counts the tokens where they are read (each prompt path's chunk) and emitted (each T/BT line),
+        // and refreshes the snapshot between windows, between requests and at every chunk.
+        struct Stats {
+            std::atomic<int64_t> pp{0}, tg{0}, hits{0}, miss{0}, pool_live{0}, pool_cached{0}, pool_mapped{0}, pool_total{0};
+            std::atomic<int> running{0}, reading{0};
+        } stats;
         const double stats_every_s = [] { const char* v = std::getenv("STRATA_STATS_EVERY_S"); return v != nullptr ? std::atof(v) : 1.0; }();
-        int64_t stats_pp = 0, stats_tg = 0;              // tokens since the last line
-        int64_t stats_pp_pos = 0;                        // the last PP position, and the read it belongs to
-        Clock::time_point stats_pp_t0{};
-        std::function<void()> stats_tick;                // defined beside the pump (it reads the slots and the drive)
-        auto stats_pp_add = [&](int64_t pos) {           // a PP line: the fresh tokens since the last one of this read
-            const int64_t from = pp_t0 == stats_pp_t0 ? std::max(stats_pp_pos, pp_from) : pp_from;
-            if (pos > from) stats_pp += pos - from;
-            stats_pp_pos = pos;
-            stats_pp_t0 = pp_t0;
-            if (stats_tick) stats_tick();
-        };
+        std::function<void()> stats_refresh;   // the snapshot (defined beside the pump: it reads the slots and the drive)
+        struct StatsThread {
+            std::thread t;
+            std::atomic<bool> stop{false};
+            ~StatsThread() { stop = true; if (t.joinable()) t.join(); }
+        } stats_thread;
         // #879: this request met a window whose head logits were not all finite (nonfinite_hit): it ends with
         // DONE ... nonfinite, emitting none of that window's tokens
         bool nf_hit = false;
@@ -11683,13 +11684,14 @@ int main(int argc, char** argv) {
             if (use_mtp && std::getenv("STRATA_SNAPSHOT_VERIFY") != nullptr)
                 std::fprintf(stderr, "strata serve: DRAFT_PREFILL path=%s mode=%d cells=%lld\n",
                              batched ? "batched" : "token", mtp.kv_state().kv_mode, (long long) T);
+            stats.pp += T;   // the stats line: fresh tokens read
+            stats.reading = 1;
             // progress for the server window: PP <position reached> <prompt tokens> <ms> <fresh tokens/s>
             const int64_t done = p0 + T;
             pp_reached = done;
             const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
             std::printf("PP %lld %lld %.0f %.1f\n", (long long) done, (long long) pp_total, ms,
                         ms > 0.0 ? 1000.0 * (double) (done - pp_from) / ms : 0.0);
-            stats_pp_add(done);
             strata::core::progress_at("reading the prompt (batched), done up to token", done);
             strata::core::progress_beat();
             std::fflush(stdout);
@@ -13981,7 +13983,7 @@ int main(int argc, char** argv) {
                     sl.ids.push_back(tok[first[t] + j]);
                     std::printf("BT %d %d\n", b, (int) y);
                     ++sl.produced;
-                    ++stats_tg;
+                    ++stats.tg;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
                     const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
@@ -14234,7 +14236,7 @@ int main(int argc, char** argv) {
                     const int32_t y = outb[blk.f + j];
                     std::printf("BT %d %d\n", blk.b, (int) y);
                     ++sl.produced;
-                    ++stats_tg;
+                    ++stats.tg;
                     ++bt_rows;
                     ++pipe_rows;
                     const char* fin = is_eos(y) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
@@ -14327,44 +14329,30 @@ int main(int argc, char** argv) {
         bool kvsh_need_quiet = false;        // a slot outgrew the reserve under a window in flight: empty the pipeline, refill
         bool kvsh_quiet_failed = false;      // ... and the refill brought nothing (the pool is full until the extents change)
         int64_t kvsh_quiet_failed_ext = -1;
-        int64_t stats_hits0 = drive.d.cache_hits, stats_miss0 = drive.d.multi_misses;
-        Clock::time_point stats_t = Clock::now();
-        bool stats_idle_said = false;
-        stats_tick = [&]() {
+        auto stats_refresh_t = Clock::now();
+        stats_refresh = [&]() {
             if (stats_every_s <= 0.0) return;
             const auto now = Clock::now();
-            const double sec = std::chrono::duration<double>(now - stats_t).count();
-            if (sec < stats_every_s) return;
+            if (std::chrono::duration<double>(now - stats_refresh_t).count() < 0.25) return;
+            stats_refresh_t = now;
             int running = 0;
             for (const BSlot& sb : bs) running += sb.active ? 1 : 0;
-            const int reading = in_prompt_read ? 1 : 0;
-            const int64_t hits = drive.d.cache_hits - stats_hits0, miss = drive.d.multi_misses - stats_miss0;
-            const bool busy = stats_pp > 0 || stats_tg > 0 || running > 0 || reading > 0;
-            if (busy || !stats_idle_said) {
-                char hit[32] = "-", pool[160] = "";
-                if (hits + miss > 0) std::snprintf(hit, sizeof hit, "%.1f%%", 100.0 * (double) hits / (double) (hits + miss));
-                if (kvsh && kv_pages.total() > 0) {
-                    const double T = (double) kv_pages.total();
-                    const int64_t mapped = kvsh_pages_per_extent > 0
-                                               ? std::min<int64_t>(kv_pages.total(), kv_pages.mapped_extents() * kvsh_pages_per_extent)
-                                               : kv_pages.total();
-                    std::snprintf(pool, sizeof pool, ", K/V pool %.1f%% live, %.1f%% cached, %.1f%% mapped",
-                                  100.0 * (double) kv_pages.pinned_count() / T, 100.0 * (double) kv_pages.evictable_count() / T,
-                                  100.0 * (double) mapped / T);
-                }
-                std::fprintf(stderr, "strata serve: stats: %sprompt %.1f tok/s, generation %.1f tok/s, running %d, reading %d, "
-                                     "expert cache %s hit%s\n", busy ? "" : "idle: ", (double) stats_pp / sec,
-                             (double) stats_tg / sec, running, reading, hit, pool);
-                stats_idle_said = !busy;
+            stats.running = running;
+            stats.reading = in_prompt_read ? 1 : 0;
+            stats.hits = drive.d.cache_hits;
+            stats.miss = drive.d.multi_misses;
+            if (kvsh && kv_pages.total() > 0) {
+                stats.pool_total = kv_pages.total();
+                stats.pool_live = kv_pages.pinned_count();
+                stats.pool_cached = kv_pages.evictable_count();
+                stats.pool_mapped = kvsh_pages_per_extent > 0
+                                        ? std::min<int64_t>(kv_pages.total(), kv_pages.mapped_extents() * kvsh_pages_per_extent)
+                                        : kv_pages.total();
             }
-            stats_pp = stats_tg = 0;
-            stats_hits0 = drive.d.cache_hits;
-            stats_miss0 = drive.d.multi_misses;
-            stats_t = now;
         };
         auto pump = [&](bool may_start) -> bool {
             ++pipe_tick;
-            stats_tick();
+            stats_refresh();
             if (kvsh_need_quiet && !pipe_inflight()) {   // the pipeline emptied for a slot's growth: the reserve refills
                 const int64_t free0 = kv_pages.free_count();
                 if (kvsh_topup) kvsh_topup();
@@ -14409,7 +14397,7 @@ int main(int argc, char** argv) {
                     const int32_t y = outb[t];
                     std::printf("BT %d %d\n", gi * GS + t, (int) y);
                     ++sl.produced;
-                    ++stats_tg;
+                    ++stats.tg;
                     ++bt_rows;
                     ++pipe_rows;
                     const bool eos = std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
@@ -14645,6 +14633,32 @@ int main(int argc, char** argv) {
                                      "long conversations may be refused\n", (long long) m, (long long) kvsh_floor_extents);
         }
         kvsh_idle_t0 = std::chrono::steady_clock::now();   // the idle clock starts with serving, not the process
+        if (stats_every_s > 0.0)
+            stats_thread.t = std::thread([&stats, &stats_thread, stats_every_s]() {
+                int64_t pp0 = 0, tg0 = 0, h0 = 0, m0 = 0;
+                auto t0 = Clock::now();
+                while (!stats_thread.stop) {
+                    for (double w = 0.0; w < stats_every_s && !stats_thread.stop; w += 0.1)
+                        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                    if (stats_thread.stop) break;
+                    const auto now = Clock::now();
+                    const double sec = std::max(1e-3, std::chrono::duration<double>(now - t0).count());
+                    t0 = now;
+                    const int64_t pp = stats.pp, tg = stats.tg, h = stats.hits, m = stats.miss;
+                    const int64_t dpp = pp - pp0, dtg = tg - tg0, dh = h - h0, dm = m - m0;
+                    pp0 = pp; tg0 = tg; h0 = h; m0 = m;
+                    char hit[32] = "-", pool[160] = "";
+                    if (dh + dm > 0) std::snprintf(hit, sizeof hit, "%.1f%%", 100.0 * (double) dh / (double) (dh + dm));
+                    const int64_t T = stats.pool_total;
+                    if (T > 0)
+                        std::snprintf(pool, sizeof pool, ", K/V pool %.1f%% live, %.1f%% cached, %.1f%% mapped",
+                                      100.0 * (double) stats.pool_live / (double) T, 100.0 * (double) stats.pool_cached / (double) T,
+                                      100.0 * (double) stats.pool_mapped / (double) T);
+                    std::fprintf(stderr, "strata serve: stats: prompt %.1f tok/s, generation %.1f tok/s, running %d, reading %d, "
+                                         "expert cache %s hit%s\n", (double) dpp / sec, (double) dtg / sec, (int) stats.running,
+                                 (int) stats.reading, hit, pool);
+                }
+            });
         // PARK A SLOT'S CONVERSATION to the host cache (best effort) and free its pages: the preemption under a
         // full pool, and a slot about to be recycled for another conversation.  `why` names the occasion.
         auto park_slot_conversation = [&](int b, const char* why) -> bool {
@@ -14863,7 +14877,7 @@ int main(int argc, char** argv) {
         };
         for (;;) {
             line_drain_ms = 0.0;
-            stats_tick();
+            stats_refresh();
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
@@ -16299,6 +16313,8 @@ int main(int argc, char** argv) {
                         if (v.service(win_pool_fn, PSD[f0 & 1], e) < 0) return fail(e);
                         if (v.done(e)) {
                             if (!v.pl_finish(nullptr, e)) return fail(e);
+                            stats.pp += wins[f0].T;   // the stats line: fresh tokens read
+                            stats.reading = 1;
                             ++f0;
                         } else if (!e.empty()) return fail(e);
                     }
@@ -16338,7 +16354,6 @@ int main(int argc, char** argv) {
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
-                stats_pp_add(b);
                 strata::core::progress_beat();
                 std::fflush(stdout);
                 return true;
@@ -16391,6 +16406,8 @@ int main(int argc, char** argv) {
                     if (logpos != nullptr && !ver.window_logprobs(nxt.data(), T, q, logpos_extra, logpos, e))
                         return false;
                     if (!ver.commit(T, e) || (use_mtp && !mtp.prefill(ver.final_R_all(), nxt.data(), T, q, e))) return false;
+                    stats.pp += T;   // the stats line: fresh tokens read
+                    stats.reading = 1;
                     q += T;
                     pp_reached = q;   // #471
                     pp_exact = true;
@@ -16400,7 +16417,6 @@ int main(int argc, char** argv) {
                 const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                 std::printf("PP %lld %lld %.0f %.1f\n", (long long) b, (long long) pp_total, ms,
                             ms > 0.0 ? 1000.0 * (double) (b - pp_from) / ms : 0.0);
-                stats_pp_add(b);
                 strata::core::progress_beat();
                 std::fflush(stdout);
                 return true;
@@ -17372,7 +17388,6 @@ int main(int argc, char** argv) {
                     const double ms = std::chrono::duration<double, std::milli>(Clock::now() - pp_t0).count();
                     std::printf("PP %lld %lld %.0f %.1f\n", (long long) to, (long long) pp_total, ms,
                                 ms > 0.0 ? 1000.0 * (double) (to - pp_from) / ms : 0.0);
-                    stats_pp_add(to);
                     std::fflush(stdout);
                 }
                 if (!sp_ok) {
@@ -18117,6 +18132,7 @@ int main(int argc, char** argv) {
                     bool eos = false;
                     for (int i = 0; !nf && i <= a && produced_n < max_new && !eos; ++i) {
                         std::printf("T %d\n", (int) outp[(size_t) i]);
+                        ++stats.tg;
                         if (req_logprobs >= 0) emit_lp_line(V1(A), i, outp[(size_t) i], req_logprobs, req_allowed);
                         strata::core::progress_beat();
                         ++produced_n;
@@ -18587,6 +18603,7 @@ int main(int argc, char** argv) {
                 bool eos = false;
                 for (int i = merged ? a : 0; i <= a && produced_n < max_new && !eos; ++i) {   // (merged: row T-1 only)
                     std::printf("T %d\n", (int) outv[(size_t) i]);
+                    ++stats.tg;
                     if (req_logprobs >= 0) emit_lp_line(ver, i, outv[(size_t) i], req_logprobs, req_allowed);
                     strata::core::progress_beat();
                     ++produced_n;
@@ -18934,7 +18951,6 @@ int main(int argc, char** argv) {
                     sl.x = x;
                     sl.p = p;
                     sl.produced = 1;
-                    ++stats_tg;
                     sl.max_new = admit_max_new;
                     sl.t0 = Clock::now();
                     sl.ids = live;
