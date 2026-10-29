@@ -261,8 +261,11 @@ inline void path_record(int64_t T, bool streamed, double ms) {
     pc.tok[p] += (double) T;
     ++pc.n[p];
     // the largest band whose shared path measures cheaper, every band below it too; a band not yet measured both ways
-    // keeps what the cap says of it today (unknown is not worse), and a band only moves the cap when the other path
-    // measures 5% cheaper (the two are level in some band on some rig: no flapping there)
+    // keeps what the cap says of it today (unknown is not worse).  The streamed walk borrows its ring from the expert
+    // cache (about 1,000 slots for a 2K chunk against 400 for the routed path's buffers), and the refill after the
+    // read and the misses until it lands are not in the read's cost, so a band goes streamed only when that path
+    // measures 15% cheaper per token, and back to shared when the shared one is 5% cheaper (measured level, 0.45
+    // against 0.43 ms per token in the 2K-4K band on 2x RTX 3090, the streamed choice cost 6 tok/s of decode)
     int64_t cap = kPathBandMin;
     bool decided = false;
     for (int i = 0; i < kPathBands; ++i) {
@@ -275,7 +278,7 @@ inline void path_record(int64_t T, bool streamed, double ms) {
         }
         decided = true;
         const double shared = q.ms[0] / q.tok[0], stream = q.ms[1] / q.tok[1];
-        const bool keep_shared = shared_today ? shared <= stream * 1.05 : shared < stream * 0.95;
+        const bool keep_shared = shared_today ? shared <= stream * 1.15 : shared < stream * 0.95;
         if (keep_shared) cap = hi;
         else break;
     }
