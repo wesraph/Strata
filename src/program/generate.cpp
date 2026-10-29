@@ -9778,7 +9778,19 @@ int main(int argc, char** argv) {
             }
         }
 #endif
-        const bool share_pool = o.batch <= 0 && !o.no_pool;
+        // Batch slots kept the share off: the pool could be decoding between a prompt's parts.  Where the concurrent
+        // read is off (every rig today: the slots wait for the whole read, generation 0 tok/s in every stats interval
+        // with a read in it, 2x RTX 3090 2026-10-29) the pool is idle for the read, so an explicit
+        // STRATA_PREFILL_CPU_SHARE (other than 0) arms it beside the slots too; the default stays off with them.
+        const bool share_forced = [] {
+            const char* v = std::getenv("STRATA_PREFILL_CPU_SHARE");
+            return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
+        }();
+        const bool share_pool = !o.no_pool && (o.batch <= 0 || share_forced);
+        if (share_pool && o.batch > 0)
+            std::fprintf(stderr, "strata serve: STRATA_PREFILL_CPU_SHARE is set: the CPU pool takes a share of a prompt "
+                                 "chunk's streamed experts beside the batch slots (they wait for the read); with "
+                                 "STRATA_PIPED_CONCURRENT reading beside the slots the pool would be shared with their misses\n");
         bool share_has_work = strata::prefill::share_rules::default_share_has_work(
             (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert));   // #1595
         if (!share_has_work)
