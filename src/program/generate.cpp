@@ -9465,6 +9465,7 @@ int main(int argc, char** argv) {
         // is spent on it.  The single-GPU loan is untouched: without a split the lend region stays in
         // pin_cache_complement's own path, and no regions are set.
         std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lends;
+        std::vector<int64_t> part_lent(stages.size() + 1, 0);   // per part: the tail slots its region covers (0: none)
         decide_split_ring();   // the ring the prompt path really uses, BEFORE bytes_needed sizes the regions below
         if (pf_borrow && d_res != nullptr && o.prefill_chunk > 0 && multi_gpu && !stages.empty()) {
             const int64_t bound = o.prefill_auto ? auto_ceiling : o.prefill_chunk;
@@ -9494,6 +9495,7 @@ int main(int argc, char** argv) {
                 k = std::min(k, xc.slots() - 128);                       // the scan's 128-slot floor
                 if (o.prefill_auto) k = std::min(k, kAutoLendPct * xc.slots() / 100);   // the auto cap
                 if (k <= 0) continue;
+                part_lent[i] = k;
                 std::vector<std::pair<int32_t, int32_t>> region;
                 for (int64_t l = lb; l < le; ++l)
                     for (int64_t e = 0; e < g.n_expert; ++e)
@@ -9505,6 +9507,47 @@ int main(int argc, char** argv) {
                 if (!region.empty()) stage_lends.push_back(std::move(region));
             }
             src.stage_lend_regions(std::move(stage_lends));
+        }
+        // --kv-share's VRAM exchange: as the pool grows, each cache lends the slots just below the prompt path's
+        // loan, downwards to its floor (xc_take in the serve loop), and their experts leave VRAM until the trim
+        // gives the extents back.  The RAM copy is sized by what the caches do not hold NOW, and with the pool
+        // they hold more than a fixed K/V would leave them - so the lent experts had no copy and every prompt
+        // chunk read them through the page cache (2 to 3 GB per prompt, 2x RTX 3090, 2026-10-29).  List them
+        // in the take's order (the caches in step: an extent spans every card's range) for the copy to keep
+        // while the budget has room; pin_cache_complement applies it under an explicit --resident-budget-gib.
+        if (kvsh && kvsh_xc_wanted && d_res != nullptr && o.resident_budget > 0) {
+            const int64_t floor = [] {
+                const char* v = std::getenv("STRATA_KV_XC_FLOOR");
+                return v != nullptr && std::atoll(v) > 0 ? (int64_t) std::atoll(v) : (int64_t) 128;
+            }();
+            std::vector<std::vector<std::pair<int32_t, int32_t>>> orders;
+            const size_t parts = multi_gpu ? stages.size() + 1 : 1;
+            for (size_t i = 0; i < parts; ++i) {
+                strata::core::ExpertCache& xc = i == 0 ? xcache : stages[i - 1]->cache;
+                const int64_t lb = i == 0 ? 0 : stages[i - 1]->lb;
+                const int64_t le = i == 0 ? (multi_gpu ? split_at[0] : g.n_layers) : stages[i - 1]->le;
+                const int64_t top = xc.slots() - (i < part_lent.size() ? part_lent[i] : 0);
+                if (top <= floor || le <= lb) continue;
+                std::vector<std::pair<int32_t, int32_t>> order;
+                for (int64_t l = lb; l < le; ++l)
+                    for (int64_t e = 0; e < g.n_expert; ++e) {
+                        const int32_t s = xc.slot_of(l, e);
+                        if (s >= floor && s < top) order.emplace_back((int32_t) l, (int32_t) e);
+                    }
+                std::sort(order.begin(), order.end(),
+                          [&](const std::pair<int32_t, int32_t>& a, const std::pair<int32_t, int32_t>& b) {
+                              return xc.slot_of(a.first, a.second) > xc.slot_of(b.first, b.second);
+                          });
+                if (!order.empty()) orders.push_back(std::move(order));
+            }
+            std::vector<std::pair<int32_t, int32_t>> region;
+            for (size_t j = 0;; ++j) {
+                bool any = false;
+                for (const auto& ord : orders)
+                    if (j < ord.size()) { region.push_back(ord[j]); any = true; }
+                if (!any) break;
+            }
+            if (!region.empty()) src.pool_take_region(std::move(region));
         }
         {   // the pack's and the MTP head's files: read at start, their cache is given back by the complement's drop
             std::vector<std::string> drop;

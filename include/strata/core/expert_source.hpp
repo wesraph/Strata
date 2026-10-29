@@ -756,6 +756,12 @@ public:
     void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
         stage_lend_regions_ = std::move(regions);
     }
+    /// --kv-share's VRAM exchange: the (layer, expert) pairs of the slots the expert caches lend to the K/V pool
+    /// as it grows, in the order the pool takes them (just below the prompt path's loan, downwards, the caches in
+    /// step).  Set BEFORE `pin_cache_complement`: under an explicit budget the copy keeps them after the
+    /// complement and the lend regions while the budget has room, so a lent slot's expert is read from RAM, not
+    /// from the files, by every prompt chunk and CPU miss after the take.  Empty (the default) keeps nothing extra.
+    void pool_take_region(std::vector<std::pair<int32_t, int32_t>> region) { pool_take_region_ = std::move(region); }
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -1227,6 +1233,7 @@ private:
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
+    std::vector<std::pair<int32_t, int32_t>> pool_take_region_;   ///< --kv-share: the slots the pool may take, in order
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;

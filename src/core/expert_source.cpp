@@ -3716,6 +3716,34 @@ bool FileExpertSource::pin_cache_complement(
         if (stage_lent < 0) return false;
         stage_lent_bytes = bytes - before;
     }
+    // --kv-share's VRAM exchange (`pool_take_region_`): the experts of the slots a cache lends to the K/V pool as it
+    // grows, in the order the pool takes them.  A lent slot's expert is a CPU miss from then on, and every prompt
+    // chunk streams it from here or, without a copy, from the files.  Measured 2026-10-29 on 2x RTX 3090 (three
+    // agents replaying 80 recorded turns): the copy held 35.6 GiB of a 48 GiB budget (the complement is sized by
+    // what the caches do not hold at the start, and with the pool they hold 12 GiB more than a fixed K/V would
+    // leave them), the pool took 105 of 712 extents, and every prompt read 2 to 3 GB of experts through the page
+    // cache where the release engine read none.  Only under an explicit budget: the region can be most of a cache,
+    // and without a budget it would take all the RAM above the headroom.
+    int64_t pool_kept = 0;
+    uint64_t pool_kept_bytes = 0;
+    const bool pool_region_on = !pool_take_region_.empty() && budget_bytes > 0 && budget_bytes != kResidentWhatFits;
+    if (pool_region_on) {
+        if (budget == std::numeric_limits<uint64_t>::max()) {   // #403: the one reading, taken now
+            uint64_t physical = budget_physical, commit = budget_commit;
+            if (physical == 0 && !available_memory_bytes(physical, &commit)) {
+                err = "FileExpertSource: cannot determine available memory for the K/V pool's take region";
+                return false;
+            }
+            const uint64_t available = std::min(physical, commit);
+            budget = available > headroom_bytes ? available - headroom_bytes : 0;
+        }
+        const uint64_t cap = std::min(budget, budget_bytes);
+        const uint64_t before = bytes;
+        pool_kept = detail::append_stage_lend_regions(n_layers_, n_expert_, layer_blob_bytes_, offsets, bytes, cap,
+                                                      {pool_take_region_}, err);
+        if (pool_kept < 0) return false;
+        pool_kept_bytes = bytes - before;
+    }
 
     void* arena = nullptr;
     const uint8_t* host = nullptr;
@@ -4193,6 +4221,15 @@ bool FileExpertSource::pin_cache_complement(
                              "their experts in RAM too (%.2f GiB)%s\n",
                      (long long) offered, (long long) stage_lent, (double) stage_lent_bytes / 1073741824.0,
                      stage_lent < offered ? " (the rest are read from the file when lent: not enough RAM for them)" : "");
+    }
+    if (!pool_take_region_.empty()) {
+        const long long offered = (long long) pool_take_region_.size();
+        std::fprintf(stderr, "FileExpertSource: the K/V pool may take %lld slots from the expert caches: %lld keep their "
+                             "experts in RAM too (%.2f GiB)%s\n", offered, (long long) pool_kept,
+                     (double) pool_kept_bytes / 1073741824.0,
+                     !pool_region_on ? " (none without --resident-budget-gib: a lent slot's expert is read from the files)"
+                     : pool_kept < offered ? " (the rest are read from the files once lent; a larger --resident-budget-gib keeps more)"
+                                           : "");
     }
     if (!additional_gpu_pairs.empty()) {
         std::fprintf(stderr, "FileExpertSource: %zu verified additional-GPU experts remain on the mmap fallback\n",
