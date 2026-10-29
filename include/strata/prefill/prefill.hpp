@@ -82,6 +82,12 @@ public:
     /// With borrowed buffers: lay them out again for chunks of `chunk` tokens (at most `init`'s) in `borrow` - a
     /// request lends only the slots its prompt needs.  The stream must be idle (between prompts).
     bool relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::string& err);
+    /// The measured cap of the CPU share (the chunk size from which every expert streams): the serve loop calls it
+    /// with the tokens a batched read is about to read, BEFORE the loan is laid out, and the read then takes the
+    /// path the cap gives it, or every eighth read of its size band the other path as a probe; each chunk's cost per
+    /// token goes to its band and path, and the cap moves to the largest band where the shared path measures cheaper.
+    /// Inert unless the share is on with no STRATA_PREFILL_STREAM_MIN / STRATA_PREFILL_CPU_SHARE_MAX given.
+    static void plan_path(int64_t fresh_tokens);
     int64_t chunk() const;
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed

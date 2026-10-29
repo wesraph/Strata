@@ -220,10 +220,79 @@ constexpr int RING_MAX = 1024;          // the arrays; the ring itself is ring_s
 // (Prefill::arm_cpu_share) it is the share's own limit instead: the share applies to staged chunks only.
 constexpr int64_t kStreamAllMinDefault = 1024;   // the default above (and the CPU share's default limit)
 int64_t g_stream_min_share = 0;
+// The measured cap (Prefill::plan_path): with the share on and no STRATA_PREFILL_STREAM_MIN / STRATA_PREFILL_CPU_SHARE_MAX
+// given, the chunk size from which every expert streams is not a number but a measurement.  Reads of 1K to 8K tokens
+// fall in three size bands; each chunk's cost per token goes to its band and path (routed with the share, or streamed),
+// every kPathProbeEvery-th read of a band takes the other path so both stay measured, and the cap is the largest band
+// where the shared path measures cheaper (at least 1024: below it the output changed on Q2_0, see above).  It starts
+// at 4096: upstream measured the share paying up to ~3K tokens, and on 2x RTX 3090 (2026-10-29) a cap of 3072 read the
+// 1.2K to 2.5K-token turns 7 to 34% faster than 1024.
+constexpr int kPathBands = 3;                 // [1024, 2048), [2048, 4096), [4096, 8192)
+constexpr int64_t kPathBandMin = 1024;
+constexpr int kPathProbeEvery = 8;
+constexpr int kPathMinSamples = 2;
+struct PathCost { double ms[2] = {0.0, 0.0}; double tok[2] = {0.0, 0.0}; int n[2] = {0, 0}; int reads = 0; };
+std::mutex g_path_mu;
+PathCost g_path[kPathBands];
+bool g_path_adaptive = false;     // set by arm_cpu_share
+int64_t g_path_cap = 0;           // the measured cap
+int64_t g_path_override = 0;      // this read's threshold (a probe), 0: the cap
+inline int path_band(int64_t T) {
+    if (T < kPathBandMin || T >= (kPathBandMin << kPathBands)) return -1;
+    int b = 0;
+    for (int64_t x = kPathBandMin; T >= x * 2; x *= 2) ++b;
+    return b;
+}
 inline int64_t stream_all_min() {
     static const int64_t env = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) -1; }();
     if (env >= 0) return env;
+    if (g_path_adaptive) return g_path_override > 0 ? g_path_override : g_path_cap;
     return g_stream_min_share > 0 ? g_stream_min_share : kStreamAllMinDefault;
+}
+// a chunk's cost, by band and path; the cap follows the measurements
+inline void path_record(int64_t T, bool streamed, double ms) {
+    if (!g_path_adaptive) return;
+    const int b = path_band(T);
+    if (b < 0 || ms <= 0.0) return;
+    std::lock_guard<std::mutex> lk(g_path_mu);
+    PathCost& pc = g_path[b];
+    const int p = streamed ? 1 : 0;
+    pc.ms[p] += ms;
+    pc.tok[p] += (double) T;
+    ++pc.n[p];
+    // the largest band whose shared path measures cheaper, every band below it too; a band not yet measured both ways
+    // keeps what the cap says of it today (unknown is not worse).  The streamed walk borrows its ring from the expert
+    // cache (about 1,000 slots for a 2K chunk against 400 for the routed path's buffers), and the refill after the
+    // read and the misses until it lands are not in the read's cost, so a band goes streamed only when that path
+    // measures 15% cheaper per token, and back to shared when the shared one is 5% cheaper (measured level, 0.45
+    // against 0.43 ms per token in the 2K-4K band on 2x RTX 3090, the streamed choice cost 6 tok/s of decode)
+    int64_t cap = kPathBandMin;
+    bool decided = false;
+    for (int i = 0; i < kPathBands; ++i) {
+        const PathCost& q = g_path[i];
+        const int64_t lo = kPathBandMin << i, hi = kPathBandMin << (i + 1);
+        const bool shared_today = lo < g_path_cap;
+        if (q.n[0] < kPathMinSamples || q.n[1] < kPathMinSamples) {
+            if (shared_today) { cap = hi; continue; }
+            break;
+        }
+        decided = true;
+        const double shared = q.ms[0] / q.tok[0], stream = q.ms[1] / q.tok[1];
+        const bool keep_shared = shared_today ? shared <= stream * 1.15 : shared < stream * 0.95;
+        if (keep_shared) cap = hi;
+        else break;
+    }
+    if (decided && cap != g_path_cap) {
+        std::fprintf(stderr, "strata prefill: the CPU share's chunk cap is now %lld tokens (measured: per token, shared / streamed:", (long long) cap);
+        for (int i = 0; i < kPathBands; ++i) {
+            const PathCost& q = g_path[i];
+            if (q.n[0] > 0 && q.n[1] > 0)
+                std::fprintf(stderr, " %lld-%lld %.2f / %.2f ms", (long long) (kPathBandMin << i), (long long) (kPathBandMin << (i + 1)) - 1,
+                             q.ms[0] / q.tok[0], q.ms[1] / q.tok[1]);
+        }
+        std::fprintf(stderr, ")\n");
+        g_path_cap = cap;
+    }
 }
 // STRATA_PREFILL_CPU_SHARE (opt-in; set_cpu_pool): a chunk below stream_all_min() hands the decode CPU pool - idle
 // while a prompt is read - the non-resident experts few of its tokens route to, instead of streaming them over PCIe.
@@ -2635,6 +2704,27 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
     (void) by_default;
 #endif
     if (applies && cpu_share_on()) g_stream_min_share = cpu_share_max();
+    if (applies && cpu_share_on() && std::getenv("STRATA_PREFILL_STREAM_MIN") == nullptr &&
+        std::getenv("STRATA_PREFILL_CPU_SHARE_MAX") == nullptr && !g_path_adaptive) {
+        g_path_adaptive = true;
+        g_path_cap = 4096;
+        std::fprintf(stderr, "prefill: the CPU share's chunk cap is measured: it starts at 4096 tokens and follows the cost per token "
+                             "of each path in the 1K-8K bands (STRATA_PREFILL_CPU_SHARE_MAX=N fixes it)\n");
+    }
+}
+
+void Prefill::plan_path(int64_t fresh_tokens) {
+    if (!g_path_adaptive) return;
+    std::lock_guard<std::mutex> lk(g_path_mu);
+    g_path_override = 0;
+    const int b = path_band(fresh_tokens);
+    if (b < 0) return;
+    PathCost& pc = g_path[b];
+    ++pc.reads;
+    const bool shared_now = fresh_tokens < g_path_cap;
+    const int other = shared_now ? 1 : 0;
+    if (pc.n[other] < kPathMinSamples || pc.reads % kPathProbeEvery == 0)   // the other path, as a probe
+        g_path_override = shared_now ? (kPathBandMin << b) : (kPathBandMin << (b + 1));
 }
 
 bool Prefill::ring_bytes_enabled() { return ring_bytes_on(); }
@@ -5616,6 +5706,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 std::fprintf(stderr, "strata prefill copies: %lld slot waits, %lld skipped as the same release event\n",
                              (long long) iss_waits, (long long) iss_dedup);
         }
+        path_record(T, stream_all, std::chrono::duration<double, std::milli>(Clock::now() - tsetup).count());
         stats_.tokens += T;
         core::progress_at("reading the prompt (batched): finishing the chunk from token", p0);
         pt.mark(kPfStart, cs);
