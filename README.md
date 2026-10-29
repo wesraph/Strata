@@ -94,6 +94,22 @@ the rig above against a real upstream 0.2.7 build, same config minus the pool:
 | reading a turn's new tokens, under 300 / 300-1,000 / 1,000-2,500 | 914 / 1,952 / 3,034 ms | 418 / 1,021 / 1,757 ms |
 | reading the 41K-token first prompt | 13.8 s | 12.0 s |
 
+The same replay on the UD-Q4_K_XL pack (104 GB; experts 20% bigger, so each card's expert cache holds a third
+fewer of them and every read and miss leans harder on the x8 links), same day, one run per arm:
+
+| | upstream 0.2.7, Q4_K_XL | this fork, Q4_K_XL |
+|---|---|---|
+| wall clock for the three agents to finish | 852 s | 588 s |
+| aggregate (29,148 tokens over that wall) | 34.2 tok/s | 49.6 tok/s |
+| wait before the first token, later turns, median / p90 | 4.20 s / 8.69 s | 2.60 s / 7.28 s |
+| decode on the long answers, per agent | 22.0 / 15.1 / 19.5 tok/s | 33.7 / 23.1 / 28.2 tok/s |
+| reading a turn's new tokens, under 300 / 300-1,000 / 1,000-2,500 | 1,894 / 3,030 / 4,402 ms | 1,237 / 2,115 / 3,099 ms |
+| reading the 41K-token first prompt | 19.3 s | 14.4 s |
+| expert cache per card | 3,183 slots | 4,790 slots |
+
+The pool leaves the caches 1,600 more slots per card because no K/V is carved out up front, and the CPU share's
+measured cap landed at 2,048 tokens on this pack (4,096 on IQ4_XS): the 2K-4K band read 16% cheaper streamed here.
+
 Three things closed the gap on the reads since the table before it. A slot that gave its conversation back
 through its turn checkpoint saved the whole K/V through host memory (3 to 5 s per turn, 26 to 36 turns per replay)
 for a restore that skipped the pooled pages; the save skips them too now. The RAM copy of the experts is sized by
