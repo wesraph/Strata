@@ -14874,7 +14874,12 @@ int main(int argc, char** argv) {
             const auto t0 = Clock::now();
             const int64_t evicted = room > 0 ? kv_pages.evict_stale(cutoff, std::min<int64_t>(room, 4096)) : 0;
             const int64_t pinned = kv_pages.pinned_count(), cached = kv_pages.evictable_count();
-            const int64_t need = pinned + cached + kvsh_reserve_want();
+            // the extents kept cover the reserve of a FULL batch, not of the slots live at this moment: at an idle
+            // moment the live count is 0, and a target sized to it gave the reserve's own extents back, which the
+            // next admission took again - 10 of 21 trims in 25 minutes dropped extents with no stale page at all,
+            // against 111 reserve maps (each a quiesce, and 43 experts evicted per extent lent)
+            const int64_t quantum = (4096 + 16 + kvsh_ps - 1) / kvsh_ps;
+            const int64_t need = pinned + cached + ((int64_t) bs.size() + 1) * quantum;
             const int64_t target = std::max<int64_t>({(need + kvsh_pages_per_extent - 1) / kvsh_pages_per_extent,
                                                       (kvsh_trim_keep_pages + kvsh_pages_per_extent - 1) / kvsh_pages_per_extent,
                                                       ext0 - 4});
