@@ -6039,6 +6039,8 @@ int main(int argc, char** argv) {
             const int64_t q_n_all = std::max<int64_t>(g.n_layers / std::max<int64_t>(g.qsa_interval, 1),
                                                       g.n_qsa_layers() > 0 ? 1 : 0);
             int64_t tokens = INT64_MAX;
+            int bound_dev = -1;        // the card whose room bounds the pool (a page lives on every card)
+            std::string per_card;      // each card's own cap: on unequal cards this is where the split shows
             const int n_dev = multi_gpu ? 2 : 1;   // a split uses one pool per card; measure every card
             for (int d = 0; d < n_dev; ++d) {
                 const strata::core::OnDevice on_d(d);
@@ -6053,7 +6055,11 @@ int main(int argc, char** argv) {
                 const int64_t q_n = kvsh_share_given ? q_n_all : std::max<int64_t>(q_n_here, 1);
                 const int64_t here = (int64_t) ((double) free_b * auto_share) /
                                      std::max<int64_t>(per_page * q_n, 1) * 4;
-                tokens = std::min<int64_t>(tokens, here);
+                if (here < tokens) { tokens = here; bound_dev = d; }
+                char t[160];
+                std::snprintf(t, sizeof t, "%s CUDA%d %lld tokens (%lld K/V layers, %.2f GiB free)", per_card.empty() ? "" : ",",
+                              d, (long long) here, (long long) q_n, (double) free_b / 1073741824.0);
+                per_card += t;
             }
             if (tokens == INT64_MAX || tokens < 1) tokens = 4 * 1024;   // measurement failed: a small floor
             strata::core::qsa_set_kv_share(tokens);
@@ -6061,6 +6067,9 @@ int main(int argc, char** argv) {
                                  "(%.2f GiB over every layer%s)\n", (long long) tokens,
                          (double) (tokens / 4 * per_page * q_n_all) / 1073741824.0,
                          kvsh_share_given ? ", a fixed share of the free VRAM" : "; no share: the pool grows with the sessions");
+            if (n_dev > 1)   // which card bounds it, and what each could hold alone: the layer split's lever on unequal cards
+                std::fprintf(stderr, "strata generate: --kv-share auto: a page lives on every card, so CUDA%d's room bounds the pool:%s\n",
+                             bound_dev, per_card.c_str());
         }
         kvsh = strata::core::qsa_kv_share_tokens() > 0;
         const int64_t kvsh_pages_of_context =
