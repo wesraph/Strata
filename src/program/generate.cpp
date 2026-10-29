@@ -1566,6 +1566,7 @@ constexpr int64_t kVramSafeMib =
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
     strata::core::stream_trace_dump(f);   // the streams' waits and records before the stall (stream_trace.hpp)
+    strata::prefill::Prefill::stall_dump(f);   // every prompt path's chunk, layer and MoE row bounds
     strata::core::Progress& p = strata::core::progress();
     std::fprintf(f, "strata serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
                     "last finished step (0 = stopped, more = slow)\n", STRATA_VERSION, stage_text().c_str(),
@@ -12848,6 +12849,12 @@ int main(int argc, char** argv) {
             int64_t taken = 0, given = 0, evicted = 0, refilled = 0;
         };
         std::vector<XcLoan> xcl;
+        // true while a prompt is read beside the slots (STRATA_PIPED_CONCURRENT): the caches evict nothing then.  An
+        // eviction unmaps a slot's chunks after a device sync, but the reader's host thread picks a resident expert's
+        // slot and launches the kernel that reads it later, on its own clock: a take between the two unmapped the slot
+        // under the kernel (Xid 13 "Out Of Range Address" on the second card, 2026-10-29, the traced stall).  The
+        // take serves from the spare and the freeable chunks only until the read ends.
+        bool kvsh_read_live = false;
         // true while a pipelined group's window is in flight: the cache may not evict then (the quiesce below
         // would wait on a window that spins for the host, which is busy here - the 60 s hangs of 2026-10-28);
         // a take serves from the spare and the freeable chunks only, and the caller waits for a quiet moment
@@ -12930,7 +12937,7 @@ int main(int argc, char** argv) {
             // a quiesce (both GPUs drained, an adaptive round, a residency upload) is worth more than one
             // extent: once the cache must lend, it lends for several (the spare serves the next takes quietly)
             const int64_t n_batch = (int64_t) L.spare.size() + freeable() < n ? std::max<int64_t>(n, 48) : n;
-            const bool busy = kvsh_pipe_busy && kvsh_pipe_busy();   // no eviction (no quiesce) under a window in flight
+            const bool busy = kvsh_read_live || (kvsh_pipe_busy && kvsh_pipe_busy());   // no eviction (no quiesce) under a window or a concurrent read in flight
             while (!busy && (int64_t) L.spare.size() + freeable() < n_batch && L.lo > L.floor) {
                 if (!quiet) {
                     adapt_quiesce();
@@ -17099,6 +17106,7 @@ int main(int argc, char** argv) {
                         bool read_ok = true;
                         std::string read_err;
                         in_prompt_read = true;
+                        kvsh_read_live = true;
                         sp.stop_at_chunk = [&] { return want_yield.load(std::memory_order_acquire) >= 0; };
                         std::thread reader([&] {
                             strata::core::FileExpertSource::set_stage_consumer(1);   // its blob hand-outs age on their own clock
@@ -17121,12 +17129,14 @@ int main(int argc, char** argv) {
                             std::thread& t;
                             std::function<bool()>& hook;
                             bool& reading;
+                            bool& live;   // kvsh_read_live: the caches may evict again
                             ~ReadEnd() {
                                 if (t.joinable()) t.join();
                                 hook = nullptr;
                                 reading = false;
+                                live = false;
                             }
-                        } read_end{reader, sp.stop_at_chunk, in_prompt_read};
+                        } read_end{reader, sp.stop_at_chunk, in_prompt_read, kvsh_read_live};
                         bool pump_ok = true;
                         size_t seen = 0;   // in_lines' length after the last look: a line that comes wakes the wait
                         // STRATA_PIPED_CONCURRENT_WARMUP_MS=N (an experiment, 0 = off): for the first N ms of a read the
@@ -17165,6 +17175,7 @@ int main(int argc, char** argv) {
                         }
                         reader.join();   // (a failed window leaves the read to finish: it is not stopped mid-run)
                         sp.stop_at_chunk = nullptr;
+                        kvsh_read_live = false;
                         in_prompt_read = false;
                         if (srcp == &src) src.set_stage_no_pin(false);
                         if (!pump_ok || !pipe_drain()) {

@@ -21,6 +21,8 @@ struct Entry {
     int dev = -1;
     StKind kind = StKind::wait;
     uint32_t repeats = 0;
+    const void* done = nullptr;   // STRATA_STREAM_TRACE=2: the event recorded right after this launch (its pool's)
+    uint32_t seq = 0;             // the launch's number on its stream (the pool reuses events: valid while recent)
 };
 constexpr size_t kRing = 65536;
 Entry g_ring[kRing];
@@ -69,6 +71,14 @@ const char* kernel_name(const void* func) {
     return "?";
 }
 
+void st_log_launch(StKind kind, const void* stream, const void* func, int dev, const void* done, uint32_t seq) {
+    note_stream(stream, dev);
+    const uint64_t t = now_us();
+    const uint64_t i = g_next.fetch_add(1, std::memory_order_relaxed);
+    Entry& e = g_ring[i % kRing];
+    e.t_us = t; e.tid = tid_of(); e.repeats = 0; e.where = nullptr; e.stream = stream; e.event = func; e.dev = dev; e.kind = kind;
+    e.done = done; e.seq = seq;
+}
 void st_log(StKind kind, const char* where, const void* stream, const void* event, int dev) {
     note_stream(stream, dev);
     // a polling loop (a synchronize begun and ended a microsecond apart, over and over) must not wash the ring: a
@@ -109,6 +119,8 @@ void st_log(StKind kind, const char* where, const void* stream, const void* even
     e.event = event;
     e.dev = dev;
     e.kind = kind;
+    e.done = nullptr;
+    e.seq = 0;
 }
 
 void stream_trace_dump(std::FILE* f, size_t last_n) {
@@ -142,10 +154,16 @@ void stream_trace_dump(std::FILE* f, size_t last_n) {
             const size_t from = v.size() > 40 ? v.size() - 40 : 0;
             for (size_t i = from; i < v.size(); ++i) {
                 const Entry& e = *v[i];
-                if (e.kind == StKind::launch)
-                    std::fprintf(f, "   %10.1f %-11s tid %04llx kernel %s\n", (double) (t_last - e.t_us), kind_name(e.kind),
-                                 (unsigned long long) e.tid, kernel_name(e.event));
-                else
+                if (e.kind == StKind::launch) {
+                    const char* state = "";
+                    if (e.done != nullptr) {   // STRATA_STREAM_TRACE=2: the first launch not done is the one the card sits on
+                        const cudaError_t q = cudaEventQuery((cudaEvent_t) e.done);
+                        (void) cudaGetLastError();
+                        state = q == cudaSuccess ? "  [done]" : q == cudaErrorNotReady ? "  [NOT DONE]" : "  [query failed]";
+                    }
+                    std::fprintf(f, "   %10.1f %-11s tid %04llx kernel %s%s\n", (double) (t_last - e.t_us), kind_name(e.kind),
+                                 (unsigned long long) e.tid, kernel_name(e.event), state);
+                } else
                     std::fprintf(f, "   %10.1f %-11s tid %04llx event %p  %s\n", (double) (t_last - e.t_us), kind_name(e.kind),
                                  (unsigned long long) e.tid, e.event, e.where ? e.where : "?");
             }
@@ -206,6 +224,32 @@ void stream_trace_dump(std::FILE* f, size_t last_n) {
             (void) cudaGetLastError();
         }
     }
+    // STRATA_STREAM_TRACE=2: for each stream still busy, the boundary between its launches that finished and the ones
+    // that did not - the first launch not done is the kernel the card sits on (the host runs far ahead of the GPU, so
+    // the last 40 entries above are usually all "not done")
+    {
+        std::map<const void*, std::vector<const Entry*>> launches;
+        for (const Entry& e : es) if ((e.kind == StKind::launch || e.kind == StKind::graph) && e.done != nullptr) launches[e.stream].push_back(&e);
+        for (auto& [st, v] : launches) {
+            if (cudaStreamQuery((cudaStream_t) st) != cudaErrorNotReady) { (void) cudaGetLastError(); continue; }
+            (void) cudaGetLastError();
+            // from the newest back: the first launch whose event is done
+            size_t first_not_done = v.size();
+            for (size_t i = v.size(); i-- > 0;) {
+                const cudaError_t q = cudaEventQuery((cudaEvent_t) v[i]->done);
+                (void) cudaGetLastError();
+                if (q == cudaSuccess) break;
+                first_not_done = i;
+            }
+            std::fprintf(f, "strata stream trace: stream %p (dev %d) is busy: of its %zu traced launches %zu finished; the first not done and its neighbours:\n",
+                         st, v.back()->dev, v.size(), first_not_done);
+            const size_t a = first_not_done >= 4 ? first_not_done - 4 : 0, b = std::min(v.size(), first_not_done + 6);
+            for (size_t i = a; i < b; ++i)
+                std::fprintf(f, "   %s %10.1f %s %s\n", i == first_not_done ? ">>" : "  ", (double) (t_last - v[i]->t_us),
+                             v[i]->kind == StKind::graph ? "graph" : "kernel", v[i]->kind == StKind::graph ? "(a captured window or commit)" : kernel_name(v[i]->event));
+            if (first_not_done == v.size()) std::fprintf(f, "   (every traced launch finished: the stream waits on something else - a copy, an event, a graph)\n");
+        }
+    }
     // derived: open synchronizes (a begin with no end from the same thread on the same stream/event)
     std::map<std::pair<uint64_t, const void*>, const Entry*> open_sync, open_esync;
     std::map<const void*, const Entry*> last_record;              // event -> its last record
@@ -245,28 +289,82 @@ void stream_trace_dump(std::FILE* f, size_t last_n) {
 // with its stream: the dump's per-stream tails then name the last kernels enqueued before a synchronize that never
 // returned.  The executable's definition binds before libcudart's; the real one is found with RTLD_NEXT.
 #include <dlfcn.h>
+#include <mutex>
 // STRATA_STREAM_TRACE=1 logs the launches too (off: the entry points forward at once; the waits, records and
 // synchronizes are always logged - they are few and cheap)
-static bool st_launches_on() {
-    static const bool on = [] { const char* e = std::getenv("STRATA_STREAM_TRACE"); return e != nullptr && std::atoi(e) != 0; }();
-    return on;
+static int st_trace_level() {
+    static const int v = [] { const char* e = std::getenv("STRATA_STREAM_TRACE"); return e != nullptr ? std::atoi(e) : 0; }();
+    return v;
+}
+static bool st_launches_on() { return st_trace_level() != 0; }
+// STRATA_STREAM_TRACE=2: an event recorded behind every launch, from a pool of 64 per stream (round robin), so the
+// stall report can query which of a busy stream's last launches finished - the first one not done is the kernel the
+// card sits on.  Not inside a graph capture (the record would become a node of the graph).
+namespace {
+constexpr uint32_t kPoolEvents = 1024;
+struct LaunchPool { const void* stream = nullptr; int dev = -1; cudaEvent_t ev[kPoolEvents] = {}; uint32_t next = 0; };
+constexpr size_t kPools = 48;
+LaunchPool g_pools[kPools];
+std::atomic<size_t> g_n_pools{0};
+std::mutex g_pool_mu;
+cudaEvent_t launch_event(cudaStream_t stream, int dev, uint32_t& seq) {
+    cudaStreamCaptureStatus cap = cudaStreamCaptureStatusNone;
+    if (cudaStreamIsCapturing(stream, &cap) != cudaSuccess || cap != cudaStreamCaptureStatusNone) { (void) cudaGetLastError(); return nullptr; }
+    std::lock_guard<std::mutex> lk(g_pool_mu);
+    const size_t n = g_n_pools.load(std::memory_order_acquire);
+    LaunchPool* p = nullptr;
+    for (size_t i = 0; i < n; ++i) if (g_pools[i].stream == (const void*) stream) { p = &g_pools[i]; break; }
+    if (p == nullptr) {
+        if (n >= kPools) return nullptr;
+        p = &g_pools[n]; p->stream = stream; p->dev = dev;
+        for (cudaEvent_t& e : p->ev) if (cudaEventCreateWithFlags(&e, cudaEventDisableTiming) != cudaSuccess) { (void) cudaGetLastError(); e = nullptr; }
+        g_n_pools.store(n + 1, std::memory_order_release);
+    }
+    cudaEvent_t e = p->ev[p->next % kPoolEvents];
+    seq = ++p->next;
+    if (e != nullptr && cudaEventRecord(e, stream) != cudaSuccess) { (void) cudaGetLastError(); return nullptr; }
+    return e;
+}
+}  // namespace
+static void log_launch(cudaStream_t stream, const void* func) {
+    int dev = -1; (void) cudaGetDevice(&dev);
+    const void* done = nullptr; uint32_t seq = 0;
+    if (st_trace_level() >= 2) done = launch_event(stream, dev, seq);
+    strata::core::st_log_launch(strata::core::StKind::launch, stream, func, dev, done, seq);
 }
 extern "C" cudaError_t cudaLaunchKernel(const void* func, dim3 grid, dim3 block, void** args, size_t shmem, cudaStream_t stream) {
     using Fn = cudaError_t (*)(const void*, dim3, dim3, void**, size_t, cudaStream_t);
     static const Fn real = (Fn) dlsym(RTLD_NEXT, "cudaLaunchKernel");
-    if (st_launches_on()) {
-        int dev = -1; (void) cudaGetDevice(&dev);
-        strata::core::st_log(strata::core::StKind::launch, nullptr, stream, func, dev);
-    }
-    return real(func, grid, block, args, shmem, stream);
+    const cudaError_t r = real(func, grid, block, args, shmem, stream);
+    if (st_launches_on()) log_launch(stream, func);
+    return r;
+}
+// CUDA 13's <<<>>> stubs call __cudaLaunchKernel (and some paths cudaLaunchKernelExC), not cudaLaunchKernel: without
+// these two the per-stream tails showed no kernel at all (2x RTX 3090, 2026-10-29, the concurrent read's stall).
+extern "C" cudaError_t __cudaLaunchKernel(const void* func, dim3 grid, dim3 block, void** args, size_t shmem, cudaStream_t stream) {
+    using Fn = cudaError_t (*)(const void*, dim3, dim3, void**, size_t, cudaStream_t);
+    static const Fn real = (Fn) dlsym(RTLD_NEXT, "__cudaLaunchKernel");
+    const cudaError_t r = real(func, grid, block, args, shmem, stream);
+    if (st_launches_on()) log_launch(stream, func);
+    return r;
+}
+extern "C" cudaError_t cudaLaunchKernelExC(const cudaLaunchConfig_t* config, const void* func, void** args) {
+    using Fn = cudaError_t (*)(const cudaLaunchConfig_t*, const void*, void**);
+    static const Fn real = (Fn) dlsym(RTLD_NEXT, "cudaLaunchKernelExC");
+    const cudaError_t r = real(config, func, args);
+    if (st_launches_on() && config != nullptr) log_launch(config->stream, func);
+    return r;
 }
 extern "C" cudaError_t cudaGraphLaunch(cudaGraphExec_t exec, cudaStream_t stream) {
     using Fn = cudaError_t (*)(cudaGraphExec_t, cudaStream_t);
     static const Fn real = (Fn) dlsym(RTLD_NEXT, "cudaGraphLaunch");
+    const cudaError_t r = real(exec, stream);
     if (st_launches_on()) {
         int dev = -1; (void) cudaGetDevice(&dev);
-        strata::core::st_log(strata::core::StKind::graph, nullptr, stream, exec, dev);
+        const void* done = nullptr; uint32_t seq = 0;
+        if (st_trace_level() >= 2) done = launch_event(stream, dev, seq);
+        strata::core::st_log_launch(strata::core::StKind::graph, stream, exec, dev, done, seq);
     }
-    return real(exec, stream);
+    return r;
 }
 #endif

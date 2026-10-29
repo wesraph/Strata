@@ -20,6 +20,8 @@ enum class StKind : uint8_t { wait = 0, record = 1, sync_begin = 2, sync_end = 3
 
 /// Log one entry (lock-free, a fixed ring; the oldest entries are overwritten).
 void st_log(StKind kind, const char* where, const void* stream, const void* event, int dev);
+/// A launch entry with its completion event (STRATA_STREAM_TRACE=2) and its number on the stream.
+void st_log_launch(StKind kind, const void* stream, const void* func, int dev, const void* done, uint32_t seq);
 
 inline cudaError_t st_wait(cudaStream_t stream, cudaEvent_t event, const char* where) {
     int dev = -1; (void) cudaGetDevice(&dev);
