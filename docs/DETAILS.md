@@ -727,7 +727,7 @@ small pool runs one worker per GPU, so the cards copy at the same time instead o
 per 100K tokens, the slot shuttle's p90 658 -> 73 ms). On one card the pool is not created.
 Each slot copy also reuses one host image per stage and layer instead of allocating a fresh
 16 MiB segment per transfer (`STRATA_SLOT_SHUTTLE=0` allocates a fresh one each time, as
-before; on Linux the images are advised `MADV_HUGEPAGE`).
+before; on Linux the images are advised `MADV_HUGEPAGE` only when the kernel's `transparent_hugepage/defrag` is `defer` or `never`: with `always`, `madvise` or `defer+madvise` a huge-page fault in an advised region compacts memory synchronously, and on a host whose RAM is full of the model files' page cache that made parks of a 90K-token conversation take 4-14 s against 80-200 ms (2x RTX 3090, 128 GB, 1.4 GB free, 2026-10-29: 100-170 huge pages, 9-17 compaction stalls and thousands of pages of direct reclaim per slow park, none on a fast one). `STRATA_CONV_HUGEPAGE=1` asks regardless, `=0` never asks).
 
 ### Session files (disk)
 
