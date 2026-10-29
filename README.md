@@ -80,11 +80,40 @@ because three different coding tasks keep the engine's prompt path and expert re
 gain there is the hit rate: upstream's model carves four 262K sessions out of VRAM up front and keeps 3,805 expert
 slots, the pool leaves 5,648.
 
-**Using it.** `--kv-share auto` sizes the pool from the free VRAM (`STRATA_KV_SHARE_FRAC`, default 0.75 of it); the host
+**The same load, replayed.** The agent loop above does different work on every run, so the fork also replays a
+recording of it: 80 recorded turns of three agents (29,148 generated tokens, every answer run to its recorded
+length, temperature 0), the same bytes for both engines, free-running as the agents were. Measured 2026-10-29 on
+the rig above against a real upstream 0.2.7 build, same config minus the pool:
+
+| | upstream 0.2.7 | this fork |
+|---|---|---|
+| wall clock for the three agents to finish | 584 s | 368 s |
+| aggregate (29,148 tokens over that wall) | 49.9 tok/s | 79.2 tok/s |
+| wait before the first token, later turns, median / p90 | 2.73 s / 5.11 s | 1.55 s / 4.43 s |
+| decode on the long answers, per agent | 31.8 / 23.7 / 27.3 tok/s | 55.2 / 35.4 / 48.0 tok/s |
+| reading a turn's new tokens, under 300 / 300-1,000 / 1,000-2,500 | 914 / 1,952 / 3,034 ms | 418 / 1,021 / 1,757 ms |
+| reading the 41K-token first prompt | 13.8 s | 12.0 s |
+
+Three things closed the gap on the reads since the table before it. A slot that gave its conversation back
+through its turn checkpoint saved the whole K/V through host memory (3 to 5 s per turn, 26 to 36 turns per replay)
+for a restore that skipped the pooled pages; the save skips them too now. The RAM copy of the experts is sized by
+what the caches do not hold at the start, and with the pool they hold more, so the experts the pool later takes
+had no copy and came through the page cache (2 to 3 GB per prompt); the copy keeps them now under
+`--resident-budget-gib`. And the CPU share of a short prompt's streamed experts (`STRATA_PREFILL_CPU_SHARE=auto`,
+upstream's own feature) was off beside batch slots whatever the setting; an explicit setting arms it there, since
+the slots wait for the read anyway. The share is what the replay above runs: it moves part of the arithmetic to the
+CPU kernels the engine already uses for cache misses, rounding noise at a mean KL of 0.004 against the share off
+(upstream's measurement; the greedy text was byte-identical in our probe), and it is opt-in.
+
+**Using it.** `--kv-share auto` has no fixed share: the pool may use the free VRAM of the tightest card, starts at
+one extent and grows with the sessions, borrowing from the expert caches and handing back what the last
+`STRATA_KV_TRIM_WINDOW_S` seconds (600; we run 30) did not touch (`STRATA_KV_SHARE_FRAC=F` keeps a fixed split); the host
 swap (`--kv-swap-mib`) sizes itself from free RAM when unset; the exchange is on by default (`STRATA_KV_EXCHANGE=0` turns
-it off, `STRATA_KV_TRIM_IDLE_S` and `STRATA_KV_TRIM_KEEP_TOKENS` tune the idle trim). The flags are documented in
-[docs/DETAILS.md](docs/DETAILS.md). With two NVIDIA cards, `STRATA_PIPED_MTP=1` and `--batch-mtp` add the pipelined slot
-drafts that the table above uses. Give the engine headroom: the pool shares the card's free VRAM with everything else, and
+it off, `STRATA_KV_TRIM_IDLE_S` and `STRATA_KV_TRIM_KEEP_TOKENS` tune the idle trim). `STRATA_STATS_EVERY_S=1` prints a
+line per second with the prompt and generation rates over the interval, the slots running and reading, the hit rate
+and the pool's use. The flags are documented in [docs/DETAILS.md](docs/DETAILS.md). With two NVIDIA cards,
+`STRATA_PIPED_MTP=2` and `--batch-mtp` add the pipelined slot drafts that the tables above use, and
+`STRATA_PREFILL_CPU_SHARE=auto` the CPU share of the short reads. Give the engine headroom: the pool shares the card's free VRAM with everything else, and
 `--vram-reserve-mib 1536` is what keeps three or more long contexts from paging on 24 GB cards.
 
 **Known edges.** Every mapped page is pinned, so three or more conversations near 200K tokens can fill the pool and the next
