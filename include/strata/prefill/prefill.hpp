@@ -19,6 +19,7 @@
 #include <cstdint>
 #include <functional>
 #include <future>
+#include <cstdio>
 #include <memory>
 #include <string>
 
@@ -88,6 +89,8 @@ public:
     /// token goes to its band and path, and the cap moves to the largest band where the shared path measures cheaper.
     /// Inert unless the share is on with no STRATA_PREFILL_STREAM_MIN / STRATA_PREFILL_CPU_SHARE_MAX given.
     static void plan_path(int64_t fresh_tokens);
+    /// The stall report: every live prompt path's chunk, layer and MoE row bounds (host copy and mapped copy), a sanity check
+    static void stall_dump(std::FILE* f);
     int64_t chunk() const;
 
     /// The share of the streamed experts' bytes DMA-able straight from pinned RAM (1 = all).  Sizes the streamed

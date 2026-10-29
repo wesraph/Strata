@@ -237,6 +237,12 @@ PathCost g_path[kPathBands];
 bool g_path_adaptive = false;     // set by arm_cpu_share
 int64_t g_path_cap = 0;           // the measured cap
 int64_t g_path_override = 0;      // this read's threshold (a probe), 0: the cap
+// The threshold a read runs with is frozen at plan_path (the loan, the ring and the buffers are laid out from it, and
+// every stage's chunk decides its path from it): path_record moves the cap, not what a read in flight sees, and
+// plan_path leaves it alone while a read is in flight (the concurrent read: the serve loop plans the next request
+// while this one is being read).
+std::atomic<int64_t> g_path_min_eff{0};
+std::atomic<int> g_reads_in_flight{0};
 inline int path_band(int64_t T) {
     if (T < kPathBandMin || T >= (kPathBandMin << kPathBands)) return -1;
     int b = 0;
@@ -246,7 +252,7 @@ inline int path_band(int64_t T) {
 inline int64_t stream_all_min() {
     static const int64_t env = [] { const char* e = std::getenv("STRATA_PREFILL_STREAM_MIN"); return e ? (int64_t) std::atoll(e) : (int64_t) -1; }();
     if (env >= 0) return env;
-    if (g_path_adaptive) return g_path_override > 0 ? g_path_override : g_path_cap;
+    if (g_path_adaptive) { const int64_t v = g_path_min_eff.load(std::memory_order_acquire); return v > 0 ? v : g_path_cap; }
     return g_stream_min_share > 0 ? g_stream_min_share : kStreamAllMinDefault;
 }
 // a chunk's cost, by band and path; the cap follows the measurements
@@ -1170,6 +1176,7 @@ struct Prefill::Impl {
     // the event that releases each ring slot: its own `used`, or - when an MMQ group is gathered in one launch - the
     // `used` of the last slot gathered with it, recorded once for all of them (a later record only waits longer)
     int used_of[RING_MAX] = {};
+    int64_t cur_layer = -1, cur_T = 0;      // the stall report: where this stage is in its chunk
     // PLE
     float* ple_emb = nullptr;
     std::vector<float> ple_pageable[2];      // the fallback when no more RAM can be pinned
@@ -1295,7 +1302,13 @@ void Prefill::reset() {
     stats_ = PrefillStats{};
 }
 
+namespace {
+std::mutex g_live_mu;              // the live prompt paths (Prefill::stall_dump)
+std::vector<Prefill*> g_live;
+}  // namespace
+
 void Prefill::release() {
+    { std::lock_guard<std::mutex> lk(g_live_mu); g_live.erase(std::remove(g_live.begin(), g_live.end(), this), g_live.end()); }
     if (!impl_) return;
     impl_->hand_worker.reset();   // idle here (run drains the chain before it returns); joins its thread
     if (impl_->cs) strata::core::st_stream_sync(impl_->cs, STRATA_ST_HERE);
@@ -1979,6 +1992,44 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
         return false;
     }
     return true;
+}
+
+// The stall report: every live prompt path's chunk, layer and MoE row bounds - the host copy, the mapped copy and the
+// device copy read back on a fresh non-blocking stream (the copy engine answers while a kernel spins) - so a matmul
+// that never ends can be told from garbage bounds (a torn or stale table) or from sane ones (the kernel itself).
+void Prefill::stall_dump(std::FILE* f) {
+    std::lock_guard<std::mutex> lk(g_live_mu);
+    for (Prefill* p : g_live) {
+        if (p->impl_ == nullptr) continue;
+        Impl& m = *p->impl_;
+        const int64_t T = m.cur_T;
+        const size_t n = m.bounds_host.size();
+        int32_t mx = 0, mn = 0;
+        for (size_t i = 0; i < n; ++i) { mx = std::max(mx, m.bounds_host[i]); mn = std::min(mn, m.bounds_host[i]); }
+        size_t diff = 0;
+        if (m.grp_host != nullptr && n > 0) { const int32_t* bh = m.grp_host + 3 * m.grp_tk; for (size_t i = 0; i < n; ++i) if (bh[i] != m.bounds_host[i]) ++diff; }
+        size_t ddiff = 0; bool dread = false; int32_t dmn = 0, dmx = 0;
+        if (m.bounds_dev != nullptr && n > 0 && m.device >= 0) {
+            int prev = -1; cudaGetDevice(&prev); cudaSetDevice(m.device);
+            cudaStream_t cs2 = nullptr; std::vector<int32_t> dv(n);
+            if (cudaStreamCreateWithFlags(&cs2, cudaStreamNonBlocking) == cudaSuccess) {
+                if (cudaMemcpyAsync(dv.data(), m.bounds_dev, n * 4, cudaMemcpyDeviceToHost, cs2) == cudaSuccess) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    cudaError_t q = cudaErrorNotReady;
+                    while ((q = cudaStreamQuery(cs2)) == cudaErrorNotReady && std::chrono::steady_clock::now() - t0 < std::chrono::seconds(3)) std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                    if (q == cudaSuccess) { dread = true; for (size_t i = 0; i < n; ++i) { if (dv[i] != m.bounds_host[i]) ++ddiff; dmx = std::max(dmx, dv[i]); dmn = std::min(dmn, dv[i]); } }
+                }
+                (void) cudaGetLastError();
+                cudaStreamDestroy(cs2);
+            }
+            if (prev >= 0) cudaSetDevice(prev);
+        }
+        std::fprintf(f, "strata prefill state: layers [%lld,%lld) dev %d: chunk T=%lld, at layer %lld, ring %d, group tables %s; bounds_host n=%zu min %d max %d (T*K=%lld); the mapped copy differs in %zu entries\n",
+                     (long long) p->stage_lb_, (long long) p->stage_le_, m.device, (long long) T, (long long) m.cur_layer, m.ring,
+                     m.grp_host != nullptr ? "mapped" : "copied", n, mn, mx, (long long) (T * K), diff);
+        if (dread) std::fprintf(f, "strata prefill state:   the device copy of the bounds differs in %zu entries (min %d max %d)\n", ddiff, dmn, dmx);
+        else std::fprintf(f, "strata prefill state:   the device copy of the bounds could not be read back in 3 s\n");
+    }
 }
 
 int64_t Prefill::chunk() const { return impl_->T; }
@@ -2708,6 +2759,7 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
         std::getenv("STRATA_PREFILL_CPU_SHARE_MAX") == nullptr && !g_path_adaptive) {
         g_path_adaptive = true;
         g_path_cap = 4096;
+        g_path_min_eff.store(4096, std::memory_order_release);
         std::fprintf(stderr, "prefill: the CPU share's chunk cap is measured: it starts at 4096 tokens and follows the cost per token "
                              "of each path in the 1K-8K bands (STRATA_PREFILL_CPU_SHARE_MAX=N fixes it)\n");
     }
@@ -2716,15 +2768,18 @@ void Prefill::arm_cpu_share(bool applies, bool by_default) {
 void Prefill::plan_path(int64_t fresh_tokens) {
     if (!g_path_adaptive) return;
     std::lock_guard<std::mutex> lk(g_path_mu);
+    if (g_reads_in_flight.load(std::memory_order_acquire) > 0) return;   // a read is running with the threshold it has
     g_path_override = 0;
     const int b = path_band(fresh_tokens);
-    if (b < 0) return;
-    PathCost& pc = g_path[b];
-    ++pc.reads;
-    const bool shared_now = fresh_tokens < g_path_cap;
-    const int other = shared_now ? 1 : 0;
-    if (pc.n[other] < kPathMinSamples || pc.reads % kPathProbeEvery == 0)   // the other path, as a probe
-        g_path_override = shared_now ? (kPathBandMin << b) : (kPathBandMin << (b + 1));
+    if (b >= 0) {
+        PathCost& pc = g_path[b];
+        ++pc.reads;
+        const bool shared_now = fresh_tokens < g_path_cap;
+        const int other = shared_now ? 1 : 0;
+        if (pc.n[other] < kPathMinSamples || pc.reads % kPathProbeEvery == 0)   // the other path, as a probe
+            g_path_override = shared_now ? (kPathBandMin << b) : (kPathBandMin << (b + 1));
+    }
+    g_path_min_eff.store(g_path_override > 0 ? g_path_override : g_path_cap, std::memory_order_release);
 }
 
 bool Prefill::ring_bytes_enabled() { return ring_bytes_on(); }
@@ -3212,6 +3267,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             kva_floor_ = p0 + T;   // the chunks are a prefix of the run: this is the first position with real rows
         }
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
+        m.cur_T = T;
+        m.cur_layer = -1;
 #if defined(STRATA_HAVE_DFLASH2)
         // DFlash2 prompt taps: the rows of this chunk at positions >= tap_first_ (the drafter looks back one window)
         const int64_t tap_t0 = tap_dev_ != nullptr ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : T;
@@ -3702,6 +3759,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              (long long) p0, (long long) layer, what, ms, cudaGetErrorString(a), cudaGetErrorString(b));
         };
         for (int64_t l = LB; l < LE; ++l) {
+            m.cur_layer = l;
             core::progress_beat();   // the serve watchdog: a prompt chunk of 8192 tokens is still moving
             if (l > LB) pf_step("reading the prompt (batched, step sync): the experts and the rest of layer", l - 1);
             core::progress_at("reading the prompt (batched): layer", l, p0);   // #251: a stall names layer and chunk
@@ -7162,6 +7220,7 @@ bool Prefill::reserve_uploads(int64_t T) {
 }
 
 bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& err) {
+    { std::lock_guard<std::mutex> lk(g_live_mu); for (Prefill* p = this; p != nullptr; p = p->next_) if (std::find(g_live.begin(), g_live.end(), p) == g_live.end()) g_live.push_back(p); }
 #if defined(STRATA_GPU_METAL)
     {
         const auto t0 = std::chrono::steady_clock::now();
@@ -7210,6 +7269,7 @@ bool Prefill::run(const int64_t* tokens, int64_t n, int64_t pos0, std::string& e
             std::fprintf(stderr, "strata prefill: layer-major off for this prompt: %s\n", why.c_str());
         }
     }
+    struct InFlight { InFlight() { g_reads_in_flight.fetch_add(1, std::memory_order_acq_rel); } ~InFlight() { g_reads_in_flight.fetch_sub(1, std::memory_order_acq_rel); } } in_flight;
     const bool body_ok = run_impl(tokens, n, pos0, err);
 
     std::string drain_err;
