@@ -1395,6 +1395,10 @@ class StrataEngine:
     @staticmethod
     def sampling_keys(sampling: dict) -> str:
         keys = ""
+        # "strata_ignore_eos": true - the end-of-text token does not end the answer; it runs to max_tokens (a replay
+        # benchmark that must generate the same count every run; the finish reason is then "length")
+        if sampling.get("strata_ignore_eos"):
+            keys += " ignore_eos=1"
         t = sampling.get("temperature")
         if isinstance(t, (int, float)) and float(t) > 0.0:
             keys += f" temperature={float(t)!r}"
