@@ -10928,6 +10928,7 @@ int main(int argc, char** argv) {
                                          (long long) page_total, victims.size());
                         kvsh_swap.refused += victims.size(); kvsh_swap.called += victims.size(); return;
                     }
+                    const auto t_out = Clock::now();
                     std::vector<size_t> order(k);
                     for (size_t i = 0; i < k; ++i) order[i] = i;
                     std::sort(order.begin(), order.end(), [&](size_t x, size_t y) { return victims[x].first < victims[y].first; });
@@ -10974,9 +10975,17 @@ int main(int argc, char** argv) {
                     for (size_t i = 0; i < k; ++i) kvsh_swap.take_owned(victims[i].second, std::move(bufs[i]));
                     kvsh_swap.refused += victims.size() - k;
                     kv_pages.count_swapped_out((int64_t) k);
+                    {   // the move's own time: the copies and the host packing (the working-set line adds the extent drops)
+                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_out).count();
+                        const double mib = (double) k * (double) page_total / 1048576.0;
+                        std::fprintf(stderr, "strata serve: --kv-share: swap out: %zu pages (%.0f MiB, %lld tokens) to the host in %.1f ms (%.2f GB/s); the swap holds %llu MiB\n",
+                                     k, mib, (long long) ((int64_t) k * kvsh_ps), ms, ms > 0.0 ? mib / 1024.0 / (ms / 1000.0) : 0.0,
+                                     (unsigned long long) (kvsh_swap.bytes >> 20));
+                    }
                 },
                 [&, page_total, page_bytes, arr_prefix, range_prefix](const std::vector<std::pair<uint64_t, int32_t>>& pairs) -> bool {
                     if (pairs.empty() || page_total <= 0) return false;
+                    const auto t_in = Clock::now();
                     const size_t k = pairs.size();
                     std::vector<const uint8_t*> src(k);
                     for (size_t i = 0; i < k; ++i)
@@ -11021,6 +11030,13 @@ int main(int argc, char** argv) {
                     }
                     for (size_t i = 0; i < k; ++i) kvsh_swap.drop(pairs[i].first);   // the pages hold them now
                     kvsh_swap.in_count += k;
+                    {
+                        const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_in).count();
+                        const double mib = (double) k * (double) page_total / 1048576.0;
+                        std::fprintf(stderr, "strata serve: --kv-share: swap in: %zu pages (%.0f MiB, %lld tokens) from the host in %.1f ms (%.2f GB/s); the swap holds %llu MiB\n",
+                                     k, mib, (long long) ((int64_t) k * kvsh_ps), ms, ms > 0.0 ? mib / 1024.0 / (ms / 1000.0) : 0.0,
+                                     (unsigned long long) (kvsh_swap.bytes >> 20));
+                    }
                     return true;
                 },
                 [&](uint64_t key) { return kvsh_swap.held.find(key) != kvsh_swap.held.end(); });
