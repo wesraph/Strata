@@ -236,7 +236,7 @@ so the slots never wait for the read and the read is one run with no drain insid
 - The prompt's K/V goes to the main sessions and the slots' to their own, so they do not touch each other's state. The
   n-gram (PLE) table both of them read is locked. The adaptive VRAM tier stands still during the read: its round lands
   before the read and none starts while it runs.
-- The VRAM expert slots the prompt path borrows are lent before the read and refilled after it, with nothing in flight;
+- The VRAM expert slots the prompt path borrows are lent before the read and refilled after it (the refill's copies go out on the GPU's default stream and land beside the first windows, which run on non-blocking streams; the residency table marks the experts resident at a later tick, and until then they are CPU misses, as they were during the synchronous refill that held the serve thread 143 ms per batched read, median of 10 on 2x RTX 3090, 2026-10-29; `STRATA_REFILL_ASYNC=0` restores the synchronous one), with nothing in flight;
   in between the slots' windows compute those experts on the CPU.
 - The slots' doorbells are served on a thread of their own during the read, which makes no CUDA call. A CUDA call can
   wait for the driver's lock while its holder waits for the GPU - a free, or the module the first kernel of a new shape

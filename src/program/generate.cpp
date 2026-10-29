@@ -9767,6 +9767,9 @@ int main(int argc, char** argv) {
             int32_t first_now = -1;        // where its buffers are laid out now
             int64_t lent_chunk = 0;
             std::vector<std::pair<int32_t, int32_t>> lent;
+            cudaEvent_t refill_ev = nullptr;   // STRATA_REFILL_ASYNC: the loan's copies back, in flight (refill_live)
+            bool refill_live = false;
+            Clock::time_point refill_t0{};
         };
         // bytes -> slots for one cache: exact when it knows its per-slot offsets (a native pack's blobs differ
         // per layer), otherwise max_blob each.
@@ -14366,6 +14369,36 @@ int main(int argc, char** argv) {
         // point).  stage_batch writes keep-all commit words for every window it launches, so a commit graph queued
         // earlier would read clobbered words at execution: running the queue before the next launch keeps them
         // valid, and the group's next window queues behind its commit on every stream.
+        // STRATA_REFILL_ASYNC (on; =0 off): after a batched prompt read, the experts the loan displaced are copied back
+        // on the GPU's default stream while the slots decode (their streams are non-blocking), and the residency table
+        // marks them resident at a later tick, once the copies have landed.  Synchronous, the refill held the serve
+        // thread 143 ms per batched read (median of 10 on the 2x3090 rig, 2026-10-29) between the read and the first
+        // window.  Until the copies land those experts are CPU misses, as they were during the synchronous refill.
+        static const bool refill_async_on = [] { const char* v = std::getenv("STRATA_REFILL_ASYNC"); return v == nullptr || v[0] != '0'; }();
+        auto refill_settle = [&](bool wait, std::string& e) -> bool {
+            bool any = false;
+            for (PfPart& p : pf_parts) {
+                if (!p.refill_live) continue;
+                const strata::core::OnDevice on(p.dev);
+                if (!wait) {
+                    if (cudaEventQuery(p.refill_ev) != cudaSuccess) { (void) cudaGetLastError(); continue; }   // still landing
+                } else if (strata::core::st_event_sync(p.refill_ev, STRATA_ST_HERE) != cudaSuccess) {
+                    e = "the refill's copies failed";
+                    return false;
+                }
+                for (const auto& [i, slot] : p.lent) host_res[(size_t) i] = slot;
+                if (trace)
+                    std::fprintf(stderr, "strata trace: refill settled on CUDA%d: %zu slots resident again, %.1f ms after the issue%s\n",
+                                 p.dev < 0 ? 0 : p.dev, p.lent.size(),
+                                 std::chrono::duration<double, std::milli>(Clock::now() - p.refill_t0).count(), wait ? " (waited)" : "");
+                p.lent.clear();
+                p.lent_chunk = 0;
+                p.refill_live = false;
+                any = true;
+            }
+            if (any) res_upload();
+            return true;
+        };
         bool kvsh_need_quiet = false;        // a slot outgrew the reserve under a window in flight: empty the pipeline, refill
         bool kvsh_quiet_failed = false;      // ... and the refill brought nothing (the pool is full until the extents change)
         int64_t kvsh_quiet_failed_ext = -1;
@@ -14394,6 +14427,7 @@ int main(int argc, char** argv) {
         auto pump = [&](bool may_start) -> bool {
             ++pipe_tick;
             stats_refresh();
+            { std::string se; if (!refill_settle(false, se)) { std::printf("ERR %s\n", se.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", se.c_str()); return false; } }
             if (kvsh_need_quiet && !pipe_inflight()) {   // the pipeline emptied for a slot's growth: the reserve refills
                 const int64_t free0 = kv_pages.free_count();
                 if (kvsh_topup) kvsh_topup();
@@ -14928,6 +14962,7 @@ int main(int argc, char** argv) {
             line_drain_ms = 0.0;
             stats.main_gen = 0;   // between requests: the non-batch path is not decoding
             stats_refresh();
+            { std::string se; if (!refill_settle(false, se)) { std::fprintf(stderr, "strata serve: the serve loop ends: %s\n", se.c_str()); return 1; } }
             if (batch_on() || (piped && pipe_inflight())) {
                 if (!try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
@@ -16484,7 +16519,7 @@ int main(int argc, char** argv) {
             // STRATA_REFILL_PARTS=1 (gfx1151's table): a lent slot of a GGUF read in place is refilled from the pieces in the mapping.
             // The default assembles the blob in a staging buffer first (a 4 MB copy on this thread), then copies that.
             static const bool refill_parts = [] { const char* v = std::getenv("STRATA_REFILL_PARTS"); return v != nullptr && std::atoi(v) != 0; }();
-            auto refill_issue = [&](PfPart& p, std::string& e) -> bool {
+            auto refill_issue = [&](PfPart& p, std::string& e, bool mark = true) -> bool {
                 tr("refill start", (long long) p.lent.size());
                 const strata::core::OnDevice on(p.dev);
                 for (const auto& [i, slot] : p.lent) {   // D-4: queued, one wait (STRATA_REFILL_BLOCKING=1: each)
@@ -16492,7 +16527,7 @@ int main(int argc, char** argv) {
                     const int np = refill_parts && !refill_blocking() ? srcp->blob_parts(i / g.n_expert, i % g.n_expert, parts) : 0;
                     if (np > 0) {   // the GGUF read in place: the tensors' pieces go from the mapping to the slot, no assembled copy
                         if (!p.cache->fill_slot_queued_parts(slot, parts, np, e)) return false;
-                        host_res[(size_t) i] = slot;
+                        if (mark) host_res[(size_t) i] = slot;
                         continue;
                     }
                     const uint8_t* b = srcp->blob_stable(i / g.n_expert, i % g.n_expert);
@@ -16501,7 +16536,7 @@ int main(int argc, char** argv) {
                                                             : p.cache->fill_slot_queued(slot, b, e, nb)))
                         return false;
                     if (!refill_blocking()) srcp->note_async_read(b, nullptr);   // #1237
-                    host_res[(size_t) i] = slot;
+                    if (mark) host_res[(size_t) i] = slot;
                 }
                 return true;
             };
@@ -16526,6 +16561,7 @@ int main(int argc, char** argv) {
             // STRATA_REFILL_SERIAL=1: stage after stage, as 0.1.30/0.1.31.
             static const bool refill_serial = std::getenv("STRATA_REFILL_SERIAL") != nullptr;
             auto refill = [&](std::string& e) -> bool {
+                if (!refill_settle(true, e)) return false;   // (an asynchronous one still landing: it lands first)
                 const auto t_rf = Clock::now();
                 int64_t n_lent = 0, n_parts = 0;
                 for (PfPart& p : pf_parts)
@@ -16548,6 +16584,30 @@ int main(int argc, char** argv) {
                 }
                 return true;
             };
+            auto refill_async = [&](std::string& e) -> bool {
+                if (!refill_settle(true, e)) return false;
+                int64_t n = 0;
+                const auto t0 = Clock::now();
+                for (PfPart& p : pf_parts) {
+                    if (p.lent.empty()) continue;
+                    const strata::core::OnDevice on(p.dev);
+                    if (p.refill_ev == nullptr && cudaEventCreateWithFlags(&p.refill_ev, cudaEventDisableTiming) != cudaSuccess) {
+                        e = "the refill's event could not be created";
+                        return false;
+                    }
+                    if (!refill_issue(p, e, false)) return false;
+                    if (cudaEventRecord(p.refill_ev, (cudaStream_t) 0) != cudaSuccess) { e = "the refill's event could not be recorded"; return false; }
+                    p.refill_live = true;
+                    p.refill_t0 = t0;
+                    n += (int64_t) p.lent.size();
+                }
+                if (trace && n > 0) {
+                    std::fprintf(stderr, "strata trace: refill of %lld slots issued in %.1f ms; it lands beside the windows\n", (long long) n,
+                                 std::chrono::duration<double, std::milli>(Clock::now() - t0).count());
+                    std::fflush(stderr);
+                }
+                return true;
+            };
             // lend the slots `tokens` batched prompt tokens need: the prompt path's buffers for min(chunk, tokens
             // rounded up to 256), laid out in the last of the slots it may borrow - per participant, out of that
             // participant's own cache, and marking only that participant's own layers
@@ -16555,6 +16615,7 @@ int main(int argc, char** argv) {
             auto lend = [&](int64_t tokens, std::string& e, int64_t exact) -> bool {
                 seg_lend = 0;
                 if (pf_parts.empty()) return true;                     // its own buffers: nothing to lend
+                if (!refill_settle(true, e)) return false;             // (copies landing in the slots it would lay out in)
                 const auto t_ln = Clock::now();
                 // what this segment needs, capped by the configured chunk: a request lends only what its own
                 // prompt needs, so a large chunk costs a short prompt nothing
@@ -17527,7 +17588,7 @@ int main(int argc, char** argv) {
                              (long long) n, page_hash(0), page_hash(1), page_hash(30), page_hash(31),
                              page_hash(32), ph);
             }
-            if (!refill(err)) {
+            if (!(refill_async_on ? refill_async(err) : refill(err))) {
                 std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                 return 1;
             }
