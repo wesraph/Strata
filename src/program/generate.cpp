@@ -13785,12 +13785,19 @@ int main(int argc, char** argv) {
                         strata::core::ConversationKv fresh;
                         strata::core::ConversationKv* img = &fresh;
                         if (!slot_shuttle_off) img = &shuttle_kv(k, j);
+                        // --kv-share: the pages main took from the pool (the keyed prefix, mapped by the admit above) are
+                        // shared, so the image carries only what follows them - the SAVE skips them like the restore
+                        // does.  It saved them all before: a checkpoint give-back of 41K tokens moved 1 GB through
+                        // pageable host memory for a restore that then read 1 page of it, 3-5 s per turn (26-36 turns
+                        // of 80 in the three-agent replay, 2x3090, 2026-10-29; 15.6 s for a 43K-token turn on the
+                        // live server), against 40-70 ms for a whole-conversation give-back
+                        const int64_t skip = kvsh ? (int64_t) kvshs.sess[0].cached.size() : 0;
                         if (!strata::core::conversation_kv_save(*img, from.qsa_states[from.qsa_ord0 + j], g, upto, true, se,
-                                                                0, nullptr, kvshs.st(b)))
+                                                                0, nullptr, kvshs.st(b), skip))
                             return false;
                         if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { se = "batch slot restore: device sync failed"; return false; }
                         if (!strata::core::conversation_kv_restore(*img, to.qsa_states[to.qsa_ord0 + j], g, upto, true, se,
-                                                                   kvshs.t(), (int64_t) kvshs.sess[0].cached.size()))
+                                                                   kvshs.t(), skip))
                             return false;
                     }
                     if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { se = "batch slot restore: device sync failed"; return false; }
