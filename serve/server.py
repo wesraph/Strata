@@ -1907,7 +1907,8 @@ class StrataEngine:
                     if slot is None:
                         finish = (self.last or {}).get("finish") if isinstance(self.last, dict) else None
                         left = int(max_new) - len(out)
-                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or (out and out[-1] in EOS_IDS):
+                        if cancel.is_set() or left <= 0 or finish in ("stop", "length") or \
+                                (out and out[-1] in EOS_IDS and not (sampling or {}).get("strata_ignore_eos")):
                             return
                         if reused0 is None:
                             reused0 = (self.last or {}).get("reused")
@@ -5457,7 +5458,7 @@ class Service:
                                 if trace is not None and trace["first_token_s"] is None:
                                     with self.status_lock:
                                         trace["first_token_s"] = round(time.perf_counter() - trace["_clock"], 3)
-                                if t in self.stop_ids:
+                                if t in self.stop_ids and not (sampling or {}).get("strata_ignore_eos"):   # (a replay runs to max_tokens)
                                     if force and parser.state == "reasoning" and parser.buf == THINK_END:
                                         opens = True    # #537: the held </think> was the end: the call opens there
                                         break
