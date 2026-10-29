@@ -9780,25 +9780,65 @@ int main(int argc, char** argv) {
 #endif
         // Batch slots kept the share off: the pool could be decoding between a prompt's parts.  Where the concurrent
         // read is off (every rig today: the slots wait for the whole read, generation 0 tok/s in every stats interval
-        // with a read in it, 2x RTX 3090 2026-10-29) the pool is idle for the read, so an explicit
-        // STRATA_PREFILL_CPU_SHARE (other than 0) arms it beside the slots too; the default stays off with them.
-        const bool share_forced = [] {
-            const char* v = std::getenv("STRATA_PREFILL_CPU_SHARE");
-            return v != nullptr && v[0] != '\0' && std::strcmp(v, "0") != 0;
-        }();
-        const bool share_pool = !o.no_pool && (o.batch <= 0 || share_forced);
+        // with a read in it) the pool is idle for the read, so this fork arms `auto` beside the slots and on a layer
+        // split too - measured 2x RTX 3090, PCIe x8, UD-IQ4_XS, 2026-10-29: short reads -24 to -39%, the three-agent
+        // replay 415 -> 368 s, greedy text byte-identical in one probe and one answer of three changed in another
+        // (upstream's measured mean KL 0.004) - unless STRATA_PIPED_CONCURRENT=1 asks for the read beside the slots
+        // (the pool would be shared with their misses).  STRATA_PREFILL_CPU_SHARE=0 turns it off; a value forces it.
+        // Whether STRATA_PIPED_CONCURRENT=1 will read prompts beside the slots on this setup (the serve loop's rule,
+        // decided once; the share gate below and the serve loop share it).  Not where a read's thread allocates or
+        // frees (the idle stage's help, STRATA_PREFILL_HELP; the batched draft K/V, STRATA_SPLIT_MTP_BATCH: a free
+        // waits for the device), where serving a doorbell makes a CUDA call (--pcie-mode dma, the Foresight swap
+        // space STRATA_FS_SLOTS, the helper caches), and where the expert source recycles the buffers it hands out
+        // (the GGUF in place, an unbuffered source, the I/O read-ahead: one thread at a time).
+        auto concurrent_read_wanted = [&]() -> bool {
+            static const bool on = [&] {
+                const char* v = std::getenv("STRATA_PIPED_CONCURRENT");
+                if (v == nullptr || std::atoi(v) == 0) return false;
+                auto env_on = [](const char* k) {
+                    const char* x = std::getenv(k);
+                    return x != nullptr && std::atoi(x) != 0;
+                };
+                strata::program::ConcurrentReadSetup s;
+                s.prefill_help = env_on("STRATA_PREFILL_HELP");
+                s.split_mtp_batch = env_on("STRATA_SPLIT_MTP_BATCH");
+                s.fs_slots = env_on("STRATA_FS_SLOTS");
+                s.pcie_dma = o.pcie_mode == "dma";
+                // (--remote-expert-opt works only through a helper cache, so without one it does not count)
+                s.helper_caches = prefill_src != srcp;
+                for (int r = 0; r < 3; ++r) s.helper_caches |= o.expert_cache_remote[(size_t) r] > 0;
+                // The staged pool hands blobs out per consumer now (FileExpertSource::stage_cid_), so the GGUF in
+                // place no longer corrupts a read beside the slots - but on 2x RTX 3090 with three agents the mode
+                // still hung twice in five minutes (the prompt chunk waiting for the GPU at a mid layer, the stage
+                // threads on its events, the doorbell thread asleep between windows: a window spinning for a
+                // doorbell starves the prompt's kernels, upstream's #31 pattern).  Until that is found, a staged
+                // source keeps the mode off unless STRATA_PIPED_CONCURRENT_STAGED=1 asks for it (a debugging opt-in).
+                s.staged_source = srcp == &src && src.stages_blobs() && !env_on("STRATA_PIPED_CONCURRENT_STAGED");
+                s.other_source = srcp != &src && srcp != &arena_src;
+                if (const char* why = strata::program::concurrent_read_off(s)) {
+                    std::fprintf(stderr, "strata batch: STRATA_PIPED_CONCURRENT is off beside %s\n", why);
+                    return false;
+                }
+                return true;
+            }();
+            return on;
+        };
+        const char* share_env = std::getenv("STRATA_PREFILL_CPU_SHARE");
+        const bool share_forced = share_env != nullptr && share_env[0] != '\0' && std::strcmp(share_env, "0") != 0;
+        const bool share_off = share_env != nullptr && std::strcmp(share_env, "0") == 0;
+        const bool share_pool = !o.no_pool && !share_off && (o.batch <= 0 || share_forced || !concurrent_read_wanted());
         if (share_pool && o.batch > 0)
-            std::fprintf(stderr, "strata serve: STRATA_PREFILL_CPU_SHARE is set: the CPU pool takes a share of a prompt "
-                                 "chunk's streamed experts beside the batch slots (they wait for the read); with "
-                                 "STRATA_PIPED_CONCURRENT reading beside the slots the pool would be shared with their misses\n");
+            std::fprintf(stderr, "strata serve: the CPU prefill share runs beside the batch slots (they wait for the read)%s; "
+                                 "STRATA_PREFILL_CPU_SHARE=0 turns it off\n",
+                         share_forced ? " as STRATA_PREFILL_CPU_SHARE asks" : ", auto by default on this fork");
         bool share_has_work = strata::prefill::share_rules::default_share_has_work(
             (int64_t) xcache.slots(), (int64_t) (g.n_layers * g.n_expert));   // #1595
         if (!share_has_work)
             std::fprintf(stderr, "strata serve: every expert is in the GPU cache (%lld of %lld): the CPU prefill share has "
                                  "nothing to take, so it is not armed by default (STRATA_PREFILL_CPU_SHARE=auto forces it)\n",
                          (long long) xcache.slots(), (long long) (g.n_layers * g.n_expert));
-        if (share_pool && stages.empty() && !multi_gpu && share_has_work && !share_default_ok()) share_has_work = false;   // H11
-        strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && stages.empty() && !multi_gpu && share_has_work);
+        if (share_pool && share_has_work && !share_default_ok()) share_has_work = false;   // H11 (this fork: a split and batch slots too)
+        strata::prefill::Prefill::arm_cpu_share(share_pool, share_pool && share_has_work);
         void* borrow = nullptr;
         uint64_t borrow_bytes = 0;
         int32_t lend_first = -1;          // the first slot the prompt path may borrow (its largest chunk)
@@ -16908,35 +16948,7 @@ int main(int argc, char** argv) {
                 // the expert source recycles the buffers it hands out (the GGUF in place, an unbuffered source, the
                 // I/O read-ahead: one thread at a time).  Pictures are read the usual way (their rows go up through
                 // pinned slots of a size known only then).
-                static const bool pr_conc = [&] {
-                    const char* v = std::getenv("STRATA_PIPED_CONCURRENT");
-                    if (v == nullptr || std::atoi(v) == 0) return false;
-                    auto env_on = [](const char* k) {
-                        const char* x = std::getenv(k);
-                        return x != nullptr && std::atoi(x) != 0;
-                    };
-                    strata::program::ConcurrentReadSetup s;
-                    s.prefill_help = env_on("STRATA_PREFILL_HELP");
-                    s.split_mtp_batch = env_on("STRATA_SPLIT_MTP_BATCH");
-                    s.fs_slots = env_on("STRATA_FS_SLOTS");
-                    s.pcie_dma = o.pcie_mode == "dma";
-                    // (--remote-expert-opt works only through a helper cache, so without one it does not count)
-                    s.helper_caches = prefill_src != srcp;
-                    for (int r = 0; r < 3; ++r) s.helper_caches |= o.expert_cache_remote[(size_t) r] > 0;
-                    // The staged pool hands blobs out per consumer now (FileExpertSource::stage_cid_), so the GGUF in
-                    // place no longer corrupts a read beside the slots - but on 2x RTX 3090 with three agents the mode
-                    // still hung twice in five minutes (the prompt chunk waiting for the GPU at a mid layer, the stage
-                    // threads on its events, the doorbell thread asleep between windows: a window spinning for a
-                    // doorbell starves the prompt's kernels, upstream's #31 pattern).  Until that is found, a staged
-                    // source keeps the mode off unless STRATA_PIPED_CONCURRENT_STAGED=1 asks for it (a debugging opt-in).
-                    s.staged_source = srcp == &src && src.stages_blobs() && !env_on("STRATA_PIPED_CONCURRENT_STAGED");
-                    s.other_source = srcp != &src && srcp != &arena_src;
-                    if (const char* why = strata::program::concurrent_read_off(s)) {
-                        std::fprintf(stderr, "strata batch: STRATA_PIPED_CONCURRENT is off beside %s\n", why);
-                        return false;
-                    }
-                    return true;
-                }();
+                static const bool pr_conc = concurrent_read_wanted();   // (the rule above the share gate; its line prints once)
                 if (piped && pr_conc && req_imgs.empty()) {   // (with no slot decoding it only watches for a BYIELD)
                     // the drafter's prompt pass captures its graphs and grows its records at first use, and the
                     // prompt path's pinned upload slots grow at their first larger upload: done here, with nothing in
