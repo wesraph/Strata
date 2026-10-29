@@ -16590,7 +16590,13 @@ int main(int argc, char** argv) {
                 return true;
             };
             auto refill_async = [&](std::string& e) -> bool {
-                if (!refill_settle(true, e)) return false;
+                // nothing newly lent: nothing to issue, and a refill still landing is left to the pump's ticks (the
+                // first version settled it here, which moved the wait from before the windows to after them: every
+                // one of 144 settles in a three-agent replay was a wait, 119 ms after the issue, and nothing was gained)
+                bool fresh = false;
+                for (const PfPart& p : pf_parts) fresh = fresh || (!p.lent.empty() && !p.refill_live);
+                if (!fresh) return true;
+                if (!refill_settle(true, e)) return false;   // (a live one: it lands before the slots are re-issued)
                 int64_t n = 0;
                 const auto t0 = Clock::now();
                 for (PfPart& p : pf_parts) {
@@ -17471,7 +17477,12 @@ int main(int argc, char** argv) {
                 if (to <= at) continue;
                 err.clear();
                 const bool win = windows_ok(at, to);
-                if (win && !refill(err)) {
+                // a part through the windows: the loan a batched part before it took goes back - asynchronously when
+                // STRATA_REFILL_ASYNC is on (the windows then compute the loan's experts on the CPU while the copies
+                // land, as the decoding slots do during a batched read; the merge-first shortcut needs every expert
+                // resident and simply does not apply).  Measured: the refill before the tail windows held the serve
+                // thread 190 ms per turn (mean of 69, the three-agent replay, 2x3090, 2026-10-29).
+                if (win && !(refill_async_on ? refill_async(err) : refill(err))) {
                     std::printf("ERR refilling a lent slot failed: %s\n", err.c_str());
                     return 1;
                 }
