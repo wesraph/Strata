@@ -99,11 +99,12 @@ through its turn checkpoint saved the whole K/V through host memory (3 to 5 s pe
 for a restore that skipped the pooled pages; the save skips them too now. The RAM copy of the experts is sized by
 what the caches do not hold at the start, and with the pool they hold more, so the experts the pool later takes
 had no copy and came through the page cache (2 to 3 GB per prompt); the copy keeps them now under
-`--resident-budget-gib`. And the CPU share of a short prompt's streamed experts (`STRATA_PREFILL_CPU_SHARE=auto`,
-upstream's own feature) was off beside batch slots whatever the setting; an explicit setting arms it there, since
-the slots wait for the read anyway. The share is what the replay above runs: it moves part of the arithmetic to the
-CPU kernels the engine already uses for cache misses, rounding noise at a mean KL of 0.004 against the share off
-(upstream's measurement; the greedy text was byte-identical in our probe), and it is opt-in.
+`--resident-budget-gib`. And the CPU share of a short prompt's streamed experts (`STRATA_PREFILL_CPU_SHARE`,
+upstream's own feature) was off beside batch slots whatever the setting; on this fork it is `auto` there by
+default, since the slots wait for the read anyway. The share is what the replay above runs: it moves part of the
+arithmetic to the CPU kernels the engine already uses for cache misses, rounding noise at a mean KL of 0.004
+against the share off (upstream's measurement; in our probes the greedy text was byte-identical once and differed
+in one answer of three another time), and `STRATA_PREFILL_CPU_SHARE=0` turns it off.
 
 **Using it.** `--kv-share auto` has no fixed share: the pool may use the free VRAM of the tightest card, starts at
 one extent and grows with the sessions, borrowing from the expert caches and handing back what the last
@@ -112,8 +113,8 @@ swap (`--kv-swap-mib`) sizes itself from free RAM when unset; the exchange is on
 it off, `STRATA_KV_TRIM_IDLE_S` and `STRATA_KV_TRIM_KEEP_TOKENS` tune the idle trim). `STRATA_STATS_EVERY_S=1` prints a
 line per second with the prompt and generation rates over the interval, the slots running and reading, the hit rate
 and the pool's use. The flags are documented in [docs/DETAILS.md](docs/DETAILS.md). With two NVIDIA cards,
-`STRATA_PIPED_MTP=2` and `--batch-mtp` add the pipelined slot drafts that the tables above use, and
-`STRATA_PREFILL_CPU_SHARE=auto` the CPU share of the short reads. Give the engine headroom: the pool shares the card's free VRAM with everything else, and
+`STRATA_PIPED_MTP=2` and `--batch-mtp` add the pipelined slot drafts that the tables above use. The CPU share of
+the short reads is on by default beside the slots on this fork (`STRATA_PREFILL_CPU_SHARE=0` turns it off). Give the engine headroom: the pool shares the card's free VRAM with everything else, and
 `--vram-reserve-mib 1536` is what keeps three or more long contexts from paging on 24 GB cards.
 
 **Known edges.** Every mapped page is pinned, so three or more conversations near 200K tokens can fill the pool and the next
