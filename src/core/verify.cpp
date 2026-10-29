@@ -1,5 +1,6 @@
 // src/core/verify.cpp - see include/strata/core/verify.hpp.
 #include "strata/core/batch_rows.hpp"
+#include "strata/core/stream_trace.hpp"
 #include "strata/core/sm75_series.hpp"
 #include "strata/core/sm120_series.hpp"
 #include "strata/core/defaults_026.hpp"
@@ -136,7 +137,7 @@ struct RouteResidentCfg {
                 for (const auto& kv : c.blocks) {
                     if (kv.second == nullptr) continue;
                     unsigned long long h[8] = {};
-                    if (cudaSetDevice(kv.first) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess ||
+                    if (cudaSetDevice(kv.first) != cudaSuccess || strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess ||
                         cudaMemcpy(h, kv.second, sizeof(h), cudaMemcpyDeviceToHost) != cudaSuccess) {
                         (void) cudaGetLastError();
                         continue;
@@ -576,6 +577,13 @@ int64_t trace_now_ns() {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
 }
 std::string released_note(bool drained) {
+    if (!drained) {
+        stream_trace_dump(stderr);   // the GPU did not finish: the stream queues name what it rests on
+        // STRATA_ABORT_ON_GPU_STALL=1 (a diagnosis under gdb): end here, so every host thread's backtrace is taken
+        // while the GPU still spins - which thread was to serve the GPU's wait, and what it waits for itself
+        static const bool abort_on_stall = [] { const char* e = std::getenv("STRATA_ABORT_ON_GPU_STALL"); return e != nullptr && std::atoi(e) != 0; }();
+        if (abort_on_stall) { std::fprintf(stderr, "strata verify: STRATA_ABORT_ON_GPU_STALL: aborting for the backtraces\n"); std::fflush(stderr); std::abort(); }
+    }
     return drained ? "; its GPU waits were released and the GPU finished (#267)"
                    : "; its GPU waits were released but the GPU did not finish within 5 s (#267)";
 }
@@ -708,8 +716,8 @@ Verifier::~Verifier() {
         Verifier* me = this;
         slot.compare_exchange_strong(me, nullptr);
     }
-    if (cs_) cudaStreamSynchronize(cs_);
-    if (sh_cs_) cudaStreamSynchronize(sh_cs_);
+    if (cs_) strata::core::st_stream_sync(cs_, STRATA_ST_HERE);
+    if (sh_cs_) strata::core::st_stream_sync(sh_cs_, STRATA_ST_HERE);
     for (auto& row : exec_)
         for (auto& e : row)
             if (e) cudaGraphExecDestroy(e);
@@ -737,7 +745,7 @@ Verifier::~Verifier() {
     if (logit_bias_device_) cudaFree(logit_bias_device_);
     if (cs_ && cs_ != ext_stream_) cudaStreamDestroy(cs_);   // set_stream: the stage's stream, shared, not ours
     if (sh_cs_) cudaStreamDestroy(sh_cs_);
-    if (copy_) { cudaStreamSynchronize(copy_); cudaStreamDestroy(copy_); }
+    if (copy_) { strata::core::st_stream_sync(copy_, STRATA_ST_HERE); cudaStreamDestroy(copy_); }
     if (side_) cudaStreamDestroy(side_);
     if (side2_) cudaStreamDestroy(side2_);
     for (cudaEvent_t e : {mfork_, mjoin_, pfork_, pjoin_})
@@ -1258,7 +1266,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     const bool side_proj = side_mixer_mode >= 2 && !batch_rec_;   // fork b063c13: the GDN gate projection, the QSA queries
     auto branch = [&](cudaEvent_t e, cudaStream_t from, cudaStream_t to, const char* what) {
         if (to == side_) note_prio_fork(from);   // STRATA_GRAPH_PRIO: where the high-priority branch leaves cs
-        if (cudaEventRecord(e, from) == cudaSuccess && cudaStreamWaitEvent(to, e, 0) == cudaSuccess) return true;
+        if (strata::core::st_record(e, from, STRATA_ST_HERE) == cudaSuccess && strata::core::st_wait(to, e, STRATA_ST_HERE) == cudaSuccess) return true;
         err = std::string("verify: the mixer branch could not ") + what;
         return false;
     };
@@ -1291,12 +1299,12 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
     // nor under the stage profiler (whose stamps are on `cs`).
     const bool br = df_branch_ && G == 1 && !batch_rec_ && !prof_on_ && !side_mixer;   // STRATA_SIDE_MIXER wins
     auto fork = [&](int i) {
-        cudaEventRecord(df_fork_, cs);
-        cudaStreamWaitEvent(df_side_[i], df_fork_, 0);
+        strata::core::st_record(df_fork_, cs, STRATA_ST_HERE);
+        strata::core::st_wait(df_side_[i], df_fork_, STRATA_ST_HERE);
     };
     auto join = [&](int i) {
-        cudaEventRecord(df_join_[i], df_side_[i]);
-        cudaStreamWaitEvent(cs, df_join_[i], 0);
+        strata::core::st_record(df_join_[i], df_side_[i], STRATA_ST_HERE);
+        strata::core::st_wait(cs, df_join_[i], STRATA_ST_HERE);
     };
     const int64_t nQall = g.n_qsa_layers();
     // a batch window: row t is slot t, whose state lives in its own session
@@ -1562,7 +1570,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                                  (const float*) wsa->data, gate + (size_t) tb * HV, beta + (size_t) tb * HV, (int) N,
                                  (int) HV, n, side_);
                     note_prio_tail(side_, 1);
-                    if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the GDN gates' branch could not join"; return false; }
+                    if (strata::core::st_record(mjoin_, side_, STRATA_ST_HERE) != cudaSuccess) { err = "verify: the GDN gates' branch could not join"; return false; }
                 }
                 if (!q8_attn) quant_in(xm, (int) N);
                 if (side_proj) {   // the gate projection (compute-bound for i-quants) beside qkv and the conv
@@ -1579,7 +1587,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     if (g_il) strata::kernels::native_mmvq_il(wg->native_type, wg->native_data, xq_, xil_, z_ + (size_t) tb * ZV,
                                                               (int) N, (int) ZV, n, side2_);
                     else native_mmvq(wg->native_type, wg->native_data, xq_, z_ + (size_t) tb * ZV, (int) N, (int) ZV, n, side2_);
-                    if (cudaEventRecord(pjoin_, side2_) != cudaSuccess) { err = "verify: the gate projection's branch could not join"; return false; }
+                    if (strata::core::st_record(pjoin_, side2_, STRATA_ST_HERE) != cudaSuccess) { err = "verify: the gate projection's branch could not join"; return false; }
                 }
                 if (br) {   // STRATA_DF_BRANCH: a/b and z beside q/k/v and the conv; all of them read only this layer's input
                     fork(0);
@@ -1626,11 +1634,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 stamp(l, 4, grp);
                 if (!side_proj) mm(wg, z_ + (size_t) tb * ZV, (int) N, (int) ZV);
                 stamp(l, 5, grp);
-                if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
+                if (side_proj && strata::core::st_wait(cs, pjoin_, STRATA_ST_HERE) != cudaSuccess) {
                     err = "verify: the gate projection's branch could not join";
                     return false;
                 }
-                if (sidem && cudaStreamWaitEvent(cs, mjoin_, 0) != cudaSuccess) {
+                if (sidem && strata::core::st_wait(cs, mjoin_, STRATA_ST_HERE) != cudaSuccess) {
                     err = "verify: the GDN gates' branch could not join";
                     return false;
                 }
@@ -1853,7 +1861,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     idx_query(side_);
                     idx_select(side_);
                     note_prio_tail(side_, 1);
-                    if (cudaEventRecord(mjoin_, side_) != cudaSuccess) { err = "verify: the indexer's branch could not join"; return false; }
+                    if (strata::core::st_record(mjoin_, side_, STRATA_ST_HERE) != cudaSuccess) { err = "verify: the indexer's branch could not join"; return false; }
                 }
                 if (side_proj) {   // the queries beside the keys and values (fork b063c13)
                     if (q_il && !il_ready && n >= 2) {   // the copy before the fork (mm(wk) / mm(wv) on cs reuse it)
@@ -1861,7 +1869,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                         il_ready = true;
                     }
                     if (!branch(pfork_, cs, side2_, "fork") || !q_chain(side2_)) return false;
-                    if (cudaEventRecord(pjoin_, side2_) != cudaSuccess) { err = "verify: the queries' branch could not join"; return false; }
+                    if (strata::core::st_record(pjoin_, side2_, STRATA_ST_HERE) != cudaSuccess) { err = "verify: the queries' branch could not join"; return false; }
                 }
                 if (!sidem) idx_key(cs);
                 stamp(l, 7, grp);
@@ -2013,11 +2021,11 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     }
                 } else {
                 if (!sidem) idx_select(cs);
-                else if (cudaStreamWaitEvent(cs, mjoin_, 0) != cudaSuccess) {
+                else if (strata::core::st_wait(cs, mjoin_, STRATA_ST_HERE) != cudaSuccess) {
                     err = "verify: the indexer's branch could not join";
                     return false;
                 }
-                if (side_proj && cudaStreamWaitEvent(cs, pjoin_, 0) != cudaSuccess) {
+                if (side_proj && strata::core::st_wait(cs, pjoin_, STRATA_ST_HERE) != cudaSuccess) {
                     err = "verify: the queries' branch could not join";
                     return false;
                 }
@@ -2070,8 +2078,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         cudaStream_t sh_stream = sh_fork ? sh_cs_ : cs;
         if (sh_fork && !sh_fork_late) {
             note_prio_fork(cs);
-            cudaEventRecord(ev_fork_, cs);
-            cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
+            strata::core::st_record(ev_fork_, cs, STRATA_ST_HERE);
+            strata::core::st_wait(sh_cs_, ev_fork_, STRATA_ST_HERE);
         }
         // the window's rows routed in 2 launches (one router GEMV reading the weight once, one
         // top-10) instead of 2 per token; every row's arithmetic is the single-token call's (STRATA_DEC_BATCH=0: old)
@@ -2151,8 +2159,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             if (sh_fork_late) {
                 note_prio_fork(cs);
-                cudaEventRecord(ev_fork_, cs);
-                cudaStreamWaitEvent(sh_cs_, ev_fork_, 0);
+                strata::core::st_record(ev_fork_, cs, STRATA_ST_HERE);
+                strata::core::st_wait(sh_cs_, ev_fork_, STRATA_ST_HERE);
             }
         }
         stamp(l, 17, grp);
@@ -2190,7 +2198,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             }
             if (sh_fork) {
                 note_prio_tail(sh_cs_, -1);
-                cudaEventRecord(ev_join_, sh_cs_);
+                strata::core::st_record(ev_join_, sh_cs_, STRATA_ST_HERE);
             }
         }
         if (strata::kernels::cpu::expert_layout().native) {
@@ -2330,7 +2338,7 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
         // Same condition as `sh_fork` above, which is per group and out of scope here: wait only when the fork
         // actually ran (a wait on an event never recorded is a no-op, but saying it outright reads better).
         if (sh_stream_on() && !prof_on_ && sh_cs_ != nullptr && ev_fork_ != nullptr && ev_join_ != nullptr) {
-            cudaStreamWaitEvent(cs, ev_join_, 0);
+            strata::core::st_wait(cs, ev_join_, STRATA_ST_HERE);
         }
         if (sg_gated_[grp]) {   // STRATA_LFUSE: the shared expert's gate was not applied: the combine applies it (all rows are hits)
             try {
@@ -2746,7 +2754,7 @@ bool Verifier::capture(int T, std::string& err) {
     cudaGraphDestroy(graph);
     if (!made) return false;
     const cudaError_t ue = cudaGraphUpload(exec_t, cs_);
-    const cudaError_t us = cudaStreamSynchronize(cs_);
+    const cudaError_t us = strata::core::st_stream_sync(cs_, STRATA_ST_HERE);
     std::fprintf(stderr, "strata verify: captured the %d-token window (upload %s, sync %s)\n", T,
                  cudaGetErrorString(ue), cudaGetErrorString(us));
     // The upload only warms the graph; the first launch does it otherwise. A failed one (out of memory on a full card)
@@ -3320,9 +3328,9 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         ++windows;
         const bool ok = next_->run(T, tokens, pos0, pool, next_user_, out, err);
         const OnDevice back(device_);
-        const cudaError_t se = cudaStreamSynchronize(cs_);
+        const cudaError_t se = strata::core::st_stream_sync(cs_, STRATA_ST_HERE);
         if (copy_used_) {
-            cudaStreamSynchronize(copy_);
+            strata::core::st_stream_sync(copy_, STRATA_ST_HERE);
             copy_used_ = false;
         }
         if (!ok) return false;
@@ -3351,7 +3359,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     }
 #endif
     trace_ev("SYNC", -1, -1, 0);
-    const cudaError_t se = cudaStreamSynchronize(cs_);
+    const cudaError_t se = strata::core::st_stream_sync(cs_, STRATA_ST_HERE);
     trace_ev("SYNCED", -1, -1, (int64_t) se);
     if (se != cudaSuccess) { err = std::string("verify: ") + cudaGetErrorString(se); return false; }
     if (handoff_failed(err)) return false;   // a stale hand-off: nothing of this window is used
@@ -3363,7 +3371,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
     commit_pending_ = false;
     progress_at("verify window: waiting for the expert copies", (int64_t) T);
     if (copy_used_) {
-        cudaStreamSynchronize(copy_);   // no host function of this window may raise flag B in the next one
+        strata::core::st_stream_sync(copy_, STRATA_ST_HERE);   // no host function of this window may raise flag B in the next one
         copy_used_ = false;
     }
     if (h_bal_ != nullptr && !all_resident_ && !bal_paused_) pcie_balance_window(steps, G);
@@ -3406,13 +3414,13 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         spec_q_ = nullptr;
         spec_nq_ = 0;
         if (measure && !judged) {
-            (void) cudaStreamSynchronize(cs_);
+            (void) strata::core::st_stream_sync(cs_, STRATA_ST_HERE);
             err = "verify: proposal sampler unavailable or allocation/copy/launch failed";
             return false;
         }
         if (judged) ++spec_windows;
         else sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
+        if (strata::core::st_stream_sync(cs_, STRATA_ST_HERE) != cudaSuccess) {   // m_out_ is the mapped h_out_: synced, it is readable
             err = "verify: the head sampling failed";
             return false;
         }
@@ -3664,24 +3672,24 @@ bool Verifier::commit(int n_keep, std::string& err) {
             (cudaEventCreate(&ct.b) != cudaSuccess || cudaEventCreate(&ct.e) != cudaSuccess)) { ct.on = false; (void) cudaGetLastError(); }
         if (ct.on && ct.pending) {
             float ms = 0;
-            if (cudaEventSynchronize(ct.e) == cudaSuccess && cudaEventElapsedTime(&ms, ct.b, ct.e) == cudaSuccess) { ct.ms += ms; ++ct.n; }
+            if (strata::core::st_event_sync(ct.e, STRATA_ST_HERE) == cudaSuccess && cudaEventElapsedTime(&ms, ct.b, ct.e) == cudaSuccess) { ct.ms += ms; ++ct.n; }
             ct.pending = false;
             if (ct.n > 0 && ct.n % 300 == 0)
                 std::fprintf(stderr, "strata verify: commit graph %.3f ms GPU on average over %lld commits\n", ct.ms / (double) ct.n,
                              (long long) ct.n);
         }
-        if (ct.on) cudaEventRecord(ct.b, cs_);
+        if (ct.on) strata::core::st_record(ct.b, cs_, STRATA_ST_HERE);
         const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
-        if (ct.on) { cudaEventRecord(ct.e, cs_); ct.pending = true; }
+        if (ct.on) { strata::core::st_record(ct.e, cs_, STRATA_ST_HERE); ct.pending = true; }
         if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
         // set_commit_async: no wait here - the next window runs on the same stream after it, and the drafter (its own
         // stream) reads only this window's final rows and its own K/V. h_commit_ is next written after the next window's
         // results are read, i.e. after this graph has run.  Everything else waits on commit_done_ (wait_commit).
         if (!g_commit_async || next_ != nullptr) {
-            const cudaError_t se = cudaStreamSynchronize(cs_);
+            const cudaError_t se = strata::core::st_stream_sync(cs_, STRATA_ST_HERE);
             if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
         } else {
-            const cudaError_t re = cudaEventRecord(commit_done_, cs_);
+            const cudaError_t re = strata::core::st_record(commit_done_, cs_, STRATA_ST_HERE);
             if (re != cudaSuccess) { err = std::string("verify: commit event: ") + cudaGetErrorString(re); return false; }
             (void) cudaStreamQuery(cs_);
             commit_pending_ = true;
@@ -3704,7 +3712,7 @@ bool Verifier::wait_commit(std::string& err) {
     if (commit_pending_) {
         const OnDevice on_device(device_);
         commit_pending_ = false;
-        const cudaError_t se = cudaEventSynchronize(commit_done_);
+        const cudaError_t se = strata::core::st_event_sync(commit_done_, STRATA_ST_HERE);
         if (se != cudaSuccess) { err = std::string("verify: commit: ") + cudaGetErrorString(se); return false; }
     }
     return next_ == nullptr || next_->wait_commit(err);
@@ -3775,7 +3783,7 @@ bool Verifier::capture_batch(const int* rows, int S, int hbase, std::string& err
     const bool made = instantiate_evicting(ex, graph, bkey(rows, S, hbase), "verify: batch instantiate: ", err);
     cudaGraphDestroy(graph);
     if (!made) return false;
-    if (cudaGraphUpload(ex, cs_) != cudaSuccess || cudaStreamSynchronize(cs_) != cudaSuccess)
+    if (cudaGraphUpload(ex, cs_) != cudaSuccess || strata::core::st_stream_sync(cs_, STRATA_ST_HERE) != cudaSuccess)
         (void) cudaGetLastError();   // only a warm-up: the first launch uploads it (see capture)
     std::string list;
     for (int t = 0; t < S; ++t) list += (t ? "," : "") + std::to_string(rows[t]);
@@ -4137,7 +4145,7 @@ bool Verifier::evict_batch_graph(const std::vector<int>& keep, bool& evicted, st
         if (t < oldest) { oldest = t; old = it; }
     }
     if (old == exec_bm_.end()) return true;
-    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+    if (strata::core::st_stream_sync(cs_, STRATA_ST_HERE) != cudaSuccess) {
         err = "verify: synchronizing before batch graph eviction failed";
         return false;
     }
@@ -4161,7 +4169,7 @@ bool Verifier::evict_window_graph(int keep_t, bool& evicted, std::string& err) {
     for (int t = 1; t <= max_t_ && t < 9; ++t) have[t] = (ar_off_ ? exec_nr_[sel_long_][t] : exec_[sel_long_][t]) != nullptr;
     const int victim = strata::core::pick_window_victim(have, std::min(max_t_, 8), keep_t, prelaunched_);
     if (victim == 0) return true;
-    if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+    if (strata::core::st_stream_sync(cs_, STRATA_ST_HERE) != cudaSuccess) {
         err = "verify: synchronizing before window graph eviction failed";
         return false;
     }
@@ -4426,9 +4434,9 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
             strata_store_fence();
             *flag = 1;
         }
-        const cudaError_t se = cudaStreamSynchronize(cs_);
+        const cudaError_t se = strata::core::st_stream_sync(cs_, STRATA_ST_HERE);
         if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
-        cudaStreamSynchronize(copy_);
+        strata::core::st_stream_sync(copy_, STRATA_ST_HERE);
         if (prof_on_) collect_profile();
         ++windows;
         if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -4491,9 +4499,9 @@ bool Verifier::run_slot_rows(const int* rows, int S, const int32_t* tokens, cons
         ms_wait += std::chrono::duration<double, std::milli>(b - a).count();
         ms_pool += ms_since(b);
     }
-    const cudaError_t se = cudaStreamSynchronize(cs_);
+    const cudaError_t se = strata::core::st_stream_sync(cs_, STRATA_ST_HERE);
     if (se != cudaSuccess) { err = std::string("verify batch: ") + cudaGetErrorString(se); return false; }
-    cudaStreamSynchronize(copy_);
+    strata::core::st_stream_sync(copy_, STRATA_ST_HERE);
     if (prof_on_) collect_profile();
     ++windows;
     if (le_ < g.n_layers) return next_ == nullptr || next_->run_slot_rows(rows, S, tokens, pos, pool, next_user_, out, err);
@@ -4536,7 +4544,7 @@ bool Verifier::commit_slot_prefixes(const int* keep, std::string& err) {
     if (!batch_self_commits(last_rows_, S)) {   // (else the window has kept its rows)
         const cudaError_t le = cudaGraphLaunch(commit_bm_[bkey(last_rows_, S, row_base_)], cs_);
         if (le != cudaSuccess) { err = std::string("verify: batch commit launch: ") + cudaGetErrorString(le); return false; }
-        const cudaError_t se = cudaStreamSynchronize(cs_);
+        const cudaError_t se = strata::core::st_stream_sync(cs_, STRATA_ST_HERE);
         if (se != cudaSuccess) { err = std::string("verify: batch commit: ") + cudaGetErrorString(se); return false; }
     }
     if (ple_stage())
@@ -4564,7 +4572,7 @@ bool Verifier::sample_rows(int S, std::string& err) {
                                        m_out_ + t, cs_);
         any = true;
     }
-    if (any && cudaStreamSynchronize(cs_) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
+    if (any && strata::core::st_stream_sync(cs_, STRATA_ST_HERE) != cudaSuccess) { err = "verify batch: the row sampling failed"; return false; }
     return true;
 }
 
@@ -4894,7 +4902,7 @@ bool Verifier::pl_launch(int T, const int32_t* tokens, int64_t pos0, std::string
     trace_ev("LAUNCHED", -1, -1, (int64_t) le);
     if (le != cudaSuccess) { err = std::string("verify: launch: ") + cudaGetErrorString(le); return false; }
     if (fl_prof_) cudaMemcpyAsync(prof_pin_, prof_, prof_h_.size() * 8, cudaMemcpyDeviceToHost, cs_);
-    if (cudaEventRecord(ev_done_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
+    if (strata::core::st_record(ev_done_, cs_, STRATA_ST_HERE) != cudaSuccess) { err = "verify: event record failed"; return false; }
     (void) cudaStreamQuery(cs_);   // WDDM: submit now
     fl_active_ = true;
     fl_since_ms_ = fl_flush_ms_ = fl_launch_ms_ = now_ms();
@@ -5029,7 +5037,7 @@ bool Verifier::pl_finish(int32_t* out, std::string& err) {
         SamplerParams sp = sampling_;
         sp.counter = (uint64_t) last_pos0_;
         sample_tokens(head_logits_, T, (int) n_vocab_, hist_d_, hist_len_, sp, m_out_, cs_);
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) {
+        if (strata::core::st_stream_sync(cs_, STRATA_ST_HERE) != cudaSuccess) {
             err = "verify: the head sampling failed";
             return false;
         }
@@ -5057,7 +5065,7 @@ bool Verifier::pl_commit_async(int n_keep, std::string& err) {
     std::atomic_thread_fence(std::memory_order_seq_cst);
     const cudaError_t le = cudaGraphLaunch(commit_exec_, cs_);
     if (le != cudaSuccess) { err = std::string("verify: commit launch: ") + cudaGetErrorString(le); return false; }
-    if (cudaEventRecord(ev_commit_, cs_) != cudaSuccess) { err = "verify: event record failed"; return false; }
+    if (strata::core::st_record(ev_commit_, cs_, STRATA_ST_HERE) != cudaSuccess) { err = "verify: event record failed"; return false; }
     (void) cudaStreamQuery(cs_);
     commit_live_ = true;
     if (ple_stage())

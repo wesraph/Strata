@@ -31,6 +31,7 @@
 #include <mutex>
 #include <tuple>
 #include <type_traits>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -6518,7 +6519,7 @@ int prepare(void* stream) {
     strata::kernels::nib_rev_fill_kernel<<<(1024 + 256 + 512 + 255) / 256, 256, 0, s>>>();
     cudaError_t e = cudaGetLastError();
     unsigned long long bad = 0;
-    if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+    if (e == cudaSuccess) e = strata::core::st_stream_sync(s, STRATA_ST_HERE);
     if (e == cudaSuccess) e = cudaMemcpyFromSymbol(&bad, strata::kernels::g_nib_rev_bad, sizeof bad);
     if (e != cudaSuccess) return (int) e;
     g_rev_ready[dev] = bad == 0 ? 1 : 2;

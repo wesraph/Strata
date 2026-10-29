@@ -33,6 +33,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 
@@ -130,7 +131,7 @@ void rope_neox_apply(const float* x, float* out, int64_t rows, int head_dim, int
         std::fprintf(stderr, "rope_neox_apply launch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) strata::core::st_device_sync(STRATA_ST_HERE);
 }
 
 }  // namespace strata::kernels

@@ -13,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::core {
 namespace {
@@ -100,8 +101,8 @@ void RemoteExperts::close() {
     if (device_ < 0) return;
     DeviceScope scope(device_);
     if (scope.ok) {
-        if (stream_) cudaStreamSynchronize(stream_);
-        if (read_stream_) cudaStreamSynchronize(read_stream_);
+        if (stream_) strata::core::st_stream_sync(stream_, STRATA_ST_HERE);
+        if (read_stream_) strata::core::st_stream_sync(read_stream_, STRATA_ST_HERE);
         cache_.close();
         if (d_x_) cudaFree(d_x_);
         if (d_out_) cudaFree(d_out_);
@@ -376,11 +377,11 @@ bool RemoteExperts::finish(float* out, std::string& err) {
         while ((e = cudaStreamQuery(stream_)) == cudaErrorNotReady) {
         }
         if (!check(e, "finish", err, device_)) return false;
-    } else if (!check(cudaStreamSynchronize(stream_), "finish", err, device_)) {
+    } else if (!check(strata::core::st_stream_sync(stream_, STRATA_ST_HERE), "finish", err, device_)) {
         return false;
     }
 #else
-    if (!check(cudaStreamSynchronize(stream_), "finish", err, device_)) return false;
+    if (!check(strata::core::st_stream_sync(stream_, STRATA_ST_HERE), "finish", err, device_)) return false;
 #endif
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
     if (remote_opt_ && remote_opt_->active()) { remote_opt_->accumulate(*this); return true; }
@@ -408,13 +409,13 @@ bool RemoteExperts::copy_cached_blobs(const int32_t* layers, const int32_t* expe
             // Nothing may still be writing a caller's buffer when this returns.  If the drain succeeds, the
             // hits queued before the failure are complete and the caller may keep them; if it does not,
             // forget every hit and let the caller refill all of them from its fallback.
-            if (cudaStreamSynchronize(read_stream_) != cudaSuccess) std::fill(hit, hit + n, 0);
+            if (strata::core::st_stream_sync(read_stream_, STRATA_ST_HERE) != cudaSuccess) std::fill(hit, hit + n, 0);
             return false;
         }
         hit[i] = 1;
         queued = true;
     }
-    if (queued && !check(cudaStreamSynchronize(read_stream_), "cache read wait", err, device_)) {
+    if (queued && !check(strata::core::st_stream_sync(read_stream_, STRATA_ST_HERE), "cache read wait", err, device_)) {
         std::fill(hit, hit + n, 0);   // a failed wait means no copied buffer may be trusted
         return false;
     }

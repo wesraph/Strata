@@ -10,6 +10,8 @@
 #include <memory>
 #include <utility>
 #include <vector>
+#include <cstdlib>
+#include <cstdio>
 #if defined(__linux__)
 #include <sys/mman.h>
 #endif
@@ -159,9 +161,36 @@ private:
         const size_t geometric = std::min(segment_bytes, std::max<size_t>(65536, std::min(previous, segment_bytes/2)*2));
         return std::max(count, std::min(geometric, std::max<size_t>(65536, held / 8)));
     }
+    // Whether to ask: the kernel's transparent_hugepage/defrag setting decides what a huge-page fault in an advised
+    // region does when no huge page is free.  "always", "madvise" and "defer+madvise" compact memory SYNCHRONOUSLY
+    // inside the fault, and on a host whose RAM is full of page cache (the model files) that is seconds: parks of
+    // a 90K-token conversation took 4-14 s against 80-200 ms, with 100-170 huge pages, 9-17 compaction stalls and
+    // thousands of pages of direct reclaim per park (2x RTX 3090 host, 128 GB, 1.4 GB free, 2026-10-29).  "defer"
+    // and "never" fall back to ordinary pages at once and compact in the background, where the advice costs
+    // nothing.  STRATA_CONV_HUGEPAGE=1 asks regardless, =0 never asks.
+    static bool hugepage_advice_wanted() {
+#if defined(__linux__)
+        static const bool wanted = [] {
+            if (const char* v = std::getenv("STRATA_CONV_HUGEPAGE"); v != nullptr && *v) return v[0] == '1';
+            std::FILE* f = std::fopen("/sys/kernel/mm/transparent_hugepage/defrag", "r");
+            if (f == nullptr) return false;
+            char buf[128] = {};
+            const size_t n = std::fread(buf, 1, sizeof buf - 1, f);
+            std::fclose(f);
+            buf[n] = 0;
+            // the active choice is in brackets: "always defer defer+madvise [madvise] never"
+            const char* a = std::strchr(buf, '[');
+            if (a == nullptr) return false;
+            return std::strncmp(a, "[defer]", 7) == 0 || std::strncmp(a, "[never]", 7) == 0;
+        }();
+        return wanted;
+#else
+        return false;
+#endif
+    }
     static void advise_hugepage(void* p, size_t n) {
 #if defined(__linux__)
-        if (p == nullptr || n < (size_t{2} << 20)) return;
+        if (p == nullptr || n < (size_t{2} << 20) || !hugepage_advice_wanted()) return;
         // madvise requires a page-aligned address. The kernel uses huge pages for the 2 MiB-aligned
         // middle of that range; an unaligned edge is left as ordinary pages.
         const uintptr_t raw = reinterpret_cast<uintptr_t>(p);

@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <mutex>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::prefill {
 namespace {
@@ -589,14 +590,14 @@ void gdn_chunk_recurrence(float* state, const float* h, const float* gate, const
         const int64_t left = (T64 - t0) / CH;
         const int nch = (int) (left < SEG ? left : SEG);
         const int ntok = nch * CH;
-        if (prof) cudaEventRecord(pe0, cs);
+        if (prof) strata::core::st_record(pe0, cs, STRATA_ST_HERE);
         gdn_chunk_cumsum_kernel<<<dim3((unsigned) nch, HV), CH, 0, cs>>>(w.gcum, gate + t0 * HV, ntok);
         check("cumsum");
         if (prof) {
-            cudaEventRecord(pe1, cs);
-            cudaEventSynchronize(pe1);
+            strata::core::st_record(pe1, cs, STRATA_ST_HERE);
+            strata::core::st_event_sync(pe1, STRATA_ST_HERE);
             cudaEventElapsedTime(&ms[0], pe0, pe1);
-            cudaEventRecord(pe0, cs);
+            strata::core::st_record(pe0, cs, STRATA_ST_HERE);
         }
         if (use_wmma) {
             gdn_chunk_wmma_kernel<<<dim3(NSE, HV), 128, WMMA_SMEM, cs>>>(
@@ -608,10 +609,10 @@ void gdn_chunk_recurrence(float* state, const float* h, const float* gate, const
             check("kkt");
         }
         if (prof) {
-            cudaEventRecord(pe1, cs);
-            cudaEventSynchronize(pe1);
+            strata::core::st_record(pe1, cs, STRATA_ST_HERE);
+            strata::core::st_event_sync(pe1, STRATA_ST_HERE);
             cudaEventElapsedTime(&ms[1], pe0, pe1);
-            cudaEventRecord(pe0, cs);
+            strata::core::st_record(pe0, cs, STRATA_ST_HERE);
         }
         if (!use_wmma) {
             gdn_chunk_fwd_kernel<<<dim3(NSE, HV), 128, 0, cs>>>(state, oc + t0 * HV * S, h + t0 * C, beta + t0 * HV,
@@ -619,8 +620,8 @@ void gdn_chunk_recurrence(float* state, const float* h, const float* gate, const
             check("fwd");
         }
         if (prof) {
-            cudaEventRecord(pe1, cs);
-            cudaEventSynchronize(pe1);
+            strata::core::st_record(pe1, cs, STRATA_ST_HERE);
+            strata::core::st_event_sync(pe1, STRATA_ST_HERE);
             cudaEventElapsedTime(&ms[2], pe0, pe1);
         }
     }

@@ -154,6 +154,9 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const ConversationView& view, const SessionState& session,
                                    const ModelGeometry& g, const QsaState& draft, std::string& error,
                                    const int32_t* table = nullptr);
+/// The image carries a draft ring (a park from a session with a drafter); without one, a restore beside a drafter
+/// leaves the drafter's ring to the caller.
+bool conversation_snapshot_has_draft(const SavedConversation& image, const SessionState& session);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
 /// #2409: true when a restore (or a copy) on CUDA device `device` from the calling thread creates no copy stream: this

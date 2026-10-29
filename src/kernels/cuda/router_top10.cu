@@ -58,6 +58,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -438,7 +439,7 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
                 std::exit(1);
             }
             if (stream == nullptr) {
-                const cudaError_t s = cudaDeviceSynchronize();
+                const cudaError_t s = strata::core::st_device_sync(STRATA_ST_HERE);
                 if (s != cudaSuccess) {
                     std::fprintf(stderr, "router_top10: %s\n", cudaGetErrorString(s));
                     std::exit(1);
@@ -467,7 +468,7 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
             std::fprintf(stderr, "router_top10 launch: %s\n", cudaGetErrorString(e));
             std::exit(1);
         }
-        if (stream == nullptr && cudaDeviceSynchronize() != cudaSuccess) std::exit(1);
+        if (stream == nullptr && strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) std::exit(1);
         return;
     }
 #endif
@@ -486,7 +487,7 @@ void router_top10(const float* logits, int n_tokens, int n_expert, int k, int* i
         std::exit(1);
     }
     if (stream == nullptr) {
-        const cudaError_t s = cudaDeviceSynchronize();
+        const cudaError_t s = strata::core::st_device_sync(STRATA_ST_HERE);
         if (s != cudaSuccess) {
             std::fprintf(stderr, "router_top10: %s\n", cudaGetErrorString(s));
             std::exit(1);

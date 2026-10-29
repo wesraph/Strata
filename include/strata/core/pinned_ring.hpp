@@ -21,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::core {
 
@@ -55,7 +56,7 @@ public:
         next_ = (next_ + 1) % kSlots;
         if (sl.pending) {                  // the copy that last read this slot is done before it is refilled
             sl.pending = false;
-            if (cudaEventSynchronize(sl.ev) != cudaSuccess) { cudaGetLastError(); return nullptr; }
+            if (strata::core::st_event_sync(sl.ev, STRATA_ST_HERE) != cudaSuccess) { cudaGetLastError(); return nullptr; }
         }
         if (sl.cap < bytes) {
             if (sl.p) { cudaFreeHost(sl.p); sl.p = nullptr; sl.cap = 0; }   // idle: its last copy was waited for above
@@ -84,19 +85,19 @@ public:
             std::fprintf(stderr, "strata: pinned upload of %zu bytes failed: %s\n", bytes, cudaGetErrorString(e));
             return e;
         }
-        if (sl != nullptr && cudaEventRecord(sl->ev, s) == cudaSuccess) {
+        if (sl != nullptr && strata::core::st_record(sl->ev, s, STRATA_ST_HERE) == cudaSuccess) {
             sl->pending = true;
             return cudaSuccess;
         }
         cudaGetLastError();                // no event: the copy is waited for here instead
-        return cudaStreamSynchronize(s);
+        return strata::core::st_stream_sync(s, STRATA_ST_HERE);
     }
 
     // the same copy without a pinned slot: from the caller's memory, the stream waited for
     static cudaError_t direct(void* dst, const void* src, size_t bytes, cudaStream_t s) {
         if (bytes == 0) return cudaSuccess;
         cudaError_t e = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, s);
-        if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+        if (e == cudaSuccess) e = strata::core::st_stream_sync(s, STRATA_ST_HERE);
         if (e != cudaSuccess) std::fprintf(stderr, "strata: upload of %zu bytes failed: %s\n", bytes, cudaGetErrorString(e));
         return e;
     }
@@ -106,7 +107,7 @@ public:
         if (bytes == 0) return cudaSuccess;
         void* stage = acquire(bytes);
         cudaError_t e = cudaMemcpyAsync(stage != nullptr ? stage : dst, src, bytes, cudaMemcpyDeviceToHost, s);
-        if (e == cudaSuccess) e = cudaStreamSynchronize(s);
+        if (e == cudaSuccess) e = strata::core::st_stream_sync(s, STRATA_ST_HERE);
         if (e == cudaSuccess && stage != nullptr) std::memcpy(dst, stage, bytes);
         if (stage != nullptr) acquired_ = nullptr;   // no event: the stream was drained
         if (e != cudaSuccess) std::fprintf(stderr, "strata: download of %zu bytes failed: %s\n", bytes, cudaGetErrorString(e));
@@ -127,7 +128,7 @@ public:
             if (sl.cap >= bytes && sl.ev != nullptr) continue;
             if (sl.pending) {
                 sl.pending = false;
-                if (cudaEventSynchronize(sl.ev) != cudaSuccess) { cudaGetLastError(); return false; }
+                if (strata::core::st_event_sync(sl.ev, STRATA_ST_HERE) != cudaSuccess) { cudaGetLastError(); return false; }
             }
             if (sl.cap < bytes) {
                 if (sl.p) { cudaFreeHost(sl.p); sl.p = nullptr; sl.cap = 0; }
@@ -150,7 +151,7 @@ public:
 
     void release() {
         for (Slot& sl : slots_) {
-            if (sl.pending && sl.ev) cudaEventSynchronize(sl.ev);
+            if (sl.pending && sl.ev) strata::core::st_event_sync(sl.ev, STRATA_ST_HERE);
             if (sl.ev) cudaEventDestroy(sl.ev);
             if (sl.p) cudaFreeHost(sl.p);
             sl = Slot{};

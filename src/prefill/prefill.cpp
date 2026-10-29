@@ -1,5 +1,6 @@
 // src/prefill/prefill.cpp - see include/strata/prefill/prefill.hpp.
 #include "strata/kernels/fused_gr.hpp"
+#include "strata/core/stream_trace.hpp"
 #include "strata/prefill/prefill.hpp"
 #include "strata/prefill/copy_events.hpp"
 #if defined(STRATA_HAVE_DFLASH2)
@@ -676,7 +677,7 @@ struct Stager {
                     // and done - for a generation's first kRing jobs that is the previous generation's last DMA from
                     // the buffer, which nothing else waits for when a chunk ends without a sync (no MTP) or the DMA
                     // was a ring entry the routing skipped (an event never recorded returns at once)
-                    cudaEventSynchronize(dma_done[i % kRing]);
+                    strata::core::st_event_sync(dma_done[i % kRing], STRATA_ST_HERE);
                 }
                 int32_t rl[kMaxBatch], re[kMaxBatch];
                 uint8_t* rd[kMaxBatch];
@@ -749,7 +750,7 @@ struct Stager {
     }
     /// The launching thread queued job j's DMA on `copy`: its buffer is free once that is done.
     void issued_one(int j, cudaStream_t copy) {
-        cudaEventRecord(dma_done[j % kRing], copy);
+        strata::core::st_record(dma_done[j % kRing], copy, STRATA_ST_HERE);
         issued.store(j + 1, std::memory_order_release);
 #if defined(STRATA_ATOMIC_WAIT)
         issued.notify_all();
@@ -862,15 +863,15 @@ struct PeerPrefill {
         int prev = 0;
         cudaGetDevice(&prev);
         cudaSetDevice(dev);
-        if (s) cudaStreamSynchronize(s);
+        if (s) strata::core::st_stream_sync(s, STRATA_ST_HERE);
         ctx.reset();
         up_ring.release();
         for (void* p : owned) cudaFree(p);
         if (ev_done) cudaEventDestroy(ev_done);
-        if (s_out) cudaStreamSynchronize(s_out);
+        if (s_out) strata::core::st_stream_sync(s_out, STRATA_ST_HERE);
         for (cudaEvent_t e : ev_grp) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : ev_dm) if (e) cudaEventDestroy(e);
-        if (s_cp) cudaStreamSynchronize(s_cp);
+        if (s_cp) strata::core::st_stream_sync(s_cp, STRATA_ST_HERE);
         for (cudaEvent_t e : pcopied) if (e) cudaEventDestroy(e);
         for (cudaEvent_t e : pused) if (e) cudaEventDestroy(e);
         if (s_cp) cudaStreamDestroy(s_cp);
@@ -878,7 +879,7 @@ struct PeerPrefill {
         if (s) cudaStreamDestroy(s);
         cudaSetDevice(prev);
         if (ev_in) cudaEventDestroy(ev_in);
-        if (x_stream) { cudaStreamSynchronize(x_stream); cudaStreamDestroy(x_stream); }
+        if (x_stream) { strata::core::st_stream_sync(x_stream, STRATA_ST_HERE); cudaStreamDestroy(x_stream); }
         if (ev_x) cudaEventDestroy(ev_x);
         if (host_x) cudaFreeHost(host_x);
         if (host_rows) cudaFreeHost(host_rows);
@@ -920,9 +921,9 @@ struct PinnedUpload {
     bool upload(void* dst, const int32_t* src, size_t count, cudaStream_t s) {
         const size_t bytes = count * sizeof(int32_t);
         if (!p || count > n) return cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, s) == cudaSuccess;
-        if (cudaEventSynchronize(ev) != cudaSuccess) return false;   // the previous upload is out of the buffer
+        if (strata::core::st_event_sync(ev, STRATA_ST_HERE) != cudaSuccess) return false;   // the previous upload is out of the buffer
         std::memcpy(p, src, bytes);
-        return cudaMemcpyAsync(dst, p, bytes, cudaMemcpyHostToDevice, s) == cudaSuccess && cudaEventRecord(ev, s) == cudaSuccess;
+        return cudaMemcpyAsync(dst, p, bytes, cudaMemcpyHostToDevice, s) == cudaSuccess && strata::core::st_record(ev, s, STRATA_ST_HERE) == cudaSuccess;
     }
     void release() {
         if (ev) cudaEventDestroy(ev);
@@ -1228,10 +1229,10 @@ void Prefill::reset() {
 void Prefill::release() {
     if (!impl_) return;
     impl_->hand_worker.reset();   // idle here (run drains the chain before it returns); joins its thread
-    if (impl_->cs) cudaStreamSynchronize(impl_->cs);
-    if (impl_->copy) cudaStreamSynchronize(impl_->copy);
-    if (impl_->kv_copy) cudaStreamSynchronize(impl_->kv_copy);
-    if (impl_->ple_copy) (void) cudaStreamSynchronize(impl_->ple_copy);
+    if (impl_->cs) strata::core::st_stream_sync(impl_->cs, STRATA_ST_HERE);
+    if (impl_->copy) strata::core::st_stream_sync(impl_->copy, STRATA_ST_HERE);
+    if (impl_->kv_copy) strata::core::st_stream_sync(impl_->kv_copy, STRATA_ST_HERE);
+    if (impl_->ple_copy) (void) strata::core::st_stream_sync(impl_->ple_copy, STRATA_ST_HERE);
     for (int i = 0; i < RING_MAX; ++i) {
         if (impl_->copied[i]) cudaEventDestroy(impl_->copied[i]);
         if (impl_->used[i]) cudaEventDestroy(impl_->used[i]);
@@ -1518,7 +1519,7 @@ void warm_gemm_libraries(int device) {
             cudaMemsetAsync(w, 0, (size_t) Nn * K * 2, st);
             gm.bf16(x, w, y, T, Nn, K);
             gm.f16(x, w, y, T, Nn, K);
-            cudaStreamSynchronize(st);
+            strata::core::st_stream_sync(st, STRATA_ST_HERE);
         }
     }
     (void) cudaGetLastError();
@@ -1883,8 +1884,8 @@ bool Prefill::relayout(int64_t chunk, void* borrow, uint64_t borrow_bytes, std::
         err = "prefill: relayout needs borrowed buffers and a chunk of at most " + std::to_string(m.T_max);
         return false;
     }
-    if (cudaStreamSynchronize(m.cs) != cudaSuccess || cudaStreamSynchronize(m.copy) != cudaSuccess ||
-        (m.kv_copy && cudaStreamSynchronize(m.kv_copy) != cudaSuccess)) {
+    if (strata::core::st_stream_sync(m.cs, STRATA_ST_HERE) != cudaSuccess || strata::core::st_stream_sync(m.copy, STRATA_ST_HERE) != cudaSuccess ||
+        (m.kv_copy && strata::core::st_stream_sync(m.kv_copy, STRATA_ST_HERE) != cudaSuccess)) {
         err = "prefill: relayout: the stream failed";
         return false;
     }
@@ -1996,7 +1997,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
     int32_t* bnd = q8 ? (int32_t*) carve(16) : nullptr;
     if ((uint64_t) (q - m.region) > m.region_bytes) return decline("the batch buffers do not fit the scratch region");
     static const bool timing = std::getenv("STRATA_DRAFT_TIMING") != nullptr;   // debug: where this pass's time goes
-    if (timing) cudaStreamSynchronize(m.cs);
+    if (timing) strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);
     const auto ti0 = Clock::now();
     if (!mtp.idle(err)) return false;   // the drafter's own stream (its graph uploads) before this writes its K/V
     const double ms_idle = ms_since(ti0);
@@ -2077,7 +2078,7 @@ bool Prefill::draft_kv(core::MtpDrafter& mtp, const float* R_rows, const int32_t
                       st.kv_int8 ? nullptr : st.v_pool, st.k_q, st.v_q, st.k_scale, st.v_scale, m.cs, &st.host);
         }
     }
-    if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+    if (strata::core::st_stream_sync(m.cs, STRATA_ST_HERE) != cudaSuccess) {
         err = std::string("prefill: the draft layer's K/V: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
@@ -2361,7 +2362,7 @@ bool Prefill::set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& e
         pp->run_ctx = pp->ctx.get();
         mmq::iota(pp->ident, pp->cap_rows, pp->s);
         peer_had_signs(*pp);   // APR: on the peer's device
-        ok = cudaStreamSynchronize(pp->s) == cudaSuccess;
+        ok = strata::core::st_stream_sync(pp->s, STRATA_ST_HERE) == cudaSuccess;
     }
     if (ok && !pp->p2p) {   // the host route's mapped buffers, sized for the largest chunk
         auto host = [&](auto*& ptr, size_t& cap, size_t n) {
@@ -2678,12 +2679,12 @@ struct ColdTrace {
     ColdTrace() { const char* e = std::getenv("STRATA_COLD_TRACE"); on = e != nullptr && e[0] == '1'; }
     bool begin() {
         if (!on || n >= 80) return false;
-        cudaDeviceSynchronize();
+        strata::core::st_device_sync(STRATA_ST_HERE);
         t0 = std::chrono::steady_clock::now();
         return true;
     }
     void end(const char* what, const std::string& name, int64_t T, int64_t N, int64_t K) {
-        cudaDeviceSynchronize();
+        strata::core::st_device_sync(STRATA_ST_HERE);
         const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
         ++n;
         std::fprintf(stderr, "strata cold-trace: #%d %s %s T=%lld N=%lld K=%lld %.2f ms\n", n, what, name.c_str(), (long long) T,
@@ -2754,7 +2755,7 @@ struct PfTimer {
             ph.push_back(0);
         }
         ph[used] = phase;
-        cudaEventRecord(ev[used], s);
+        strata::core::st_record(ev[used], s, STRATA_ST_HERE);
         ++used;
     }
     // every recorded mark has completed (the stream was synchronized): charge the gaps, keep the last mark
@@ -2791,7 +2792,7 @@ struct PeTimer {
             ph.push_back(0);
         }
         ph[used] = phase;
-        cudaEventRecord(ev[used], s);
+        strata::core::st_record(ev[used], s, STRATA_ST_HERE);
         ++used;
     }
     void fold() {   // every mark has completed
@@ -2859,7 +2860,7 @@ struct KvaTap {
         }
         host.resize((size_t) T * D);
         if (cudaMemcpyAsync(host.data(), R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, cs) != cudaSuccess ||
-            cudaStreamSynchronize(cs) != cudaSuccess) {
+            strata::core::st_stream_sync(cs, STRATA_ST_HERE) != cudaSuccess) {
             err = "kva capture: the residual copy failed";
             return false;
         }
@@ -2992,7 +2993,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // An early return must drain DMA before the caller refills the borrowed expert slots.
     struct KvDrain {
         cudaStream_t stream;
-        ~KvDrain() { if (stream) cudaStreamSynchronize(stream); }
+        ~KvDrain() { if (stream) strata::core::st_stream_sync(stream, STRATA_ST_HERE); }
     } kv_drain{kv_prefetch ? m.kv_copy : nullptr};
     KvDrain ple_drain{m.ple_copy};   // STRATA_PLE_COPY_STREAM: no upload left in flight from a buffer the next run refills
     int64_t kv_prefetches = 0;
@@ -3027,9 +3028,9 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         ~HelpScope() {
             if (!on) return;
             const core::OnDevice d(m.pp->dev);   // its work is done before the stage hands over; settle its streams
-            cudaStreamSynchronize(m.pp->s_cp);
-            cudaStreamSynchronize(m.pp->s_out);
-            cudaStreamSynchronize(m.pp->s);
+            strata::core::st_stream_sync(m.pp->s_cp, STRATA_ST_HERE);
+            strata::core::st_stream_sync(m.pp->s_out, STRATA_ST_HERE);
+            strata::core::st_stream_sync(m.pp->s, STRATA_ST_HERE);
             std::swap(m.pp, m.help_pp);
         }
     } help_scope{m, helped};
@@ -3144,7 +3145,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             for (int i = 0; ok && i < hand_pieces_; ++i) {
                 int64_t r0 = 0, nr = 0;
                 handoff_piece(n, hand_pieces_, i, r0, nr);
-                ok = cudaStreamWaitEvent(m.cs, ev[i], 0) == cudaSuccess;
+                ok = strata::core::st_wait(m.cs, ev[i], STRATA_ST_HERE) == cudaSuccess;
                 if (ok && whole && nr > 0)
                     ok = cudaMemcpyAsync(m.R + (size_t) r0 * D, hand_in_ + (size_t) r0 * D, (size_t) nr * D * 4,
                                          cudaMemcpyHostToDevice, m.cs) == cudaSuccess;
@@ -3251,28 +3252,28 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             // done, on whichever stream ran it, for the host-side reuse guard below.
             const bool ple_side = m.ple_compact[ple_buf] && m.ple_copy != nullptr;
             const cudaStream_t ple_up = ple_side ? m.ple_copy : m.cs;
-            if ((ple_side && cudaStreamWaitEvent(m.ple_copy, m.ple_raw_free, 0) != cudaSuccess) ||
+            if ((ple_side && strata::core::st_wait(m.ple_copy, m.ple_raw_free, STRATA_ST_HERE) != cudaSuccess) ||
                 (m.ple_compact[ple_buf]
                      ? cudaMemcpyAsync(m.ple_raw_dev, m.ple_emb_host[ple_buf], raw_bytes, cudaMemcpyHostToDevice, ple_up)
                      : m.ple_pageable[ple_buf].empty()
                      ? cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cudaMemcpyHostToDevice, m.cs)
                      : m.up_ring.h2d(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, m.cs)) !=
                     cudaSuccess ||
-                cudaEventRecord(m.ple_copied[ple_buf], ple_up) != cudaSuccess ||
-                (ple_side && cudaStreamWaitEvent(m.cs, m.ple_copied[ple_buf], 0) != cudaSuccess)) {
+                strata::core::st_record(m.ple_copied[ple_buf], ple_up, STRATA_ST_HERE) != cudaSuccess ||
+                (ple_side && strata::core::st_wait(m.cs, m.ple_copied[ple_buf], STRATA_ST_HERE) != cudaSuccess)) {
                 err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
             if (m.ple_compact[ple_buf]) {
                 strata::kernels::ple_iq4nl_dequant(m.ple_raw_dev, T * strata::kernels::PLE_N_HEADS, m.ple_emb, m.cs);
-                if (ple_side && cudaEventRecord(m.ple_raw_free, m.cs) != cudaSuccess) {
+                if (ple_side && strata::core::st_record(m.ple_raw_free, m.cs, STRATA_ST_HERE) != cudaSuccess) {
                     err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
             }
             if (c0 + C < n) {
                 // the other buffer's upload (a chunk ago) is done before the SSD thread refills it
-                if (cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]) != cudaSuccess) {
+                if (strata::core::st_event_sync(m.ple_copied[ple_buf ^ 1], STRATA_ST_HERE) != cudaSuccess) {
                     err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
@@ -3305,15 +3306,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 if (state.kv_mode != 1) { ++ordinal; continue; }
                 // Reuse one KV pool only after its last attention reader completes. The next layer's
                 // [0, p0) host prefix is immutable throughout this chunk; its new rows are appended later.
-                if (cudaEventRecord(m.kv_released, cs) != cudaSuccess ||
-                    cudaStreamWaitEvent(m.kv_copy, m.kv_released, 0) != cudaSuccess) {
+                if (strata::core::st_record(m.kv_released, cs, STRATA_ST_HERE) != cudaSuccess ||
+                    strata::core::st_wait(m.kv_copy, m.kv_released, STRATA_ST_HERE) != cudaSuccess) {
                     err = "prefill: releasing KV staging pool";
                     return false;
                 }
                 strata::kernels::kv_stage_from_host(pools_of(m.stage, m.ident_table), state.host,
                     core::qsa_kv_format(state), (p0 + s.page_size - 1) / s.page_size, s, m.kv_copy);
                 if (cudaPeekAtLastError() != cudaSuccess ||
-                    cudaEventRecord(m.kv_ready, m.kv_copy) != cudaSuccess) {
+                    strata::core::st_record(m.kv_ready, m.kv_copy, STRATA_ST_HERE) != cudaSuccess) {
                     err = "prefill: enqueueing KV prefetch";
                     return false;
                 }
@@ -3348,10 +3349,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             while (P.p_issued < limit) {
                 const PeerPrefill::PsEntry& en = P.pseq[P.p_issued];
                 const size_t sl = P.p_issued % (size_t) P.RP;
-                if (P.plive[sl]) cudaStreamWaitEvent(P.s_cp, P.pused[sl], 0);
+                if (P.plive[sl]) strata::core::st_wait(P.s_cp, P.pused[sl], STRATA_ST_HERE);
                 cudaMemcpyAsync(P.pstage[sl], en.blob, (size_t) strata::kernels::cpu::expert_layout().blob_bytes(en.l),
                                 cudaMemcpyHostToDevice, P.s_cp);
-                cudaEventRecord(P.pcopied[sl], P.s_cp);
+                strata::core::st_record(P.pcopied[sl], P.s_cp, STRATA_ST_HERE);
                 P.plive[sl] = 1;
                 ++P.p_issued;
             }
@@ -3359,7 +3360,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         auto p_release_to = [&](int64_t l, int32_t e_stop, cudaStream_t ps) {
             PeerPrefill& P = *m.pp;
             while (P.pk < P.pseq_start[(size_t) l + 1] && P.pseq[P.pk].e < e_stop) {
-                cudaEventRecord(P.pused[P.pk % (size_t) P.RP], ps);
+                strata::core::st_record(P.pused[P.pk % (size_t) P.RP], ps, STRATA_ST_HERE);
                 ++P.pk;
                 p_issue_until(P.pk + (size_t) P.RP);
             }
@@ -3435,7 +3436,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 const int sl = (int) (issued % (size_t) m.ring);
                 const auto th = Clock::now();
                 const size_t bytes = (size_t) lay0.blob_bytes(en.l);
-                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
+                if (m.stage_live[sl]) strata::core::st_wait(m.copy, m.used[m.used_of[sl]], STRATA_ST_HERE);
                 if (en.job < 0) {
                     cudaMemcpyAsync(m.stage_dev[sl], en.blob, bytes, cudaMemcpyHostToDevice, m.copy);
                     ++stats_.experts_dma;
@@ -3444,7 +3445,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
                     m.stager->issued_one(en.job, m.copy);
                 }
-                cudaEventRecord(m.copied[sl], m.copy);
+                strata::core::st_record(m.copied[sl], m.copy, STRATA_ST_HERE);
                 m.stage_live[sl] = true;
                 stats_.ms_experts_host += ms_since(th);
                 ++stats_.experts_streamed;
@@ -3508,7 +3509,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                 int64_t last_rec = -1;   // sparse_copied: the last entry whose copied event is recorded
                 int prev_rel = -1;       // dedupe: the release event the copy stream waited on for the previous entry
                 auto record = [&](size_t i) {
-                    cudaEventRecord(m.copied[i % (size_t) m.ring], m.copy);
+                    strata::core::st_record(m.copied[i % (size_t) m.ring], m.copy, STRATA_ST_HERE);
                     rec_of[i % (size_t) m.ring].store((int64_t) i, std::memory_order_release);
                     a_rec.store(i + 1, std::memory_order_release);
                     last_rec = (int64_t) i;
@@ -3535,7 +3536,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (copy_wait_dedupe && strata::prefill::copy_wait_dedupe_ok(idx, m.ring, MMQ_GROUP, rel, prev_rel)) {
                             ++iss_dedup;
                         } else {
-                            cudaStreamWaitEvent(m.copy, m.used[rel], 0);
+                            strata::core::st_wait(m.copy, m.used[rel], STRATA_ST_HERE);
                             ++iss_waits;
                         }
                         prev_rel = rel;
@@ -3551,7 +3552,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         cudaMemcpyAsync(m.stage_dev[sl], hb, bytes, cudaMemcpyHostToDevice, m.copy);
                         m.stager->issued_one(en.job, m.copy);
                     }
-                    if (!sparse_copied) cudaEventRecord(m.copied[sl], m.copy);
+                    if (!sparse_copied) strata::core::st_record(m.copied[sl], m.copy, STRATA_ST_HERE);
                     else if (strata::prefill::copy_event_due(idx, seq.size(), copy_event_every)) record(idx);
                     m.stage_live[sl] = true;
                     iss_ms += ms_since(th);
@@ -3572,7 +3573,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         // is given back (the issuer stays a ring ahead).
         auto wait_copied = [&](size_t k, size_t slot) {
             if (!sparse_copied) {
-                cudaStreamWaitEvent(m.cs, m.copied[slot], 0);
+                strata::core::st_wait(m.cs, m.copied[slot], STRATA_ST_HERE);
                 return;
             }
             while (a_rec.load(std::memory_order_acquire) <= k) std::this_thread::yield();
@@ -3581,7 +3582,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             const size_t r = strata::prefill::copy_event_entry(k, hi, [&](size_t e) {
                 return rec_of[e % (size_t) m.ring].load(std::memory_order_acquire) == (int64_t) e;
             });
-            cudaStreamWaitEvent(m.cs, m.copied[r % (size_t) m.ring], 0);
+            strata::core::st_wait(m.cs, m.copied[r % (size_t) m.ring], STRATA_ST_HERE);
         };
         auto give_back = [&](size_t upto) {
             if (threaded_issue) a_consumed.store(upto, std::memory_order_release);
@@ -3604,7 +3605,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (!step_sync) return;
             core::progress_at(what, layer, p0);
             const auto ts = Clock::now();
-            const cudaError_t a = cudaStreamSynchronize(m.cs), b = cudaStreamSynchronize(m.copy);
+            const cudaError_t a = strata::core::st_stream_sync(m.cs, STRATA_ST_HERE), b = strata::core::st_stream_sync(m.copy, STRATA_ST_HERE);
             const double ms = ms_since(ts);
             if (ms > 250.0 || a != cudaSuccess || b != cudaSuccess)
                 std::fprintf(stderr, "strata pf-step: chunk from token %lld, layer %lld: %s took %.0f ms (%s / %s)\n",
@@ -3756,7 +3757,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         upmixed = gr_upmix(m.lo16, (const uint16_t*) wu->data, m.R, m.grs, (const float*) wn->data,
                                            m.mixed, m.mixed_bf, m.mixed_h, T, m.cs);
                         cudaMemcpyAsync(got.data(), m.mixed, got.size() * 4, cudaMemcpyDeviceToHost, m.cs);
-                        cudaStreamSynchronize(m.cs);
+                        strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);
                         double e2 = 0, r2 = 0, emax = 0;
                         for (size_t i = 0; i < ref.size(); ++i) {
                             const double dd = (double) got[i] - ref[i];
@@ -3853,7 +3854,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (staged) {
                         pt.mark(kPfKvStage, cs);
                         if (kv_pending == qsa_index) {
-                            if (cudaStreamWaitEvent(cs, m.kv_ready, 0) != cudaSuccess) {
+                            if (strata::core::st_wait(cs, m.kv_ready, STRATA_ST_HERE) != cudaSuccess) {
                                 err = "prefill: waiting for KV prefetch";
                                 return false;
                             }
@@ -3967,7 +3968,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     if (static const bool ovl = std::getenv("STRATA_SEL_OVERLAP") != nullptr; ovl && qsa_index == 0) {
                         std::vector<int32_t> ids((size_t) (T * m.cap));
                         cudaMemcpyAsync(ids.data(), m.sel_ids, ids.size() * 4, cudaMemcpyDeviceToHost, m.cs);
-                        cudaStreamSynchronize(m.cs);
+                        strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);
                         double sum_w = 0, sum_u = 0;
                         for (int64_t t0 = 0; t0 + 16 <= T; t0 += 16) {
                             std::vector<int32_t> u;
@@ -4012,7 +4013,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         std::vector<int32_t> a((size_t) (T * m.cap)), b((size_t) (T * m.cap));
                         cudaMemcpyAsync(a.data(), m.sel_ids, a.size() * 4, cudaMemcpyDeviceToHost, m.cs);
                         cudaMemcpyAsync(b.data(), ids16, b.size() * 4, cudaMemcpyDeviceToHost, m.cs);
-                        cudaStreamSynchronize(m.cs);
+                        strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);
                         for (int64_t t = 0; t < T; ++t) {
                             const int64_t w = m.steps_host[(size_t) (t * strata::kernels::kStepCount + strata::kernels::kStepWidth)];
                             const int32_t *x = a.data() + t * m.cap, *y = b.data() + t * m.cap;
@@ -4041,7 +4042,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         if (p0 + T > pos0 + n - last && (only < 0 || only == (int) qsa_index)) {
                             std::vector<int32_t> h((size_t) (T * m.cap));
                             cudaMemcpyAsync(h.data(), m.sel_ids, h.size() * 4, cudaMemcpyDeviceToHost, m.cs);
-                            cudaStreamSynchronize(m.cs);
+                            strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);
                             if (std::FILE* f = std::fopen(dump, "ab")) {
                                 const int32_t hdr[4] = {(int32_t) qsa_index, (int32_t) p0, (int32_t) T, (int32_t) m.cap};
                                 std::fwrite(hdr, 4, 4, f);
@@ -4135,7 +4136,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }();
                             const int32_t pos = (int32_t) posl[l & 63];
                             posl[l & 63] += T;
-                            cudaStreamSynchronize((cudaStream_t) m.cs);
+                            strata::core::st_stream_sync((cudaStream_t) m.cs, STRATA_ST_HERE);
                             if (ff != nullptr) {
                                 std::vector<int32_t> hid((size_t) T * K); std::vector<float> hw((size_t) T * K);
                                 cudaMemcpy(hid.data(), m.ids, hid.size() * 4, cudaMemcpyDeviceToHost);
@@ -4305,7 +4306,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 fused::experts(b, (int) m.g->n_expert, T * K, m.GU, m.Xq, m.src_dev, m.H, m.Dm, m.cs);
                             }
                             for (size_t kk = k0; kk < k; ++kk) {
-                                cudaEventRecord(m.used[kk % (size_t) m.ring], m.cs);
+                                strata::core::st_record(m.used[kk % (size_t) m.ring], m.cs, STRATA_ST_HERE);
                                 m.used_of[kk % (size_t) m.ring] = (int) (kk % (size_t) m.ring);
                             }
                             if (k > k0) {
@@ -4356,7 +4357,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (m.cpu_wall[0] == nullptr)
                                 for (cudaEvent_t& e : m.cpu_wall) cudaEventCreate(&e);
                             cpu_set = (int) (i & 1);
-                            cudaEventRecord(m.cpu_wall[2 * cpu_set], m.cs);
+                            strata::core::st_record(m.cpu_wall[2 * cpu_set], m.cs, STRATA_ST_HERE);
                         }
                         if (cpu_maybe && cpu_arm) {
                             const size_t want = (size_t) T * N;
@@ -4379,7 +4380,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // work), not the host: the watchdog's report says so (only its text changes)
                         core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
                                           l, p0);
-                        cudaStreamSynchronize(m.cs);
+                        strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);
                         core::progress_at("reading the prompt (batched): layer", l, p0);
                         if (on_routes) on_routes(l, ids_h, T * K);   // 149-prefetch: the RAM policy's prompt seed
                         if (cpu_maybe) {   // the rows buffer, once, at its largest (an expert takes at most MAXT tokens' rows)
@@ -4434,7 +4435,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                         pt.fold();
                         if (pe.on) {   // the peer's marks so far are done: the primary waited for its last rows
-                            int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
+                            int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); strata::core::st_stream_sync(m.pp->s, STRATA_ST_HERE); pe.fold(); cudaSetDevice(pd);
                         }
                         if (defer_shared) {
                             pt.mark(kPfRouter, cs);   // keep the existing router+shared timing attribution
@@ -4567,7 +4568,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             dumped_moe = true;
                             std::vector<float> x((size_t) (T * N));
                             cudaMemcpyAsync(x.data(), m.mixed, x.size() * sizeof(float), cudaMemcpyDeviceToHost, m.cs);
-                            cudaStreamSynchronize(m.cs);
+                            strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);
                             if (std::FILE* f = std::fopen(dump_moe, "wb")) {
                                 const int64_t hdr[3] = {(int64_t) T, (int64_t) N, (int64_t) K};
                                 std::fwrite(hdr, sizeof hdr, 1, f);
@@ -4611,7 +4612,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             const strata::kernels::cpu::NativeFmt& cf = lay.fmt[(size_t) l];
                             if (cpu_share_env() < 0.0) {
                                 if (m.cpu_ev[0] == nullptr) { cudaEventCreate(&m.cpu_ev[0]); cudaEventCreate(&m.cpu_ev[1]); }
-                                cudaEventRecord(m.cpu_ev[0], m.cs);
+                                strata::core::st_record(m.cpu_ev[0], m.cs, STRATA_ST_HERE);
                             }
                             cpu_fut = std::async(std::launch::async, [&m, &on_cpu, &cpu_blob, &cf, &cpu_ms, src_h, l, T, r0c, this]() -> bool {
                                 const auto t0 = std::chrono::steady_clock::now();
@@ -4779,8 +4780,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             // (mixed_h and w are rewritten only after this layer's combine, which waits for the peer)
                             cudaStream_t xs = m.cs;
                             if (P.x_stream != nullptr) {
-                                cudaEventRecord(P.ev_x, m.cs);
-                                cudaStreamWaitEvent(P.x_stream, P.ev_x, 0);
+                                strata::core::st_record(P.ev_x, m.cs, STRATA_ST_HERE);
+                                strata::core::st_wait(P.x_stream, P.ev_x, STRATA_ST_HERE);
                                 xs = P.x_stream;
                             }
                             if (!P.p2p && P.f16) cudaMemcpyAsync(P.host_x16, m.mixed_h, (size_t) T * N * 2, cudaMemcpyDeviceToHost, xs);
@@ -4790,13 +4791,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 for (int64_t i = 0; i < T * K; ++i)
                                     if (const int32_t r = slot_h[(size_t) i]; r >= rows_local) P.host_pair[r - rows_local] = (int32_t) i;
                             }
-                            cudaEventRecord(P.ev_in, xs);
+                            strata::core::st_record(P.ev_in, xs, STRATA_ST_HERE);
                             int prevd = 0;
                             cudaGetDevice(&prevd);
                             cudaSetDevice(P.dev);
                             const cudaStream_t ps = P.s;
-                            cudaStreamWaitEvent(ps, P.ev_in, 0);
-                            if (P.out_pending) { cudaStreamWaitEvent(ps, P.ev_done, 0); P.out_pending = false; }
+                            strata::core::st_wait(ps, P.ev_in, STRATA_ST_HERE);
+                            if (P.out_pending) { strata::core::st_wait(ps, P.ev_done, STRATA_ST_HERE); P.out_pending = false; }
                             pe.mark(kPeMoeIn, ps);
                             if (P.p2p) cudaMemcpyPeerAsync(P.mixed, P.dev, m.mixed, prevd, (size_t) T * N * 4, ps);
                             else if (P.f16) f16_to_f32_wide(P.mixed, P.host_x16, T * N, ps);
@@ -4909,7 +4910,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                 return false;
                                             }
                                             psl = (int) (P.pk % (size_t) P.RP);
-                                            cudaStreamWaitEvent(ps, P.pcopied[(size_t) psl], 0);
+                                            strata::core::st_wait(ps, P.pcopied[(size_t) psl], STRATA_ST_HERE);
                                             bd = P.pstage[(size_t) psl];
                                             ++P.ps_experts;
                                         } else {
@@ -4922,7 +4923,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         else
                                             mmq::gather_strata_q2(bd, P.grp_gu + q * mmq_gub, P.grp_d + q * mmq_db, ps);
                                         if (psl >= 0) {   // the slot is free once gathered
-                                            cudaEventRecord(P.pused[(size_t) psl], ps);
+                                            strata::core::st_record(P.pused[(size_t) psl], ps, STRATA_ST_HERE);
                                             ++P.pk;
                                             p_issue_until(P.pk + (size_t) P.RP);
                                         }
@@ -4943,7 +4944,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         strata::kernels::hadamard_rows(P.H_g, P.H_g, nr, 640, had_block, P.had_sh[(size_t) l], ps);
                                     mmq::quantize(P.H_g, nullptr, P.Hq_g, mmq_dt, 640, 640, nr, ps);
                                     const int b = (int) (g2 & 1);
-                                    if (P.dm_live[b]) cudaStreamWaitEvent(ps, P.ev_dm[b], 0);   // its last rows have left
+                                    if (P.dm_live[b]) strata::core::st_wait(ps, P.ev_dm[b], STRATA_ST_HERE);   // its last rows have left
                                     mmq::Product dn;
                                     dn.w = P.grp_d; dn.type = mmq_dt; dn.w_rows = N; dn.w_cols = 640; dn.expert_bytes = mmq_db;
                                     dn.n = ngx; dn.xq = P.Hq_g; dn.bounds = rel;
@@ -4962,15 +4963,15 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                              P.pair + P.bounds_host[j], P.bounds_host[j + 1] - P.bounds_host[j], ps);
                                         continue;
                                     }
-                                    cudaEventRecord(P.ev_grp[g2 % PeerPrefill::kGrpEv], ps);
-                                    cudaStreamWaitEvent(P.s_out, P.ev_grp[g2 % PeerPrefill::kGrpEv], 0);
+                                    strata::core::st_record(P.ev_grp[g2 % PeerPrefill::kGrpEv], ps, STRATA_ST_HERE);
+                                    strata::core::st_wait(P.s_out, P.ev_grp[g2 % PeerPrefill::kGrpEv], STRATA_ST_HERE);
                                     if (P.p2p)
                                         cudaMemcpyPeerAsync(m.Dm + (size_t) (rows_local + r0) * N, prevd, P.Dm_b[b], P.dev,
                                                             (size_t) nr * N * 4, P.s_out);
                                     else   // the primary reads them when it combines (below)
                                         cudaMemcpyAsync(P.host_rows + (size_t) r0 * N, P.Dm_b[b], (size_t) nr * N * 4,
                                                         cudaMemcpyDeviceToHost, P.s_out);
-                                    cudaEventRecord(P.ev_dm[b], P.s_out);
+                                    strata::core::st_record(P.ev_dm[b], P.s_out, STRATA_ST_HERE);
                                     P.dm_live[b] = true;
                                 }
                             } else {
@@ -5029,8 +5030,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     dn.ld_dst = N;
                                     P.run_ctx->run(dn, ps);
                                     if (P.out_pipe && nr > 0) {   // this group's rows go back while the next group computes
-                                        cudaEventRecord(P.ev_grp[g2], ps);
-                                        cudaStreamWaitEvent(P.s_out, P.ev_grp[g2], 0);
+                                        strata::core::st_record(P.ev_grp[g2], ps, STRATA_ST_HERE);
+                                        strata::core::st_wait(P.s_out, P.ev_grp[g2], STRATA_ST_HERE);
                                         cudaMemcpyPeerAsync(m.Dm + (size_t) (rows_local + r0) * N, prevd, P.Dm + (size_t) r0 * N,
                                                             P.dev, (size_t) nr * N * 4, P.s_out);
                                     }
@@ -5044,14 +5045,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 } else {
                                     cudaMemcpyAsync(P.host_sum, P.sum, (size_t) T * N * 4, cudaMemcpyDeviceToHost, ps);
                                 }
-                                cudaEventRecord(P.ev_done, ps);
+                                strata::core::st_record(P.ev_done, ps, STRATA_ST_HERE);
                                 P.out_pending = true;
                             } else if (P.out_pipe) {
-                                cudaEventRecord(P.ev_done, P.s_out);
+                                strata::core::st_record(P.ev_done, P.s_out, STRATA_ST_HERE);
                                 P.out_pending = true;
                             } else {
                                 cudaMemcpyPeerAsync(m.Dm + (size_t) rows_local * N, prevd, P.Dm, P.dev, (size_t) rows_peer * N * 4, ps);
-                                cudaEventRecord(P.ev_done, ps);
+                                strata::core::st_record(P.ev_done, ps, STRATA_ST_HERE);
                             }
                             pe.mark(kPeIdle, ps);
                             cudaSetDevice(prevd);
@@ -5133,17 +5134,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             if (pinned && !b) { err = "prefill: expert source has no blob"; return false; }
                             if (pinned) {
                                 // DMA straight from the page-locked arena: the copy stream only waits for the slot
-                                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
+                                if (m.stage_live[sl]) strata::core::st_wait(m.copy, m.used[m.used_of[sl]], STRATA_ST_HERE);
                                 cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
                                 ++stats_.experts_dma;
                             } else {
                                 // copied to a pinned buffer by the stager (waits only if it is behind), then DMA
                                 const uint8_t* hb = m.stager->wait(job_of[j]);
-                                if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
+                                if (m.stage_live[sl]) strata::core::st_wait(m.copy, m.used[m.used_of[sl]], STRATA_ST_HERE);
                                 cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
                                 m.stager->issued_one(job_of[j], m.copy);
                             }
-                            cudaEventRecord(m.copied[sl], m.copy);
+                            strata::core::st_record(m.copied[sl], m.copy, STRATA_ST_HERE);
                             m.stage_live[sl] = true;
                             stage_of[j] = sl;
                             stats_.ms_experts_host += ms_since(th);
@@ -5200,7 +5201,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             }
                             if (gg_nslots > 0) {
                                 const int rel = gg_slots[gg_nslots - 1];
-                                cudaEventRecord(m.used[rel], m.cs);
+                                strata::core::st_record(m.used[rel], m.cs, STRATA_ST_HERE);
                                 for (int i = 0; i < gg_nslots; ++i) m.used_of[gg_slots[i]] = rel;
                             }
                             gg_nslots = 0;
@@ -5252,7 +5253,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                                                m.grp_d + (size_t) c * mmq_db, m.cs);
                                         }
                                     }
-                                    if (slot >= 0 && !gg_now) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                    if (slot >= 0 && !gg_now) { strata::core::st_record(m.used[slot], m.cs, STRATA_ST_HERE); m.used_of[slot] = slot; }
                                     if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                                     if (gg_now) {   // also when the last entry was direct (a no-op without gathers)
                                         flush(0);
@@ -5290,7 +5291,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                         cudaMemsetAsync(m.grp_d + (size_t) (q + 1) * mmq_db, 0, MMQ_TAIL, m.cs);
                                     }
                                 }
-                                if (slot >= 0 && !gg_now) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                                if (slot >= 0 && !gg_now) { strata::core::st_record(m.used[slot], m.cs, STRATA_ST_HERE); m.used_of[slot] = slot; }
                                 if (q + 1 < MMQ_GROUP && j + 1 < order.size()) return true;
                                 }
                                 // the group's products: gate/up, swiglu, the group's H to q8_1, down
@@ -5368,7 +5369,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             } else {
                                 blob_dequant_f16(blob_dev, m.dq_gu[q], m.dq_d[q], m.cs);
                             }
-                            if (slot >= 0) { cudaEventRecord(m.used[slot], m.cs); m.used_of[slot] = slot; }
+                            if (slot >= 0) { strata::core::st_record(m.used[slot], m.cs, STRATA_ST_HERE); m.used_of[slot] = slot; }
                             const int64_t o0 = m.off[(size_t) e], ne = m.cnt[(size_t) e];
                             pt.mark(kPfGemmGU, cs);
                             m.gemm.f16(m.Xs + o0 * N, m.dq_gu[q], m.GU + o0 * 1280, ne, 1280, N);
@@ -5421,7 +5422,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 } else {
                                     if (!group_resident) {   // grouped: the flush waits once, on the group's last copy
                                         pt.mark(kPfWaitCopy, cs);
-                                        cudaStreamWaitEvent(m.cs, m.copied[stage_of[j]], 0);
+                                        strata::core::st_wait(m.cs, m.copied[stage_of[j]], STRATA_ST_HERE);
                                     }
                                     if (!compute(j, m.stage_dev[stage_of[j]], stage_of[j], -1)) return false;
                                     --pending;   // compute recorded the slot's release event before any reuse
@@ -5436,7 +5437,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 while (k < kend && seq[k].e < e_stop) {
                                     if (gg_nslots > 0) flush(0);   // the open group's slots get their event first
                                     const int sl = (int) (k % (size_t) m.ring);
-                                    cudaEventRecord(m.used[sl], m.cs);
+                                    strata::core::st_record(m.used[sl], m.cs, STRATA_ST_HERE);
                                     m.used_of[sl] = sl;
                                     consumed = ++k;
                                     give_back(consumed);
@@ -5471,7 +5472,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     pt.mark(kPfCombine, cs);
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail, row_sd 1 (s_down is in them)
-                        if (cpu_share_env() < 0.0) cudaEventRecord(m.cpu_ev[1], m.cs);   // after the GPU's expert work
+                        if (cpu_share_env() < 0.0) strata::core::st_record(m.cpu_ev[1], m.cs, STRATA_ST_HERE);   // after the GPU's expert work
                         if (!cpu_fut.get()) { err = "prefill: a CPU expert has no blob"; return false; }
                         if (cpu_share_env() < 0.0 && n_stream > n_cpu) {
                             m.cpu_pend = true;
@@ -5490,14 +5491,14 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                     }
                     // no reading from a layer the share could not change (nothing taken) or with one-time costs
                     if (cpu_set >= 0 && n_stream > 0 && (!cpu_arm || n_cpu > 0) && !cpu_cold) {
-                        cudaEventRecord(m.cpu_wall[2 * cpu_set + 1], m.cs);
+                        strata::core::st_record(m.cpu_wall[2 * cpu_set + 1], m.cs, STRATA_ST_HERE);
                         m.pend_wall = cpu_arm ? 2 : 1;
                         m.pend_set = cpu_set;
                         m.pend_l = (int) l;
                         m.pend_wall_n = n_stream;
                     }
                     if (peer_now) {   // multi-GPU: the peer's rows are in Dm (or, without P2P, in host memory)
-                        cudaStreamWaitEvent(m.cs, m.pp->ev_done, 0);
+                        strata::core::st_wait(m.cs, m.pp->ev_done, STRATA_ST_HERE);
                         if (!m.pp->p2p && !m.pp->sums)
                             copy_f32_wide(m.Dm + (size_t) m.pp->back_at * N, m.pp->host_rows, m.pp->back_rows * N, m.cs);
                     }
@@ -5510,7 +5511,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                     use_mmq && !fused_l && lay.native && lay.fmt[(size_t) l].tail_off ? m.row_sd : nullptr);
                     // debug: STRATA_DBG_NAN=1 reports the first layer of a chunk whose MoE produced non-finite values
                     if (static const bool dbg = std::getenv("STRATA_DBG_NAN") != nullptr; dbg) {
-                        cudaStreamSynchronize(m.cs);
+                        strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);
                         auto bad = [&](const float* d, int64_t n) {
                             std::vector<float> h((size_t) n);
                             cudaMemcpy(h.data(), d, (size_t) n * 4, cudaMemcpyDeviceToHost);
@@ -5577,7 +5578,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         cudaMemcpyAsync(rb.data(), rc, rb.size() * 4, cudaMemcpyDeviceToHost, m.cs);
                         cudaMemcpyAsync(xa.data(), m.xn16, xa.size() * 2, cudaMemcpyDeviceToHost, m.cs);
                         cudaMemcpyAsync(xb.data(), xc, xb.size() * 2, cudaMemcpyDeviceToHost, m.cs);
-                        cudaStreamSynchronize(m.cs);
+                        strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);
                         cudaFree(Rc); cudaFree(rc); cudaFree(xc);
                         std::fprintf(stderr, "strata: STRATA_CVEC_FUSE_CHECK layer %lld T %lld: R %s, rs %s, xn16 %s\n",
                                      (long long) l, (long long) T,
@@ -5625,21 +5626,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             if (hp > 0) {
                 // STRATA_HANDOFF_PIPE: the pieces' downloads stay queued; the host waits for the chunk's work only (the
                 // state on_stage_chunk saves, the error check), the next stage's uploads wait on the pieces' events
-                bool ok = cudaEventRecord(m.hand_done[hand_buf_], m.cs) == cudaSuccess;
+                bool ok = strata::core::st_record(m.hand_done[hand_buf_], m.cs, STRATA_ST_HERE) == cudaSuccess;
                 for (int i = 0; ok && i < hp; ++i) {
                     int64_t r0 = 0, nr = 0;
                     handoff_piece(T, hp, i, r0, nr);
                     if (nr > 0)
                         ok = cudaMemcpyAsync(h + (size_t) r0 * D, m.R + (size_t) r0 * D, (size_t) nr * D * 4,
                                              cudaMemcpyDeviceToHost, m.cs) == cudaSuccess;
-                    ok = ok && cudaEventRecord(m.hand_ev[hand_buf_][i], m.cs) == cudaSuccess;
+                    ok = ok && strata::core::st_record(m.hand_ev[hand_buf_][i], m.cs, STRATA_ST_HERE) == cudaSuccess;
                 }
-                if (!ok || cudaEventSynchronize(m.hand_done[hand_buf_]) != cudaSuccess) {
+                if (!ok || strata::core::st_event_sync(m.hand_done[hand_buf_], STRATA_ST_HERE) != cudaSuccess) {
                     err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                     return false;
                 }
             } else if (cudaMemcpyAsync(h, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost, m.cs) != cudaSuccess ||
-                       cudaStreamSynchronize(m.cs) != cudaSuccess) {
+                       strata::core::st_stream_sync(m.cs, STRATA_ST_HERE) != cudaSuccess) {
                 err = std::string("prefill: the layer split's hand-off: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -5669,7 +5670,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
             continue;   // the last stage reports the chunk (on_chunk)
         }
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: the final residuals, every 64th
-            cudaStreamSynchronize(m.cs);                                  // position (A/B quality of this path)
+            strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);                                  // position (A/B quality of this path)
             if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
                 std::vector<float> row((size_t) D);
                 for (int64_t t = (64 - p0 % 64) % 64; t < T; t += 64) {
@@ -5684,7 +5685,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R_ALL")) {
             // S25 (draft-layer distillation data, opt-in): every position's final multi-stream residual as BF16
             // (round-to-nearest-even), rows in position order, appended across chunks and requests: [n][hc*n_embd]
-            cudaStreamSynchronize(m.cs);
+            strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);
             if (std::FILE* f = std::fopen(dump, "ab")) {
                 constexpr int64_t kRows = 512;
                 std::vector<float> rows((size_t) (kRows * D));
@@ -5705,13 +5706,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         }
 #if defined(STRATA_HAVE_DFLASH2)
         if (tap_rows > 0 && on_taps) {
-            if (cudaStreamSynchronize(m.cs) != cudaSuccess) { err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+            if (strata::core::st_stream_sync(m.cs, STRATA_ST_HERE) != cudaSuccess) { err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError()); return false; }
             if (!on_taps(tap_dev_, tap_rows, p0 + tap_t0, err)) return false;
         }
 #endif
         if (on_chunk || on_stage_chunk) {
             const auto toc = Clock::now();
-            if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+            if (strata::core::st_stream_sync(m.cs, STRATA_ST_HERE) != cudaSuccess) {
                 err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -5727,7 +5728,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     ss.ple_prev[0] = prev[0];
     ss.ple_prev[1] = prev[1];
     if (std::getenv("STRATA_DBG_NAN") != nullptr) {   // debug: the state the prompt leaves for the token path
-        cudaStreamSynchronize(m.cs);
+        strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);
         auto bad = [&](const float* d, int64_t n) {
             std::vector<float> h((size_t) n);
             cudaMemcpy(h.data(), d, (size_t) n * 4, cudaMemcpyDeviceToHost);
@@ -5744,17 +5745,17 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         bad(ss.gdn_state, 64 * 1024);
         std::fprintf(stderr, "\n");
     }
-    if (cudaStreamSynchronize(m.cs) != cudaSuccess) {
+    if (strata::core::st_stream_sync(m.cs, STRATA_ST_HERE) != cudaSuccess) {
         err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
     // (PR #121) an expert copy that failed on the copy stream surfaces here, not in the next request
-    if (const cudaError_t cst = cudaStreamSynchronize(m.copy); cst != cudaSuccess) {
+    if (const cudaError_t cst = strata::core::st_stream_sync(m.copy, STRATA_ST_HERE); cst != cudaSuccess) {
         err = std::string("prefill: expert copy stream: ") + cudaGetErrorString(cst);
         return false;
     }
     if (kv_prefetch) {
-        if (const cudaError_t cst = cudaStreamSynchronize(m.kv_copy); cst != cudaSuccess) {
+        if (const cudaError_t cst = strata::core::st_stream_sync(m.kv_copy, STRATA_ST_HERE); cst != cudaSuccess) {
             err = std::string("prefill: KV prefetch stream: ") + cudaGetErrorString(cst);
             return false;
         }
@@ -5787,7 +5788,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
         if (pe.on) {
-            int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
+            int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); strata::core::st_stream_sync(m.pp->s, STRATA_ST_HERE); pe.fold(); cudaSetDevice(pd);
             std::string pl;
             for (int i = 0; i < kPeCount; ++i) {
                 std::snprintf(b, sizeof b, " %s %.0f", kPeNames[i], pe.ms[i]);
@@ -5841,7 +5842,7 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                          (long long) kva_suffix, (long long) kva_split);
     }
     if (std::getenv("STRATA_STATE_HASH_GDN") != nullptr) {   // debug: the GDN states as the prompt path leaves them
-        cudaStreamSynchronize(m.cs);
+        strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);
         std::vector<uint8_t> b((size_t) gdn_floats * 4);
         std::string line;
         char h[8];
@@ -5922,7 +5923,7 @@ void Prefill::lm_release() {
     Impl& m = *impl_;
     const core::OnDevice on_device(m.device);
     if (m.lm.dev) {
-        cudaStreamSynchronize(m.cs);
+        strata::core::st_stream_sync(m.cs, STRATA_ST_HERE);
         cudaFree(m.lm.dev);
     }
     m.lm.dev = nullptr;
@@ -6204,12 +6205,12 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         if ((m.ple_pageable[ple_buf].empty()
                  ? cudaMemcpyAsync(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cudaMemcpyHostToDevice, cs)
                  : m.up_ring.h2d(m.ple_emb, m.ple_emb_host[ple_buf], (size_t) T * N * 4, cs)) != cudaSuccess ||
-            cudaEventRecord(m.ple_copied[ple_buf], cs) != cudaSuccess) {
+            strata::core::st_record(m.ple_copied[ple_buf], cs, STRATA_ST_HERE) != cudaSuccess) {
             err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
         if (c0 + m.T < n) {
-            if (cudaEventSynchronize(m.ple_copied[ple_buf ^ 1]) != cudaSuccess) {
+            if (strata::core::st_event_sync(m.ple_copied[ple_buf ^ 1], STRATA_ST_HERE) != cudaSuccess) {
                 err = std::string("prefill: the PLE rows' upload failed: ") + cudaGetErrorString(cudaGetLastError());
                 return false;
             }
@@ -6271,7 +6272,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
         cudaMemcpyAsync(idsw, lb.ids, (size_t) rows * 4, cudaMemcpyDeviceToHost, cs);
         cudaMemcpyAsync(idsw + rows, lb.w, (size_t) rows * 4, cudaMemcpyDeviceToHost, cs);
         core::progress_at("reading the prompt (layer-major): waiting for the GPU (attention, router) at layer", l, pos0);
-        if (cudaStreamSynchronize(cs) != cudaSuccess) {
+        if (strata::core::st_stream_sync(cs, STRATA_ST_HERE) != cudaSuccess) {
             err = std::string("prefill (layer-major): ") + cudaGetErrorString(cudaGetLastError());
             return false;
         }
@@ -6428,7 +6429,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             const bool pinned = m.src->pinned(l, e);
             const uint8_t* b = pinned ? m.src->blob_stable(l, e) : nullptr;
             if (pinned && !b) { err = "prefill (layer-major): expert source has no blob"; return false; }
-            if (m.stage_live[sl]) cudaStreamWaitEvent(m.copy, m.used[m.used_of[sl]], 0);
+            if (m.stage_live[sl]) strata::core::st_wait(m.copy, m.used[m.used_of[sl]], STRATA_ST_HERE);
             if (pinned) {
                 cudaMemcpyAsync(m.stage_dev[sl], b, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
                 ++stats_.experts_dma;
@@ -6438,7 +6439,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 cudaMemcpyAsync(m.stage_dev[sl], hb, (size_t) lay.blob_bytes(l), cudaMemcpyHostToDevice, m.copy);
                 m.stager->issued_one(job_of[u], m.copy);
             }
-            cudaEventRecord(m.copied[sl], m.copy);
+            strata::core::st_record(m.copied[sl], m.copy, STRATA_ST_HERE);
             m.stage_live[sl] = true;
             stage_of[u] = sl;
             stats_.ms_experts_host += ms_since(tq);
@@ -6472,7 +6473,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     ++lm_resident;
                 } else {
                     pt.mark(kPfWaitCopy, cs);
-                    cudaStreamWaitEvent(cs, m.copied[stage_of[u]], 0);
+                    strata::core::st_wait(cs, m.copied[stage_of[u]], STRATA_ST_HERE);
                     blob_dev = m.stage_dev[stage_of[u]];
                 }
             }
@@ -6492,7 +6493,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         blob_dequant_f16(blob_dev, m.dq_gu[dq], m.dq_d[dq], cs);
                     }
                     if (stage_of[u] >= 0) {   // the blob is read by the dequant: its ring slot is free
-                        cudaEventRecord(m.used[stage_of[u]], cs);
+                        strata::core::st_record(m.used[stage_of[u]], cs, STRATA_ST_HERE);
                         m.used_of[stage_of[u]] = stage_of[u];
                     }
                 }
@@ -6522,7 +6523,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 mmq::gather_strata_q2(blob_dev, m.grp_gu + q * mmq_gub, m.grp_d + q * mmq_db, cs);
             }
             if (j == last_ent[u] && stage_of[u] >= 0) {   // the blob is read: its ring slot is free
-                cudaEventRecord(m.used[stage_of[u]], cs);
+                strata::core::st_record(m.used[stage_of[u]], cs, STRATA_ST_HERE);
                 m.used_of[stage_of[u]] = stage_of[u];
             }
             if (j + 1 < gp.j1) continue;
@@ -6570,7 +6571,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 const int64_t cc0 = sc0 + c * m.T, TT = std::min(m.T, n - cc0);
                 cudaMemcpyAsync(r_buf(c), lb.R_host + (size_t) (c * m.T) * D, (size_t) TT * D * 4, cudaMemcpyHostToDevice,
                                 m.copy);
-                cudaEventRecord(lb.ev_in[c & 1], m.copy);
+                strata::core::st_record(lb.ev_in[c & 1], m.copy, STRATA_ST_HERE);
             };
             if (!lb.r_dev && l > 0) issue_up(0);
             int64_t qsa_index = 0, gdn_index = 0;
@@ -6589,9 +6590,9 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                 if (!lb.r_dev) {
                     if (l > 0) {
                         if (c + 1 < nc) issue_up(c + 1);
-                        cudaStreamWaitEvent(cs, lb.ev_in[c & 1], 0);
+                        strata::core::st_wait(cs, lb.ev_in[c & 1], STRATA_ST_HERE);
                     } else {
-                        cudaStreamWaitEvent(cs, lb.ev_out[c & 1], 0);   // its last download (sub-chunk c - 2) is done
+                        strata::core::st_wait(cs, lb.ev_out[c & 1], STRATA_ST_HERE);   // its last download (sub-chunk c - 2) is done
                     }
                 }
                 m.mixed = lb.mixed + t0 * N;
@@ -6652,14 +6653,14 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     stats_.tokens += T;
                     ++stats_.chunks;
                     if (c == 0 && next_run_.valid() && !next_run_.get()) { err = next_err_; return false; }
-                    cudaEventRecord(lb.ev_done[c & 1], cs);
-                    cudaStreamWaitEvent(m.copy, lb.ev_done[c & 1], 0);
+                    strata::core::st_record(lb.ev_done[c & 1], cs, STRATA_ST_HERE);
+                    strata::core::st_wait(m.copy, lb.ev_done[c & 1], STRATA_ST_HERE);
                     if (cudaMemcpyAsync(next_->impl_->lm.R_host + (size_t) t0 * D, m.R, (size_t) T * D * 4,
                                         cudaMemcpyDeviceToHost, m.copy) != cudaSuccess) {
                         err = "prefill (layer-major): the layer split's hand-off failed";
                         return false;
                     }
-                    cudaEventRecord(lb.ev_out[c & 1], m.copy);
+                    strata::core::st_record(lb.ev_out[c & 1], m.copy, STRATA_ST_HERE);
                     continue;
                 }
                 if (l == LE) {
@@ -6667,7 +6668,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     stats_.tokens += T;
                     ++stats_.chunks;
                     if (const char* dump = std::getenv("STRATA_PREFILL_DUMP_R")) {   // debug: run_impl's dump format
-                        cudaStreamSynchronize(cs);
+                        strata::core::st_stream_sync(cs, STRATA_ST_HERE);
                         if (std::FILE* f = std::fopen(dump, c0 == 0 ? "wb" : "ab")) {
                             std::vector<float> row((size_t) D);
                             for (int64_t t = (64 - p0 % 64) % 64; t < T; t += 64) {
@@ -6680,7 +6681,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                         }
                     }
                     if (on_chunk || on_stage_chunk) {
-                        if (cudaStreamSynchronize(cs) != cudaSuccess) {
+                        if (strata::core::st_stream_sync(cs, STRATA_ST_HERE) != cudaSuccess) {
                             err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
                             return false;
                         }
@@ -6966,14 +6967,14 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
                     }
                 }
                 if (!lb.r_dev) {   // down on the copy stream once this sub-chunk's work is done
-                    cudaEventRecord(lb.ev_done[c & 1], cs);
-                    cudaStreamWaitEvent(m.copy, lb.ev_done[c & 1], 0);
+                    strata::core::st_record(lb.ev_done[c & 1], cs, STRATA_ST_HERE);
+                    strata::core::st_wait(m.copy, lb.ev_done[c & 1], STRATA_ST_HERE);
                     if (cudaMemcpyAsync(lb.R_host + (size_t) t0 * D, m.R, (size_t) T * D * 4, cudaMemcpyDeviceToHost,
                                         m.copy) != cudaSuccess) {
                         err = "prefill (layer-major): the residual rows' download failed";
                         return false;
                     }
-                    cudaEventRecord(lb.ev_out[c & 1], m.copy);
+                    strata::core::st_record(lb.ev_out[c & 1], m.copy, STRATA_ST_HERE);
                 }
             }
             ms_attn += ms_since(ta);
@@ -6981,7 +6982,7 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
             if (!lm_experts(l, Sn)) return false;
         }
         if (next_ != nullptr) {   // the super-chunk's rows are in the next stage's R_host: it reads them on a thread
-            if (cudaStreamSynchronize(cs) != cudaSuccess || cudaStreamSynchronize(m.copy) != cudaSuccess) {
+            if (strata::core::st_stream_sync(cs, STRATA_ST_HERE) != cudaSuccess || strata::core::st_stream_sync(m.copy, STRATA_ST_HERE) != cudaSuccess) {
                 err = std::string("prefill (layer-major): the layer split's hand-off: ") +
                       cudaGetErrorString(cudaGetLastError());
                 return false;
@@ -6998,11 +6999,11 @@ bool Prefill::run_layer_major(const int64_t* tokens, int64_t n, int64_t pos0, st
     ss.ple_prev[0] = prev[0];
     ss.ple_prev[1] = prev[1];
     if (ple_next.valid()) ple_next.wait();
-    if (cudaStreamSynchronize(cs) != cudaSuccess) {
+    if (strata::core::st_stream_sync(cs, STRATA_ST_HERE) != cudaSuccess) {
         err = std::string("prefill: ") + cudaGetErrorString(cudaGetLastError());
         return false;
     }
-    if (const cudaError_t cst = cudaStreamSynchronize(m.copy); cst != cudaSuccess) {
+    if (const cudaError_t cst = strata::core::st_stream_sync(m.copy, STRATA_ST_HERE); cst != cudaSuccess) {
         err = std::string("prefill: expert copy stream: ") + cudaGetErrorString(cst);
         return false;
     }

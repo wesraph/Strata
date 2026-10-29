@@ -298,7 +298,9 @@ void full_session(int fmt, int mode, int experts) {
               "a stage image holds the session's own layers, no draft");
         check(stage.bytes()<a.bytes(),"a stage image is smaller by the draft ring");
         check(conversation_snapshot_validate(stage,ss,g,nullptr,err),"validate a stage image without a draft");
-        check(!conversation_snapshot_validate(stage,ss,g,draft.state,err),"a stage image is refused where a draft is expected");
+        check(conversation_snapshot_validate(stage,ss,g,draft.state,err) && !conversation_snapshot_has_draft(stage,ss),
+              "a stage image without a draft ring is accepted beside a drafter and says it carries none");
+        check(conversation_snapshot_has_draft(a,ss),"an image with a draft ring says so");
         check(!conversation_snapshot_validate(a,ss,g,nullptr,err),"an image with a draft is refused where none is expected");
         fill(201);
         check(snap_save(stage_b,view,ss,g,nullptr,err),"capture another stage state");

@@ -21,6 +21,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -83,7 +84,7 @@ void s2_gemv_quads(const uint16_t* x, const uint8_t* codes, const float* scales,
     const size_t smem = (size_t) threads_per_row * sizeof(float);
     s2_gemv_quads_kernel<<<(unsigned) n_out, threads_per_row, smem>>>(x, codes, scales, y, n_in, n_out,
                                                                      threads_per_row);
-    const cudaError_t e = cudaDeviceSynchronize();
+    const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
     if (e != cudaSuccess) {
         std::fprintf(stderr, "s2_gemv_quads: %s\n", cudaGetErrorString(e));
         std::exit(1);

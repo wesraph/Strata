@@ -10,6 +10,7 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -112,7 +113,7 @@ __global__ void rms_norm_weighted_kernel(float* __restrict__ x, const float* __r
 
 void sync_if_needed(void* stream, const char* what) {
     if (stream != nullptr) return;
-    const cudaError_t e = cudaDeviceSynchronize();
+    const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
     if (e != cudaSuccess) {
         std::fprintf(stderr, "%s: %s\n", what, cudaGetErrorString(e));
         std::exit(1);

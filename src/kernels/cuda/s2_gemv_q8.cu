@@ -23,6 +23,7 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -90,7 +91,7 @@ void s2_gemv_q8(const uint8_t* act, const uint8_t* codes, const float* scales, f
         std::fprintf(stderr, "s2_gemv_q8 launch: %s\n", cudaGetErrorString(e));
         std::exit(1);
     }
-    if (stream == nullptr) cudaDeviceSynchronize();
+    if (stream == nullptr) strata::core::st_device_sync(STRATA_ST_HERE);
 }
 
 }  // namespace strata::kernels

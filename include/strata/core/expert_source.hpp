@@ -756,6 +756,12 @@ public:
     void stage_lend_regions(std::vector<std::vector<std::pair<int32_t, int32_t>>> regions) {
         stage_lend_regions_ = std::move(regions);
     }
+    /// --kv-share's VRAM exchange: the (layer, expert) pairs of the slots the expert caches lend to the K/V pool
+    /// as it grows, in the order the pool takes them (just below the prompt path's loan, downwards, the caches in
+    /// step).  Set BEFORE `pin_cache_complement`: under an explicit budget the copy keeps them after the
+    /// complement and the lend regions while the budget has room, so a lent slot's expert is read from RAM, not
+    /// from the files, by every prompt chunk and CPU miss after the take.  Empty (the default) keeps nothing extra.
+    void pool_take_region(std::vector<std::pair<int32_t, int32_t>> region) { pool_take_region_ = std::move(region); }
     void close();
 
     bool mapped() const { return base_ != nullptr; }
@@ -914,6 +920,16 @@ public:
     bool copy_blobs(const int32_t* layers, const int32_t* experts, uint8_t* const* dst, size_t n) override;
     /// CS-T: advances the assembled blobs' age (see staged_blob).
     void begin_layer(int64_t layer, const int32_t* ids, int64_t k) override;
+    /// The calling thread hands blobs out as consumer `cid` from now on: 0 the decode (the default), 1 the thread
+    /// reading a prompt beside the decoding slots (see stage_cid_).
+    static void set_stage_consumer(int cid) { stage_cid_ = cid; }
+    /// The pool of assembled blobs grows to at least `n` buffers now, pinned where the driver allows: called with
+    /// nothing in flight before a prompt is read beside the decoding slots, so that no thread of that read ever
+    /// allocates (claim_stage's cudaHostAlloc takes the driver's lock and can wait for the device: upstream's #31).
+    void stage_reserve(size_t n);
+    /// While on, a buffer the pool still has to add is pageable (new[], no driver call): the read beside the slots.
+    void set_stage_no_pin(bool on) { stage_no_pin_.store(on, std::memory_order_relaxed); }
+    size_t stage_buffers() const { return stage_buf_.size(); }
     /// CS-T: the GGUF in place assembles the missed experts on `fetch_threads_` threads.
     void prefetch(int64_t layer, const int64_t* experts, int64_t n) override;
     int64_t prefetch_begin(int64_t layer, const int64_t* experts, int64_t n, uint8_t* pending) override;
@@ -986,6 +1002,7 @@ private:
     bool open_gguf(std::string& err);
     const uint8_t* staged_blob(int64_t layer, int64_t expert);
     bool claim_stage(int64_t key, size_t& v, bool& fill, bool ahead = false);
+    size_t stage_add_locked();   ///< one more buffer (stage_mu_ held), SIZE_MAX on failure
     bool fill_stage(size_t v, int64_t layer, int64_t expert, uint8_t* dst);
     void publish_stage(size_t v, int64_t layer, bool ok, double us);
     struct Fill { size_t v; int64_t layer, e; uint8_t* dst; };
@@ -1099,7 +1116,17 @@ private:
     std::mutex stage_mu_;
     std::vector<std::unique_ptr<uint8_t[], StageBufFree>> stage_buf_;
     std::vector<int64_t> stage_key_;
-    std::vector<uint64_t> stage_epoch_, stage_used_;
+    std::vector<uint64_t> stage_epoch_, stage_used_;   ///< stage_used_: the last touch by anyone (victim order)
+    // Two consumers hand blobs out of this pool at once when a prompt is read beside the decoding slots
+    // (STRATA_PIPED_CONCURRENT): the decode (its doorbell thread, the fetch and read-ahead threads: consumer 0,
+    // the default) and the prompt reader's thread (consumer 1, set_stage_consumer).  Each consumer ages the
+    // buffers it asked for on its own clock, so the reader's thousands of hand-outs per chunk can never retire
+    // a buffer the decode's CPU workers are still reading (the global sequence did: one thread at a time was
+    // the rule before).  A buffer is a victim only when every consumer that touched it has moved on.
+    static thread_local int stage_cid_;
+    std::atomic<bool> stage_no_pin_{false};        ///< set_stage_no_pin: new buffers pageable (no cudaHostAlloc)
+    uint64_t stage_seq_d_ = 0, stage_seq_p_ = 0;     ///< hand-outs per consumer
+    std::vector<uint64_t> stage_used_d_, stage_used_p_;   ///< per buffer: that consumer's last hand-out (0: never)
     std::vector<char> stage_busy_;            ///< being filled (outside stage_mu_): never a victim
     std::condition_variable stage_cv_;
     int fetch_threads_ = 8;
@@ -1206,6 +1233,7 @@ private:
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
     int64_t complement_lent_slots_ = 0;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
+    std::vector<std::pair<int32_t, int32_t>> pool_take_region_;   ///< --kv-share: the slots the pool may take, in order
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer
     struct Exchange { size_t in, out; int64_t q; uint64_t bytes; };
     std::vector<Exchange> staged_;

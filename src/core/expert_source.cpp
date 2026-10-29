@@ -19,6 +19,7 @@
 #include "strata/kernels/cpu/pool.hpp"
 
 #include <cuda_runtime.h>
+#include "strata/core/stream_trace.hpp"
 
 #include <algorithm>
 #include <atomic>
@@ -1587,12 +1588,14 @@ void FileExpertSource::close() {
     {
         std::lock_guard<std::mutex> lk(stage_mu_);
         // the buffers' last copies end before they are freed (#1237)
-        if (!stage_ev_.empty()) (void) cudaDeviceSynchronize();
+        if (!stage_ev_.empty()) (void) strata::core::st_device_sync(STRATA_ST_HERE);
         stage_free_events();
         stage_buf_.clear();
         stage_key_.clear();
         stage_epoch_.clear();
         stage_used_.clear();
+        stage_used_d_.clear();
+        stage_used_p_.clear();
         stage_busy_.clear();
         stage_pf_.clear();
         stage_of_.clear();
@@ -1803,15 +1806,86 @@ void FileExpertSource::StageBufFree::operator()(uint8_t* p) const noexcept {
 //
 // `claim_stage` finds or reserves the buffer of `key` (stage_mu_ held): true when the blob is already there (or
 // being filled by another thread - the caller then waits), false when the caller must fill buffer `v`.
+thread_local int FileExpertSource::stage_cid_ = 0;
+
+// one more buffer for the pool (stage_mu_ held): pinned where the driver allows and the read beside the slots is
+// not on (set_stage_no_pin), pageable otherwise; SIZE_MAX when even that failed
+size_t FileExpertSource::stage_add_locked() {
+    const size_t v = stage_buf_.size();
+    // Pinned, where the driver allows: a stage buffer is the source of the cache fill's cudaMemcpyAsync,
+    // and a pageable source is staged through the driver's bounce buffer - an extra copy at a fraction of
+    // the transfer rate, on the calling thread.  A failure falls back to pageable for this buffer.
+    // STRATA_STAGE_PIN: 0 keeps them pageable (as before 0.1.41), 1 always tries to pin, unset (the default) pins while
+    // the host has kStagePinFloor of RAM to spare beside this buffer (the pool grows to ~257 buffers, 0.4-0.6 GiB):
+    // a low-RAM box keeps pageable ones instead of paying for the pinning (recommend, never force).
+    static const int pin_mode = [] { const char* v = std::getenv("STRATA_STAGE_PIN"); return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0); }();
+    bool want_pin = pin_mode != 0 && !stage_no_pin_.load(std::memory_order_relaxed);
+    if (pin_mode < 0 && want_pin) {
+        uint64_t avail = 0;
+        want_pin = STAGE_PIN_DEFAULT && available_memory_bytes(avail) && avail >= (uint64_t) stage_blob_ + kStagePinFloor;
+    }
+    void* p = nullptr;
+    cudaError_t pin_err = cudaSuccess;
+    if (want_pin) pin_err = cudaHostAlloc(&p, (size_t) stage_blob_, cudaHostAllocDefault);
+    const bool pinned = want_pin && pin_err == cudaSuccess && p != nullptr;
+    if (!pinned) (void) cudaGetLastError();   // the failed alloc's sticky error is ours, not the caller's
+    uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) stage_blob_];
+    if (raw == nullptr) return SIZE_MAX;
+    stage_buf_.emplace_back(raw, StageBufFree{pinned});
+    stage_idx_[raw] = stage_buf_.size() - 1;
+    stage_ev_.push_back(nullptr);
+    stage_ev_live_.push_back(0);
+    if (pinned && !stage_pin_said_) {
+        stage_pin_said_ = true;
+        std::fprintf(stderr, "FileExpertSource: the stage buffers are pinned (cudaHostAlloc)\n");
+    } else if (!pinned && want_pin && !stage_pin_failed_said_) {
+        stage_pin_failed_said_ = true;
+        std::fprintf(stderr, "FileExpertSource: cudaHostAlloc failed for a stage buffer (%s) - pageable it is\n",
+                     cudaGetErrorString(pin_err));
+    }
+    stage_key_.push_back(-1);
+    stage_epoch_.push_back(0);
+    stage_used_.push_back(0);
+    stage_used_d_.push_back(0);
+    stage_used_p_.push_back(0);
+    stage_busy_.push_back(0);
+    stage_pf_.push_back(0);
+    if (stage_buf_.size() == 512 && !stage_grew_) {
+        stage_grew_ = true;
+        std::fprintf(stderr, "FileExpertSource: %zu blobs assembled from the GGUF are in use at once (%.2f GiB)\n",
+                     stage_buf_.size(), (double) stage_buf_.size() * (double) stage_blob_ / 1073741824.0);
+    }
+    return v;
+}
+
+void FileExpertSource::stage_reserve(size_t n) {
+    if (stage_blob_ == 0) return;
+    std::lock_guard<std::mutex> lk(stage_mu_);
+    while (stage_buf_.size() < n)
+        if (stage_add_locked() == SIZE_MAX) break;
+}
+
 bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahead) {
     constexpr uint64_t kStageSeq = 256;
     const uint64_t seq = ++stage_seq_;
+    const int cid = stage_cid_;
+    const uint64_t cseq = cid == 0 ? ++stage_seq_d_ : ++stage_seq_p_;
+    // this consumer has moved on from buffer i: never touched it, or kStageAge layers (the decode's clock) or
+    // kStageSeq of its own hand-outs have passed since
+    auto moved_on = [&](size_t i) {
+        const bool d = stage_used_d_[i] == 0 || stage_epoch_[i] + kStageAge <= epoch_ || stage_used_d_[i] + kStageSeq <= stage_seq_d_;
+        const bool p = stage_used_p_[i] == 0 || stage_used_p_[i] + kStageSeq <= stage_seq_p_;
+        return d && p;
+    };
+    auto stamp = [&](size_t i) {
+        stage_used_[i] = seq;
+        if (cid == 0) { stage_epoch_[i] = epoch_; stage_used_d_[i] = cseq; } else stage_used_p_[i] = cseq;
+    };
     auto it = stage_of_.find(key);
     fill = false;
     if (it != stage_of_.end()) {
         v = it->second;
-        stage_epoch_[v] = epoch_;
-        stage_used_[v] = seq;
+        stamp(v);
         if (!ahead && stage_pf_[v]) {   // a layer asked for what was read ahead
             stage_pf_[v] = 0;
             io_pf_used_.fetch_add(1, std::memory_order_relaxed);
@@ -1822,53 +1896,13 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
     v = stage_buf_.size();
     uint64_t oldest = std::numeric_limits<uint64_t>::max();
     for (size_t i = 0; i < stage_buf_.size(); ++i)
-        if (!stage_busy_[i] && (stage_epoch_[i] + kStageAge <= epoch_ || stage_used_[i] + kStageSeq <= seq) &&
-            stage_used_[i] < oldest) {
+        if (!stage_busy_[i] && moved_on(i) && stage_used_[i] < oldest) {
             oldest = stage_used_[i];
             v = i;
         }
     if (v == stage_buf_.size()) {
-        // Pinned, where the driver allows: a stage buffer is the source of the cache fill's cudaMemcpyAsync,
-        // and a pageable source is staged through the driver's bounce buffer - an extra copy at a fraction of
-        // the transfer rate, on the calling thread.  A failure falls back to pageable for this buffer.
-        // STRATA_STAGE_PIN: 0 keeps them pageable (as before 0.1.41), 1 always tries to pin, unset (the default) pins while
-        // the host has kStagePinFloor of RAM to spare beside this buffer (the pool grows to ~257 buffers, 0.4-0.6 GiB):
-        // a low-RAM box keeps pageable ones instead of paying for the pinning (recommend, never force).
-        static const int pin_mode = [] { const char* v = std::getenv("STRATA_STAGE_PIN"); return v == nullptr ? -1 : (std::atoi(v) != 0 ? 1 : 0); }();
-        bool want_pin = pin_mode != 0;
-        if (pin_mode < 0) {
-            uint64_t avail = 0;
-            want_pin = STAGE_PIN_DEFAULT && available_memory_bytes(avail) && avail >= (uint64_t) stage_blob_ + kStagePinFloor;
-        }
-        void* p = nullptr;
-        cudaError_t pin_err = cudaSuccess;
-        if (want_pin) pin_err = cudaHostAlloc(&p, (size_t) stage_blob_, cudaHostAllocDefault);
-        const bool pinned = want_pin && pin_err == cudaSuccess && p != nullptr;
-        if (!pinned) (void) cudaGetLastError();   // the failed alloc's sticky error is ours, not the caller's
-        uint8_t* raw = pinned ? (uint8_t*) p : new (std::nothrow) uint8_t[(size_t) stage_blob_];
-        if (raw == nullptr) return false;
-        stage_buf_.emplace_back(raw, StageBufFree{pinned});
-        stage_idx_[raw] = stage_buf_.size() - 1;
-        stage_ev_.push_back(nullptr);
-        stage_ev_live_.push_back(0);
-        if (pinned && !stage_pin_said_) {
-            stage_pin_said_ = true;
-            std::fprintf(stderr, "FileExpertSource: the stage buffers are pinned (cudaHostAlloc)\n");
-        } else if (!pinned && want_pin && !stage_pin_failed_said_) {
-            stage_pin_failed_said_ = true;
-            std::fprintf(stderr, "FileExpertSource: cudaHostAlloc failed for a stage buffer (%s) - pageable it is\n",
-                         cudaGetErrorString(pin_err));
-        }
-        stage_key_.push_back(-1);
-        stage_epoch_.push_back(0);
-        stage_used_.push_back(0);
-        stage_busy_.push_back(0);
-        stage_pf_.push_back(0);
-        if (stage_buf_.size() == 512 && !stage_grew_) {
-            stage_grew_ = true;
-            std::fprintf(stderr, "FileExpertSource: %zu blobs assembled from the GGUF are in use at once (%.2f GiB)\n",
-                         stage_buf_.size(), (double) stage_buf_.size() * (double) stage_blob_ / 1073741824.0);
-        }
+        v = stage_add_locked();
+        if (v == SIZE_MAX) return false;
     } else {
         stage_of_.erase(stage_key_[v]);
         if (stage_pf_[v]) { stage_pf_[v] = 0; io_pf_unused_.fetch_add(1, std::memory_order_relaxed); }   // read ahead, never asked for
@@ -1880,15 +1914,15 @@ bool FileExpertSource::claim_stage(int64_t key, size_t& v, bool& fill, bool ahea
             if (stage_ev_[v] != nullptr) {
                 if (cudaEventQuery((cudaEvent_t) stage_ev_[v]) == cudaErrorNotReady) {
                     stage_fence_waits_.fetch_add(1, std::memory_order_relaxed);
-                    (void) cudaEventSynchronize((cudaEvent_t) stage_ev_[v]);
+                    (void) strata::core::st_event_sync((cudaEvent_t) stage_ev_[v], STRATA_ST_HERE);
                 }
                 (void) cudaGetLastError();
             }
         }
     }
     stage_key_[v] = key;
-    stage_epoch_[v] = epoch_;
-    stage_used_[v] = seq;
+    stage_used_d_[v] = stage_used_p_[v] = 0;   // a fresh blob: only its claimant has touched it
+    stamp(v);
     stage_busy_[v] = 1;
     stage_of_[key] = v;
     fill = true;
@@ -2040,14 +2074,14 @@ void FileExpertSource::note_async_read(const uint8_t* blob, void* stream) {
         cudaEvent_t ev = nullptr;
         if (cudaEventCreateWithFlags(&ev, cudaEventDisableTiming) != cudaSuccess) {
             (void) cudaGetLastError();
-            (void) cudaStreamSynchronize((cudaStream_t) stream);   // no event: wait for the copy itself
+            (void) strata::core::st_stream_sync((cudaStream_t) stream, STRATA_ST_HERE);   // no event: wait for the copy itself
             return;
         }
         stage_ev_[v] = ev;
     }
-    if (cudaEventRecord((cudaEvent_t) stage_ev_[v], (cudaStream_t) stream) != cudaSuccess) {
+    if (strata::core::st_record((cudaEvent_t) stage_ev_[v], (cudaStream_t) stream, STRATA_ST_HERE) != cudaSuccess) {
         (void) cudaGetLastError();
-        (void) cudaStreamSynchronize((cudaStream_t) stream);
+        (void) strata::core::st_stream_sync((cudaStream_t) stream, STRATA_ST_HERE);
         return;
     }
     stage_ev_live_[v] = 1;
@@ -2650,6 +2684,8 @@ bool FileExpertSource::end_startup_unbuffered(std::string& why) {
         stage_key_.clear();
         stage_epoch_.clear();
         stage_used_.clear();
+        stage_used_d_.clear();
+        stage_used_p_.clear();
         stage_busy_.clear();
         stage_pf_.clear();
         stage_of_.clear();
@@ -3473,7 +3509,7 @@ bool FileExpertSource::pin_cache_complement(
         err = "FileExpertSource: the GPU expert cache is not fully filled";
         return false;
     }
-    const cudaError_t sync = cudaDeviceSynchronize();
+    const cudaError_t sync = strata::core::st_device_sync(STRATA_ST_HERE);
     if (sync != cudaSuccess) {
         err = std::string("FileExpertSource: GPU expert cache is not ready: ") + cudaGetErrorString(sync);
         (void) cudaGetLastError();
@@ -3679,6 +3715,34 @@ bool FileExpertSource::pin_cache_complement(
                                                        stage_lend_regions_, err);
         if (stage_lent < 0) return false;
         stage_lent_bytes = bytes - before;
+    }
+    // --kv-share's VRAM exchange (`pool_take_region_`): the experts of the slots a cache lends to the K/V pool as it
+    // grows, in the order the pool takes them.  A lent slot's expert is a CPU miss from then on, and every prompt
+    // chunk streams it from here or, without a copy, from the files.  Measured 2026-10-29 on 2x RTX 3090 (three
+    // agents replaying 80 recorded turns): the copy held 35.6 GiB of a 48 GiB budget (the complement is sized by
+    // what the caches do not hold at the start, and with the pool they hold 12 GiB more than a fixed K/V would
+    // leave them), the pool took 105 of 712 extents, and every prompt read 2 to 3 GB of experts through the page
+    // cache where the release engine read none.  Only under an explicit budget: the region can be most of a cache,
+    // and without a budget it would take all the RAM above the headroom.
+    int64_t pool_kept = 0;
+    uint64_t pool_kept_bytes = 0;
+    const bool pool_region_on = !pool_take_region_.empty() && budget_bytes > 0 && budget_bytes != kResidentWhatFits;
+    if (pool_region_on) {
+        if (budget == std::numeric_limits<uint64_t>::max()) {   // #403: the one reading, taken now
+            uint64_t physical = budget_physical, commit = budget_commit;
+            if (physical == 0 && !available_memory_bytes(physical, &commit)) {
+                err = "FileExpertSource: cannot determine available memory for the K/V pool's take region";
+                return false;
+            }
+            const uint64_t available = std::min(physical, commit);
+            budget = available > headroom_bytes ? available - headroom_bytes : 0;
+        }
+        const uint64_t cap = std::min(budget, budget_bytes);
+        const uint64_t before = bytes;
+        pool_kept = detail::append_stage_lend_regions(n_layers_, n_expert_, layer_blob_bytes_, offsets, bytes, cap,
+                                                      {pool_take_region_}, err);
+        if (pool_kept < 0) return false;
+        pool_kept_bytes = bytes - before;
     }
 
     void* arena = nullptr;
@@ -4157,6 +4221,15 @@ bool FileExpertSource::pin_cache_complement(
                              "their experts in RAM too (%.2f GiB)%s\n",
                      (long long) offered, (long long) stage_lent, (double) stage_lent_bytes / 1073741824.0,
                      stage_lent < offered ? " (the rest are read from the file when lent: not enough RAM for them)" : "");
+    }
+    if (!pool_take_region_.empty()) {
+        const long long offered = (long long) pool_take_region_.size();
+        std::fprintf(stderr, "FileExpertSource: the K/V pool may take %lld slots from the expert caches: %lld keep their "
+                             "experts in RAM too (%.2f GiB)%s\n", offered, (long long) pool_kept,
+                     (double) pool_kept_bytes / 1073741824.0,
+                     !pool_region_on ? " (none without --resident-budget-gib: a lent slot's expert is read from the files)"
+                     : pool_kept < offered ? " (the rest are read from the files once lent; a larger --resident-budget-gib keeps more)"
+                                           : "");
     }
     if (!additional_gpu_pairs.empty()) {
         std::fprintf(stderr, "FileExpertSource: %zu verified additional-GPU experts remain on the mmap fallback\n",
@@ -5340,7 +5413,7 @@ void expert_hit_run(void* user, void* stream, HitPhase phase, const int32_t* ids
             strata::kernels::moe_hit_grouped_s2(d.cache_base, d.d_slot, d.d_dst, d.n_hits, d.cache_blob,
                 d.x_q8_0_hit, d.hit_scratch, d.hit_out, cs, d.x_q8_0_hit_scale);
         d.hit_pending = true;
-        if (d.hit_done != nullptr) cudaEventRecord((cudaEvent_t) d.hit_done, cs);
+        if (d.hit_done != nullptr) strata::core::st_record((cudaEvent_t) d.hit_done, cs, STRATA_ST_HERE);
         // The A/B arm: ONE driver entry here, and nothing else changes.  If the work was waiting for the host
         // to enter the driver, this is what lets it start while the pool runs.
         if (d.hit_poke && d.hit_done != nullptr) (void) cudaEventQuery((cudaEvent_t) d.hit_done);
@@ -6229,7 +6302,7 @@ ForesightSwap::~ForesightSwap() {
     if (filler_.joinable()) filler_.join();
     for (size_t c = 0; c < card_dev.size(); ++c) {
         const OnDevice on(card_dev[c]);
-        if (card_stream[c]) cudaStreamSynchronize((cudaStream_t) card_stream[c]);
+        if (card_stream[c]) strata::core::st_stream_sync((cudaStream_t) card_stream[c], STRATA_ST_HERE);
         if (card_mem[c]) cudaFree(card_mem[c]);
         if (card_stream[c]) cudaStreamDestroy((cudaStream_t) card_stream[c]);
     }
@@ -6256,7 +6329,7 @@ void ForesightSwap::fill_loop() {
         if (dev != cur_dev) { cudaSetDevice(dev); cur_dev = dev; }
         cudaStream_t s = (cudaStream_t) card_stream[(size_t) layer_card[(size_t) l]];
         if (cudaMemcpyAsync((void*) sl.dptr, sl.src, sl.bytes, cudaMemcpyHostToDevice, s) != cudaSuccess ||
-            cudaEventRecord((cudaEvent_t) sl.ev, s) != cudaSuccess) {
+            strata::core::st_record((cudaEvent_t) sl.ev, s, STRATA_ST_HERE) != cudaSuccess) {
             cudaGetLastError();
             if (!failed.exchange(true)) std::fprintf(stderr, "strata serve: foresight swap: a copy failed - swap space off\n");
             continue;   // never marked issued: the slot is never used

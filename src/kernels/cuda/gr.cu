@@ -34,6 +34,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <stdexcept>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::kernels {
 namespace {
@@ -455,7 +456,7 @@ void gr_read(const float* R, const float* w_norm, const uint16_t* w_down, const 
         std::exit(1);
     }
     if (stream == nullptr) {
-        const cudaError_t se = cudaDeviceSynchronize();
+        const cudaError_t se = strata::core::st_device_sync(STRATA_ST_HERE);
         if (se != cudaSuccess) {
             std::fprintf(stderr, "gr_read: %s\n", cudaGetErrorString(se));
             std::exit(1);
@@ -494,7 +495,7 @@ void gr_read_multi(const float* R, const float* w_norm, const uint16_t* w_down, 
             std::exit(1);
         }
         if (stream == nullptr) {
-            const cudaError_t se = cudaDeviceSynchronize();
+            const cudaError_t se = strata::core::st_device_sync(STRATA_ST_HERE);
             if (se != cudaSuccess) {
                 std::fprintf(stderr, "gr_read_multi: %s\n", cudaGetErrorString(se));
                 std::exit(1);
@@ -520,7 +521,7 @@ void gr_write(const float* R, const float* block_out, const float* inject, const
         gr_write_kernel<<<blocks, THREADS, (size_t) s.hc * sizeof(float), (cudaStream_t) stream>>>(
             R, block_out, inject, (int) s.n_embd, (int) s.hc, R_out);
     if (stream == nullptr) {
-        const cudaError_t e = cudaDeviceSynchronize();
+        const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
         if (e != cudaSuccess) {
             std::fprintf(stderr, "gr_write: %s\n", cudaGetErrorString(e));
             std::exit(1);
@@ -534,7 +535,7 @@ void gr_write_multi(const float* R, const float* block_out, const float* inject,
     if (!no_multi_gr() && native_mmvf && n_tok > 1) {
         native_gr_post_multi(R, block_out, inject, R_out, (int) s.n_embd, (int) s.hc, n_tok, stream);
         if (stream == nullptr) {
-            const cudaError_t e = cudaDeviceSynchronize();
+            const cudaError_t e = strata::core::st_device_sync(STRATA_ST_HERE);
             if (e != cudaSuccess) {
                 std::fprintf(stderr, "gr_write_multi: %s\n", cudaGetErrorString(e));
                 std::exit(1);

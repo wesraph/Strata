@@ -19,6 +19,7 @@
 #include <atomic>
 #include <initializer_list>
 #include <stdexcept>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::core {
 namespace {
@@ -41,7 +42,7 @@ Dflash2Drafter::~Dflash2Drafter() {
     prof_report();
     prof_free();
     const OnDevice on_device(device_);
-    if (cs_) cudaStreamSynchronize(cs_);
+    if (cs_) strata::core::st_stream_sync(cs_, STRATA_ST_HERE);
     for (cudaGraphExec_t& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     auto fr = [](void* p) { if (p) cudaFree(p); };
@@ -84,14 +85,14 @@ void Dflash2Drafter::stamp(const char* name) {
     if (!prof_) return;
     cudaEvent_t e;
     cudaEventCreate(&e);
-    cudaEventRecord(e, cs_);
+    strata::core::st_record(e, cs_, STRATA_ST_HERE);
     prof_->ev.push_back(e);
     prof_->name.push_back(name);
 }
 
 void Dflash2Drafter::prof_collect() {
     if (!prof_ || prof_->ev.size() < 2) return;
-    cudaStreamSynchronize(cs_);
+    strata::core::st_stream_sync(cs_, STRATA_ST_HERE);
     for (size_t i = 1; i < prof_->ev.size(); ++i) {
         float ms = 0;
         cudaEventElapsedTime(&ms, prof_->ev[i - 1], prof_->ev[i]);
@@ -186,7 +187,7 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
         if (t.dtype == "q8_0") {   // GGUF blocks -> the tiled qs plane at the tensor's offset, then the d plane (same total bytes)
             if (cudaMemcpy(tmp, stage.data(), t.bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "dflash2: weight upload failed"; return false; }
             kernels::df2_q8_tile(tmp, blob_ + t.off, blob_ + t.off + (uint64_t) t.rows * (uint64_t) t.cols, (int) t.cols, t.rows * t.cols / 32, nullptr);
-            if (cudaDeviceSynchronize() != cudaSuccess) { err = "dflash2: weight conversion failed"; return false; }
+            if (strata::core::st_device_sync(STRATA_ST_HERE) != cudaSuccess) { err = "dflash2: weight conversion failed"; return false; }
         } else if (cudaMemcpy(blob_ + t.off, stage.data(), t.bytes, cudaMemcpyHostToDevice) != cudaSuccess) {
             err = "dflash2: weight upload failed";
             return false;
@@ -255,7 +256,7 @@ bool Dflash2Drafter::alloc(std::string& err) {
     cudaMemset(xqc_, 0, (size_t) 5 * N_ * 8 + 4096);
     cudaMemset(xdc_, 0, ((size_t) 5 * N_ / 32 * 8 + 64) * 4);
     for (int l = 0; l < L_; ++l) { cudaMemset(kring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); cudaMemset(vring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4); }
-    return cudaDeviceSynchronize() == cudaSuccess;
+    return strata::core::st_device_sync(STRATA_ST_HERE) == cudaSuccess;
 }
 
 bool Dflash2Drafter::bind_raw(EmbedFn embed, const void* head_w, int head_type, int64_t head_rows, const std::vector<int32_t>& vocab, std::string& err) {
@@ -318,7 +319,7 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
         }
         cudaMemcpy(dv, vocab.data(), vocab.size() * 4, cudaMemcpyHostToDevice);
         kernels::gather_rows((const uint8_t*) hw, row_bytes, dv, (int64_t) vocab.size(), dhead_, nullptr);
-        cudaDeviceSynchronize();
+        strata::core::st_device_sync(STRATA_ST_HERE);
         cudaFree(dv);
         vram_ += (uint64_t) ((int64_t) vocab.size() * row_bytes);
         hw = dhead_;
@@ -363,7 +364,7 @@ bool Dflash2Drafter::record_context(const float* taps, int n, cudaStream_t cs, s
             stamp("gemm:kp");
             df2_kv_ring(kc_, vc_, f32(p + "self_attn.k_norm.weight"), d_meta_ + 0, rt_ctx_, kring_[l], vring_[l], kRing, n, NKV_, eps_, cs);
             stamp("df2_kv_ring");
-            if (fork_) cudaEventRecord(ev_ctx_[l], cs);   // layer l's keys and values are in the ring
+            if (fork_) strata::core::st_record(ev_ctx_[l], cs, STRATA_ST_HERE);   // layer l's keys and values are in the ring
         }
     } catch (const std::exception& e) {
         err = e.what();
@@ -397,7 +398,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
             stamp("gemm:qp");
             if (!skip_part("small")) df2_norm_rope_qk(q_, k_, f32(p + "self_attn.q_norm.weight"), f32(p + "self_attn.k_norm.weight"), rt_blk_, qn_, kblk_, B, NH_, NKV_, eps_, cs);
             stamp("df2_norm_rope_qk");
-            if (fork_) cudaStreamWaitEvent(cs, ev_ctx_[l], 0);   // the context update has written this layer's ring
+            if (fork_) strata::core::st_wait(cs, ev_ctx_[l], STRATA_ST_HERE);   // the context update has written this layer's ring
             if (!skip_part("attn")) df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, xqp_, xdp_, cs);
             stamp("df2_attention");
             if (!skip_part("qkvo")) gemm({(p + "self_attn.o_proj.weight").c_str()}, {o_}, B, cs, xqp_, xdp_);
@@ -451,13 +452,13 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     static const bool fork_on = [] { const char* e = std::getenv("STRATA_DF2_FORK"); return e && e[0] ? e[0] == '1' : fork_default; }();
     fork_ = fork_on && prof_ == nullptr && cs2_ != nullptr;
     if (fork_) {
-        cudaEventRecord(ev_fork_, cs_);
-        cudaStreamWaitEvent(cs2_, ev_fork_, 0);
+        strata::core::st_record(ev_fork_, cs_, STRATA_ST_HERE);
+        strata::core::st_wait(cs2_, ev_fork_, STRATA_ST_HERE);
     }
     bool ok = record_context(taps, n, fork_ ? cs2_ : cs_, err);
-    if (fork_) cudaEventRecord(ev_join_, cs2_);
+    if (fork_) strata::core::st_record(ev_join_, cs2_, STRATA_ST_HERE);
     if (ok) ok = record_block(cs_, err);
-    if (fork_) cudaStreamWaitEvent(cs_, ev_join_, 0);
+    if (fork_) strata::core::st_wait(cs_, ev_join_, STRATA_ST_HERE);
     fork_ = false;
     cudaGraph_t graph = nullptr;
     const cudaError_t ce = cudaStreamEndCapture(cs_, &graph);
@@ -469,7 +470,7 @@ bool Dflash2Drafter::capture(int n, const float* taps, std::string& err) {
     }
     cudaGraphDestroy(graph);
     cudaGraphUpload(exec_[n], cs_);
-    cudaStreamSynchronize(cs_);
+    strata::core::st_stream_sync(cs_, STRATA_ST_HERE);
     return true;
 }
 
@@ -495,7 +496,7 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
         std::atomic_thread_fence(std::memory_order_seq_cst);
         kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
         if (!record_context(taps + (size_t) r0 * (size_t) tap_n, m, cs_, err)) return false;
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+        if (strata::core::st_stream_sync(cs_, STRATA_ST_HERE) != cudaSuccess) { err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     }
     have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
     return true;
@@ -521,9 +522,9 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
     for (int i = 1; i < 8; ++i) h_meta_[24 + i] = mask_token_;
     for (int i = 0; i < kDrafts; ++i) { ((volatile int32_t*) h_out_)[i] = -1; }
     std::atomic_thread_fence(std::memory_order_seq_cst);
-    if (timing_) cudaEventRecord(ev_a_, cs_);
+    if (timing_) strata::core::st_record(ev_a_, cs_, STRATA_ST_HERE);
     if (prof_) {   // the same round without its graph, an event after every stage
-        cudaStreamSynchronize(cs_);
+        strata::core::st_stream_sync(cs_, STRATA_ST_HERE);
         for (cudaEvent_t e : prof_->ev) cudaEventDestroy(e);   // the stamps of context() calls are not a round
         prof_->ev.clear();
         prof_->name.clear();
@@ -533,9 +534,9 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
         prof_collect();
     } else
     if (cudaGraphLaunch(exec_[n_new], cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
-    if (timing_) cudaEventRecord(ev_b_, cs_);
+    if (timing_) strata::core::st_record(ev_b_, cs_, STRATA_ST_HERE);
     (void) cudaStreamQuery(cs_);
-    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+    if (strata::core::st_stream_sync(cs_, STRATA_ST_HERE) != cudaSuccess) { err = std::string("dflash2 draft: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     for (int i = 0; i < kDrafts; ++i) {
         drafts[i] = ((volatile int32_t*) h_out_)[i];
         if (probs) probs[i] = ((volatile float*) h_out_)[16 + i];

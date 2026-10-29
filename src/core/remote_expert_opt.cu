@@ -7,6 +7,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include "strata/core/stream_trace.hpp"
 
 namespace strata::core {
 namespace {
@@ -71,7 +72,7 @@ bool RemoteExpertOpt::init(std::string& err) {
 RemoteExpertOpt::~RemoteExpertOpt() {
     for (auto& p : peers_) {
         const OnDevice on(p.remote->device_);
-        if (p.remote->stream_) cudaStreamSynchronize(p.remote->stream_);
+        if (p.remote->stream_) strata::core::st_stream_sync(p.remote->stream_, STRATA_ST_HERE);
         if (p.sum) cudaFree(p.sum);
         p.remote->remote_opt_ = nullptr;
     }
@@ -188,7 +189,7 @@ bool RemoteExpertOpt::adapt(const std::vector<float>& usage, const std::vector<i
                                     r.stream_, err, (int64_t) lay.blob_bytes(s.layer))) return false;
             source.note_async_read(in_blob, r.stream_);   // #1237
         }
-        if (!check(cudaStreamSynchronize(r.stream_), err)) return false;
+        if (!check(strata::core::st_stream_sync(r.stream_, STRATA_ST_HERE), err)) return false;
         for (const auto& s : swaps) {
             r.cache_.replace(s.layer, s.out, s.in);
             const size_t base = (size_t) s.layer * r.n_expert_;
