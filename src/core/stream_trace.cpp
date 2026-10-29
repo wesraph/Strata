@@ -144,6 +144,33 @@ void stream_trace_dump(std::FILE* f, size_t last_n) {
                          (double) (t_last - e.t_us), kind_name(e.kind), (unsigned long long) e.tid, e.dev, e.stream, e.event,
                          e.where ? e.where : "?", e.repeats ? " (repeated)" : "");
     }
+    // STRATA_STREAM_TRACE=2: for each stream still busy, the boundary between its launches that finished and the ones
+    // that did not - the first launch not done is the kernel the card sits on (the host runs far ahead of the GPU, so
+    // the last 40 entries above are usually all "not done")
+    {
+        std::map<const void*, std::vector<const Entry*>> launches;
+        for (const Entry& e : es) if ((e.kind == StKind::launch || e.kind == StKind::graph) && e.done != nullptr) launches[e.stream].push_back(&e);
+        for (auto& [st, v] : launches) {
+            if (cudaStreamQuery((cudaStream_t) st) != cudaErrorNotReady) { (void) cudaGetLastError(); continue; }
+            (void) cudaGetLastError();
+            // from the newest back: the first launch whose event is done
+            size_t first_not_done = v.size();
+            for (size_t i = v.size(); i-- > 0;) {
+                const cudaError_t q = cudaEventQuery((cudaEvent_t) v[i]->done);
+                (void) cudaGetLastError();
+                if (q == cudaSuccess) break;
+                first_not_done = i;
+            }
+            std::fprintf(f, "strata stream trace: stream %p (dev %d) is busy: of its %zu traced launches %zu finished; the first not done and its neighbours:\n",
+                         st, v.back()->dev, v.size(), first_not_done);
+            const size_t a = first_not_done >= 4 ? first_not_done - 4 : 0, b = std::min(v.size(), first_not_done + 6);
+            for (size_t i = a; i < b; ++i)
+                std::fprintf(f, "   %s %10.1f %s %s\n", i == first_not_done ? ">>" : "  ", (double) (t_last - v[i]->t_us),
+                             v[i]->kind == StKind::graph ? "graph" : "kernel", v[i]->kind == StKind::graph ? "(a captured window or commit)" : kernel_name(v[i]->event));
+            if (first_not_done == v.size()) std::fprintf(f, "   (every traced launch finished: the stream waits on something else - a copy, an event, a graph)\n");
+        }
+    }
+    std::fflush(f);
     // per stream, its last entries in order: the enqueue order on each stream is what a cycle reads off
     {
         std::map<const void*, std::vector<const Entry*>> per;
@@ -222,32 +249,6 @@ void stream_trace_dump(std::FILE* f, size_t last_n) {
             std::fprintf(f, "  stream %p (dev %d): %s\n", st, dev,
                          q == cudaSuccess ? "idle" : q == cudaErrorNotReady ? "BUSY (work still running)" : cudaGetErrorString(q));
             (void) cudaGetLastError();
-        }
-    }
-    // STRATA_STREAM_TRACE=2: for each stream still busy, the boundary between its launches that finished and the ones
-    // that did not - the first launch not done is the kernel the card sits on (the host runs far ahead of the GPU, so
-    // the last 40 entries above are usually all "not done")
-    {
-        std::map<const void*, std::vector<const Entry*>> launches;
-        for (const Entry& e : es) if ((e.kind == StKind::launch || e.kind == StKind::graph) && e.done != nullptr) launches[e.stream].push_back(&e);
-        for (auto& [st, v] : launches) {
-            if (cudaStreamQuery((cudaStream_t) st) != cudaErrorNotReady) { (void) cudaGetLastError(); continue; }
-            (void) cudaGetLastError();
-            // from the newest back: the first launch whose event is done
-            size_t first_not_done = v.size();
-            for (size_t i = v.size(); i-- > 0;) {
-                const cudaError_t q = cudaEventQuery((cudaEvent_t) v[i]->done);
-                (void) cudaGetLastError();
-                if (q == cudaSuccess) break;
-                first_not_done = i;
-            }
-            std::fprintf(f, "strata stream trace: stream %p (dev %d) is busy: of its %zu traced launches %zu finished; the first not done and its neighbours:\n",
-                         st, v.back()->dev, v.size(), first_not_done);
-            const size_t a = first_not_done >= 4 ? first_not_done - 4 : 0, b = std::min(v.size(), first_not_done + 6);
-            for (size_t i = a; i < b; ++i)
-                std::fprintf(f, "   %s %10.1f %s %s\n", i == first_not_done ? ">>" : "  ", (double) (t_last - v[i]->t_us),
-                             v[i]->kind == StKind::graph ? "graph" : "kernel", v[i]->kind == StKind::graph ? "(a captured window or commit)" : kernel_name(v[i]->event));
-            if (first_not_done == v.size()) std::fprintf(f, "   (every traced launch finished: the stream waits on something else - a copy, an event, a graph)\n");
         }
     }
     // derived: open synchronizes (a begin with no end from the same thread on the same stream/event)

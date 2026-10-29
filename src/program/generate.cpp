@@ -1565,8 +1565,9 @@ constexpr int64_t kVramSafeMib =
 #endif
 
 void stall_report(std::FILE* f, uint64_t layers_during) {
+    strata::prefill::Prefill::stall_dump(f);   // every prompt path's chunk, layer and MoE row bounds (first: the rest may not return)
+    std::fflush(f);
     strata::core::stream_trace_dump(f);   // the streams' waits and records before the stall (stream_trace.hpp)
-    strata::prefill::Prefill::stall_dump(f);   // every prompt path's chunk, layer and MoE row bounds
     strata::core::Progress& p = strata::core::progress();
     std::fprintf(f, "strata serve: stall report (engine %s): stage \"%s\" for %lld s; %llu layers served since the "
                     "last finished step (0 = stopped, more = slow)\n", STRATA_VERSION, stage_text().c_str(),
