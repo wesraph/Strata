@@ -11451,30 +11451,24 @@ int main(int argc, char** argv) {
         struct Stats {
             std::atomic<int64_t> pp{0}, tg{0}, hits{0}, miss{0}, pool_live{0}, pool_cached{0}, pool_mapped{0}, pool_total{0};
             std::atomic<int64_t> read_mark_us{0};   // when the serve thread last was outside a read, or committed a chunk
+            std::atomic<int64_t> chunk_rate_mtps{0};   // the last committed prompt chunk's speed, tokens per second x 1000
             std::atomic<int> running{0}, reading{0}, main_gen{0};   // main_gen: the non-batch path is decoding
-            struct Chunk { int64_t start_us, end_us, tokens; };   // a prompt chunk read: its tokens over the time it took
-            std::mutex mu;
-            std::vector<Chunk> chunks;
         } stats;
         auto stats_us = []() { return (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(Clock::now().time_since_epoch()).count(); };
         stats.read_mark_us = stats_us();
-        // a prompt chunk committed: its tokens, spread over the time it took (since the previous chunk or the read's
-        // start).  The prompt rate is tokens read per wall second, averaged over the window: a chunk of 16K tokens
-        // lands whole every few seconds, so counted at its commit the per-second figure read 14,886 then 0, 0, 0
-        // and a 10 s window swung from 1.6K to 4.6K around a true 3.0K; spread over its own reading time it is
-        // what it was: 3.0K while the read runs, 0 when nothing is read.
+        // a prompt chunk committed: its tokens over the time it took (since the previous chunk or the read's start)
+        // is the prompt speed the line shows while a read is in progress.  Progress inside a chunk is not observable
+        // (a 16K-token chunk takes 5-9 s and lands whole), so a count per line interval read 14,886 then 0, 0, 0,
+        // and any average over a few seconds swung around the true figure; the last chunk's own speed is exact.
         auto stats_read_add = [&](int64_t T) {
             const int64_t now_us = stats_us();
             const int64_t mark = stats.read_mark_us.exchange(now_us);
             stats.pp += T;
             stats.reading = 1;
-            std::lock_guard<std::mutex> lk(stats.mu);
-            stats.chunks.push_back({std::min(mark, now_us - 1), now_us, T});
+            const int64_t us = std::max<int64_t>(1, now_us - mark);
+            stats.chunk_rate_mtps = T * 1000000000 / us;
         };
         const double stats_every_s = [] { const char* v = std::getenv("STRATA_STATS_EVERY_S"); return v != nullptr ? std::atof(v) : 1.0; }();
-        // the rates are over the last STRATA_STATS_WINDOW_S seconds (10): a prompt chunk's tokens land whole when it
-        // commits (16K tokens at once every few seconds), so a one-second rate read 14,886 then 0, 0, 0
-        const double stats_window_s = [] { const char* v = std::getenv("STRATA_STATS_WINDOW_S"); return v != nullptr ? std::atof(v) : 10.0; }();
         std::function<void()> stats_refresh;   // the snapshot (defined beside the pump: it reads the slots and the drive)
         struct StatsThread {
             std::thread t;
@@ -14681,37 +14675,22 @@ int main(int argc, char** argv) {
         }
         kvsh_idle_t0 = std::chrono::steady_clock::now();   // the idle clock starts with serving, not the process
         if (stats_every_s > 0.0)
-            stats_thread.t = std::thread([&stats, &stats_thread, stats_every_s, stats_window_s]() {
-                struct Sample { Clock::time_point t; int64_t pp, tg, h, m; };
-                std::deque<Sample> ring;   // the counters at every tick of the last window
-                ring.push_back({Clock::now(), 0, 0, 0, 0});
-                auto us_of = [](Clock::time_point t) { return (int64_t) std::chrono::duration_cast<std::chrono::microseconds>(t.time_since_epoch()).count(); };
+            stats_thread.t = std::thread([&stats, &stats_thread, stats_every_s]() {
+                int64_t tg0 = stats.tg, h0 = stats.hits, m0 = stats.miss;
+                auto t0 = Clock::now();
                 while (!stats_thread.stop) {
                     for (double w = 0.0; w < stats_every_s && !stats_thread.stop; w += 0.1)
                         std::this_thread::sleep_for(std::chrono::milliseconds(100));
                     if (stats_thread.stop) break;
                     const auto now = Clock::now();
-                    ring.push_back({now, stats.pp, stats.tg, stats.hits, stats.miss});
-                    while (ring.size() > 2 && std::chrono::duration<double>(now - ring[1].t).count() >= stats_window_s) ring.pop_front();
-                    const Sample& a = ring.front();
-                    const Sample& b = ring.back();
-                    const double sec = std::max(1e-3, std::chrono::duration<double>(b.t - a.t).count());
-                    const int64_t dtg = b.tg - a.tg, dh = b.h - a.h, dm = b.m - a.m;
-                    // the prompt tokens in the window: each chunk's share of the part of its reading time inside it
-                    double pp_in = 0.0;
-                    {
-                        const int64_t w0 = us_of(a.t), w1 = us_of(b.t);
-                        std::lock_guard<std::mutex> lk(stats.mu);
-                        size_t keep = 0;
-                        for (const auto& c : stats.chunks) {
-                            if (c.end_us < w0) continue;   // before the window: dropped
-                            stats.chunks[keep++] = c;
-                            const int64_t o0 = std::max(c.start_us, w0), o1 = std::min(c.end_us, w1);
-                            if (o1 > o0 && c.end_us > c.start_us) pp_in += (double) c.tokens * (double) (o1 - o0) / (double) (c.end_us - c.start_us);
-                        }
-                        stats.chunks.resize(keep);
-                    }
-                    const double pp_rate = pp_in / sec;
+                    const double sec = std::max(1e-3, std::chrono::duration<double>(now - t0).count());
+                    t0 = now;
+                    // generation: the tokens emitted since the last line, over the time since it; prompt: the last
+                    // committed chunk's speed while a read is in progress, 0 otherwise
+                    const int64_t tg = stats.tg, h = stats.hits, m = stats.miss;
+                    const int64_t dtg = tg - tg0, dh = h - h0, dm = m - m0;
+                    tg0 = tg; h0 = h; m0 = m;
+                    const double pp_rate = stats.reading ? (double) stats.chunk_rate_mtps / 1000.0 : 0.0;
                     char hit[32] = "-", pool[160] = "";
                     if (dh + dm > 0) std::snprintf(hit, sizeof hit, "%.1f%%", 100.0 * (double) dh / (double) (dh + dm));
                     const int64_t T = stats.pool_total;
