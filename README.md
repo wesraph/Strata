@@ -114,7 +114,8 @@ it off, `STRATA_KV_TRIM_IDLE_S` and `STRATA_KV_TRIM_KEEP_TOKENS` tune the idle t
 line per second with the prompt and generation rates over the interval, the slots running and reading, the hit rate
 and the pool's use. The flags are documented in [docs/DETAILS.md](docs/DETAILS.md). With two NVIDIA cards,
 `STRATA_PIPED_MTP=2` and `--batch-mtp` add the pipelined slot drafts that the tables above use. The CPU share of
-the short reads is on by default beside the slots on this fork (`STRATA_PREFILL_CPU_SHARE=0` turns it off). Give the engine headroom: the pool shares the card's free VRAM with everything else, and
+the short reads is on by default beside the slots on this fork, its fraction measured per layer and the chunk size it
+applies up to measured per size band (`STRATA_PREFILL_CPU_SHARE=0` turns it off). Give the engine headroom: the pool shares the card's free VRAM with everything else, and
 `--vram-reserve-mib 1536` is what keeps three or more long contexts from paging on 24 GB cards.
 
 **Known edges.** Every mapped page is pinned, so three or more conversations near 200K tokens can fill the pool and the next
