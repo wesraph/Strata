@@ -2092,10 +2092,19 @@ class StrataEngine:
                         if f[3:4] == ["nonfinite"]:              # #879: the engine dropped the slot's state
                             self.slot_held[slot] = []
                             raise EngineNonFinite("the engine's logits became non-finite (#879)")
-                        if (going_solo and f[3:4] == ["cancel"] and not cancel.is_set() and len(out) < int(max_new)
-                                and not (out and out[-1] in EOS_IDS)):
+                        # --kv-share: the engine's pool had no page for this slot's next window while another slot
+                        # held pages ("preempt"): the request is admitted again with what it generated, as below -
+                        # that admission waits in the engine until there is room, and the answer goes on
+                        preempted = f[3:4] == ["preempt"]
+                        if ((preempted or (going_solo and f[3:4] == ["cancel"])) and not cancel.is_set()
+                                and len(out) < int(max_new)
+                                # (a replay's end token is a token like any other: the answer goes on past it)
+                                and not (out and out[-1] in EOS_IDS and not (sampling or {}).get("strata_ignore_eos"))):
                             # the solo path continues it: the engine copies the slot's sessions back (all but the
                             # last token are in them) and decodes with MTP drafts again
+                            if preempted:
+                                print(f"[strata] parallel: the K/V pool is full: the answer in slot {slot} waits for "
+                                      f"room after {len(out)} tokens and goes on", flush=True)
                             carry_leg(carry, self.last)         # #1869: the solo path's DONE replaces these figures
                             self.slot_live[slot] = None
                             self.slot_used[slot] = time.time()
@@ -2107,8 +2116,9 @@ class StrataEngine:
                             if reused0 is None:
                                 reused0 = (self.last or {}).get("reused")
                             prompt, left = list(ids) + out, int(max_new) - len(out)
-                            solo_again += 1
-                            btrace("back to the solo path")
+                            if not preempted:                   # (a preempted leg is not a hand-back to the solo path)
+                                solo_again += 1
+                            btrace("preempted: admitted again" if preempted else "back to the solo path")
                             break
                         return
         finally:
