@@ -933,14 +933,15 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
         }
         tap_on_ = true;
     }
-    if (bal_ != nullptr) {   // set_pcie_balance: four stamp words per (layer, group)
-        if (!mapped((size_t) g.n_layers * 2 * 4 * 8, (void**) &h_bal_, (void**) &m_bal_)) {
+    if (bal_ != nullptr) {   // set_pcie_balance: kBalWords stamp words per (layer, group)
+        if (!mapped((size_t) g.n_layers * 2 * kBalWords * 8, (void**) &h_bal_, (void**) &m_bal_)) {
             err = "verify: mapped balance stamps allocation failed";
             return false;
         }
         bal_p_.assign((size_t) g.n_layers * 2, 0.0);
         bal_nc_.assign((size_t) g.n_layers * 2, 0);
         bal_np_.assign((size_t) g.n_layers * 2, 0);
+        bal_nv_.assign((size_t) g.n_layers * 2, 0);
         bal_ok_.assign((size_t) g.n_layers * 2, 0);
         bal_->on = true;
     }
@@ -2281,7 +2282,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                     wait_copy_i32_from_mapped(m_flagA_, ring, pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
                 } else {
                 if (m_bal_ != nullptr)   // set_pcie_balance: the GPU's share starts as the plan arrives
-                    wait_flag_ge_stamped(m_flagA_, ring, nullptr, m_bal_ + ((l - lb_) * 2 + grp) * 4, cs);
+                    wait_flag_ge_stamped(m_flagA_, ring, m_bal_ + ((l - lb_) * 2 + grp) * kBalWords + 3,
+                                         m_bal_ + ((l - lb_) * 2 + grp) * kBalWords, cs);
                 else
                     wait_flag_ge(m_flagA_, ring, cs);              // the pool published this group's GPU plan
                 copy_i32_from_mapped(pl, m_plan_ + (size_t) grp * (size_t) plan_i32_, plan_i32_, cs);
@@ -2292,7 +2294,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             stamp(l, 20, grp);
             if (device_plan_) wait_flag_ge_or(m_flagB_, ring, skip_ + grp, cs);
             else if (m_bal_ != nullptr)   // set_pcie_balance: the PCIe part starts
-                wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 1, nullptr, cs);
+                wait_flag_ge_stamped(m_flagB_, ring, m_bal_ + ((l - lb_) * 2 + grp) * kBalWords + 1,
+                                     m_bal_ + ((l - lb_) * 2 + grp) * kBalWords + 4, cs);
             else wait_flag_ge(m_flagB_, ring, cs);                 // the PCIe share is in staging (DMA) or mapped
             if (sink_.pcie_mode == 2) {                            // stage it with a copy kernel, then point at staging
                 const int64_t per = G == 2 ? kStagingBlobs / 2 : kStagingBlobs;
@@ -2313,7 +2316,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 const bool fuse_rows = fuse_rows_on() && !prof_on_ && !remote_opt_ && dec_batch && m_bal_ == nullptr;   // 143-amdk
                 if (!fuse_rows) {
                     if (m_bal_ != nullptr)   // set_pcie_balance: ... and ends as it waits for the CPU's rows
-                        wait_flag_ge_stamped(m_flag_, ring, m_bal_ + ((l - lb_) * 2 + grp) * 4 + 2, nullptr, cs);
+                        wait_flag_ge_stamped(m_flag_, ring, m_bal_ + ((l - lb_) * 2 + grp) * kBalWords + 2,
+                                             m_bal_ + ((l - lb_) * 2 + grp) * kBalWords + 5, cs);
                     else
                         wait_flag_ge(m_flag_, ring, cs);           // the CPU's share is in the mapped rows
                 }
@@ -3052,7 +3056,7 @@ bool Verifier::prelaunch(int T, const int32_t* tokens, int64_t pos0, std::string
     std::atomic_thread_fence(std::memory_order_seq_cst);
     trace_ev("WINDOW-PRE", -1, -1, pos0 * 16 + T);
     ms_host += ms_since(t0);
-    if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // this window's stamps only
+    if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * kBalWords * 8);   // this window's stamps only
     if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
     // 0.1.43: the same gate run() applies before it launches (the adaptive tier's copies land first)
     if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
@@ -3149,7 +3153,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
         trace_ev("WINDOW", -1, -1, pos0 * 16 + T);
         ms_host += ms_since(t0);
         VDBG("staged; launching\n");
-        if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // this window's stamps only
+        if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * kBalWords * 8);   // this window's stamps only
         if (ar_on() && h_plan_err_ != nullptr) *(volatile uint32_t*) h_plan_err_ = 0;
         // 0.1.43: with the all-resident graph the host serves no layer, so nothing can hold a layer back: every copy first
         if (adapt_gate_ != nullptr && adapt_gate_->active.load(std::memory_order_acquire) && ar_on() &&
@@ -3291,6 +3295,7 @@ bool Verifier::run(int T, const int32_t* tokens, int64_t pos0, PoolMultiFn pool,
             bal_ok_[bi] = *(volatile uint32_t*) h_flagA_ == want;
             bal_nc_[bi] = bal_ok_[bi] ? sink_.cpu_jobs : 0;
             bal_np_[bi] = bal_ok_[bi] ? sink_.counts[2] : 0;
+            bal_nv_[bi] = bal_ok_[bi] ? sink_.counts[0] : 0;
             sink_.cpu_jobs = 0;
         }
         if (*(volatile uint32_t*) h_flagA_ != want) {        // the pool did not publish a plan: an empty one
@@ -3493,9 +3498,20 @@ void Verifier::pcie_balance_window(int64_t steps, int G) {
     for (int64_t k = 0; k < steps; ++k) {
         const size_t i = (size_t) ((k / G) * 2 + k % G);
         if (!bal_ok_[i]) continue;
-        const unsigned long long ta = st[4 * i], tb = st[4 * i + 1], tw = st[4 * i + 2];
+        const unsigned long long* w = (const unsigned long long*) st + (size_t) kBalWords * i;
+        const unsigned long long ta = w[0], tb = w[1], tw = w[2];
         if (ta == 0 || tb < ta || tw < tb || tw - ta > 1000000000ull) continue;   // not stamped in this window
         M.sample(bal_nc_[i], bal_np_[i], bal_p_[i], (double) (tw - ta) * 1e-6);
+        // the GPU's own time in this step, every wait for the host left out (StageSpeed): from the previous layer's
+        // return from the CPU-rows wait to this layer's plan wait, the GPU's experts, then the PCIe part's - on the
+        // steps without PCIe experts (their transfer is a miss cost, priced apart)
+        if (k >= G && bal_np_[i] == 0) {
+            const unsigned long long a_in = w[3], b_out = w[4];
+            const unsigned long long r_prev = ((const unsigned long long*) st)[(size_t) kBalWords * (i - 2) + 5];
+            if (r_prev != 0 && a_in >= r_prev && ta >= a_in && b_out >= tb && tw >= b_out && a_in - r_prev < 100000000ull)
+                speed_.sample((double) bal_nv_[i], (double) (bal_nv_[i] + bal_nc_[i] + bal_np_[i]),
+                              (double) ((a_in - r_prev) + (tb - ta) + (tw - b_out)) * 1e-6);
+        }
     }
     M.solve();
 }
@@ -4088,7 +4104,7 @@ bool Verifier::batch_launch_rows(const int* rows, int S, int hbase, const int32_
     staging_deferred_ = false;
     if (!staged || !capture_deferred(rows, S, hbase, err)) return false;
     const auto key = bkey(rows, S, hbase);
-    if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // set_pcie_balance: this window's stamps only
+    if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * kBalWords * 8);   // set_pcie_balance: this window's stamps only
     cudaError_t le = cudaGraphLaunch(exec_bm_[key], cs_);
     if (le == cudaSuccess) le = cudaGraphLaunch(save_bm_[key], cs_);   // the rows the commit replays, kept for it
     if (le != cudaSuccess) { err = std::string("verify: batch launch: ") + cudaGetErrorString(le); return false; }
@@ -4584,7 +4600,7 @@ bool Verifier::batch_launch(int base, int S, const int32_t* tokens, const int64_
     for (int t = 0; t < S && t < 8; ++t) rows[t] = base + t;
     if (pre_launch_ && !pre_launch_(cs_, err)) return false;
     if (!stage_batch(rows, S, base, tokens, pos, err)) return false;
-    if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * 4 * 8);   // set_pcie_balance: this window's stamps only
+    if (h_bal_ != nullptr) std::memset(h_bal_, 0, (size_t) bal_p_.size() * kBalWords * 8);   // set_pcie_balance: this window's stamps only
     cudaError_t le = cudaGraphLaunch(exec_bm_[bkey(rows, S, base)], cs_);
     if (le == cudaSuccess && !batch_self_commits(rows, S))   // (else the window has kept its rows itself)
         le = cudaGraphLaunch(commit_bm_[bkey(rows, S, base)], cs_);   // right behind it: every row is kept
@@ -4637,6 +4653,7 @@ int Verifier::batch_serve(PoolMultiFn pool, void* user) {
             bal_ok_[bi] = *(volatile uint32_t*) h_flagA_ == want;
             bal_nc_[bi] = bal_ok_[bi] ? sink_.cpu_jobs : 0;
             bal_np_[bi] = bal_ok_[bi] ? sink_.counts[2] : 0;
+            bal_nv_[bi] = bal_ok_[bi] ? sink_.counts[0] : 0;
             bal_p_[bi] = ms_since(b);
             sink_.cpu_jobs = 0;
         }
