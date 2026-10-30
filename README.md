@@ -134,8 +134,34 @@ the short reads is on by default beside the slots on this fork, its fraction mea
 applies up to measured per size band (`STRATA_PREFILL_CPU_SHARE=0` turns it off). Give the engine headroom: the pool shares the card's free VRAM with everything else, and
 `--vram-reserve-mib 1536` is what keeps three or more long contexts from paging on 24 GB cards.
 
-**Known edges.** Every mapped page is pinned, so three or more conversations near 200K tokens can fill the pool and the next
-answer waits on evictions. The exchange's working-set window and minimum lend are tuned on our traffic, not derived.
+**Two cards of different sizes or speeds** (a 3090 with a 3080 Ti or a 3060). Use `--layer-split auto`, not a fixed
+number: a fixed `--layer-split 24` gives the smaller card half the layers, and with them half the K/V, while it has the
+least room for experts. Measured on our two 3090s with one held to 12 GB as a 3080 Ti stand-in (three-agent replay):
+
+| 24 GB + 12 GB | stock 0.2.7 | this fork |
+|---|---|---|
+| Q4_K_XL, `--layer-split 24` | does not start (the K/V carved up front leaves the draft model no room) | every answer, but agents wait for each other's room in the pool: 1,087 s |
+| Q4_K_XL, `--layer-split auto` (36/12) | 1,381 s | 949 s |
+| IQ4_XS, `--layer-split auto` (36/12) | 986 s | 623 s |
+
+On two full 3090s, `auto` (26/22) and `24` measured the same (571 and 558 s), so `auto` is right on both. On such a pair
+prefer IQ4_XS: its smaller experts let 30% more of them fit on the cards.
+
+- **A full K/V pool never refuses a request.** The pool first parks idle agents' conversations to RAM; if it is still
+  full while another agent is answering, the new request waits until an answer ends. An answer that finds no free page
+  is never cut either: that part of it ends as `preempt` and the server sends the same request again with what it
+  generated. Only a single conversation longer than the whole pool, with every other agent parked, is refused.
+- **`auto` learns the cards' real speeds.** On the first start it estimates each card from its SM count and rated clock,
+  and measures, while it serves, each card's GPU time per layer, its CPU time per missed expert and its whole time per
+  step. It writes them to `split-speed.txt` next to the expert profile when the slots go idle; every later start with
+  `auto` prices the splits from those numbers (the log says `the costs a run measured on these cards`). Change the cards
+  or the model and the first start estimates again. `STRATA_SPLIT_MEASURED=0` keeps the estimate alone,
+  `STRATA_SPLIT_SPEED_FILE=path` moves the file, `STRATA_SPLIT_TRACE=1` prints the price of every split. With one 3090
+  held to 1 GHz, the measured costs chose 29 layers on the fast card where 25 measured best (5% faster steps);
+  [docs/DETAILS.md](docs/DETAILS.md) has the numbers and what the model still leaves out.
+
+**Known edges.** Every mapped page is pinned, so three or more conversations near 200K tokens can fill the pool; the next
+admission then waits for an answer to end, and on a small card agents can spend minutes waiting for each other. The exchange's working-set window and minimum lend are tuned on our traffic, not derived.
 Unpinned mappings for idle slots and a fairer share rule near a full pool are the next steps.
 
 ---
