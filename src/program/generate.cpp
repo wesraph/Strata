@@ -1304,6 +1304,7 @@ struct SplitDrive {
     const uint8_t* cache_base[kMax] = {};
     const uint64_t* cache_slot_off[kMax] = {};
     int pcie_num[kMax] = {};
+    strata::core::PcieModel* pm[kMax] = {};   ///< STRATA_PCIE_BALANCE on a split: stage i's cost model (null: off)
 };
 void drive_pool_split_impl(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                            int64_t layer, strata::kernels::cpu::NativeArithmetic arithmetic) {
@@ -1315,6 +1316,7 @@ void drive_pool_split_impl(void* user, const float* x_f, const int32_t* ids, int
     d.d.cache_base = s->cache_base[st];
     d.d.cache_slot_off = s->cache_slot_off[st];
     d.d.pcie_num = s->pcie_num[st];
+    d.d.pcie_cur = s->pm[st];
     drive_pool_multi_impl(s->base, x_f, ids, n_tok, k, out, layer, arithmetic);
 }
 void drive_pool_split(void* u, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t l) {
@@ -10429,6 +10431,15 @@ int main(int argc, char** argv) {
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
         strata::core::Verifier ver_same;
         SplitDrive split_drive;
+        // A layer split (the batch slots included): each stage picks, per layer, how many of its missed experts its GPU
+        // reads over PCIe and how many the CPU computes, from that stage's measured costs (PcieModel: the CPU's time per
+        // expert, the GPU's per PCIe expert), instead of --pcie-frac's fixed share - which stays the start, until the
+        // stage's fits have samples.  The right share depends on the link, the CPU and the pack; this finds it.
+        // 2x RTX 3090 (x8 links, Ryzen 9 5900X), three slots at 41K: equal to the best fixed share on IQ4_XS and
+        // Q4_K_XL, never below it (docs/DETAILS.md).  STRATA_PCIE_BALANCE=0: the fixed share, as before.
+        std::array<strata::core::PcieModel, SplitDrive::kMax> stage_pm{};
+        const bool split_balance = [] { const char* e = std::getenv("STRATA_PCIE_BALANCE"); return e == nullptr || std::strcmp(e, "0") != 0; }() &&
+                                   native_pack;
         auto stage_ver = [&](int st) -> strata::core::Verifier& {
             return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
         };
@@ -10519,7 +10530,15 @@ int main(int argc, char** argv) {
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
                 split_drive.pcie_num[st] = pcie_num_of(o.pcie_frac);
+                if (split_balance) {
+                    split_drive.pm[st] = &stage_pm[(size_t) st];
+                    stage_ver(st).set_pcie_balance(split_drive.pm[st]);
+                }
             }
+            if (split_balance)
+                std::fprintf(stderr, "strata serve: PCIe balance: each of the %d stages picks its PCIe experts per layer from its "
+                                     "measured CPU and PCIe costs (--pcie-frac %.2f until its fits have samples; STRATA_PCIE_BALANCE=0: fixed)\n",
+                             n_stages, o.pcie_frac);
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
@@ -10588,6 +10607,7 @@ int main(int argc, char** argv) {
                 vs.blob = thits.blob;
                 vs.slot_off = gs.cache.slot_offsets();
                 vs.n_slots = gs.cache.slots();
+                if (split_drive.pm[st] != nullptr) gs.ver_b.set_pcie_balance(split_drive.pm[st]);
                 if (!gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, o.spec, err)) {
                     std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA%d (stage %d): %s "
                                          "(raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n",
@@ -10608,6 +10628,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+            if (split_drive.pm[0] != nullptr) ver_b.set_pcie_balance(split_drive.pm[0]);
             if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
                 std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA0 (the first card): "
                                      "%s (raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n", err.c_str());
@@ -13625,6 +13646,10 @@ int main(int argc, char** argv) {
             // #879: it was running when non-finite logits dropped the cached state; its state may have started from
             // that state (a checkpoint, a parked conversation), so it is not kept as a cache when it ends
             bool tainted = false;
+            // --kv-share: the pool had no page for its next window while another slot held pages: this leg of the answer
+            // ends as "preempt" (its conversation stays in the slot, its pages keyed) and the server admits the same
+            // request again with what it generated - that admission waits for room, the answer does not end
+            bool preempt = false;
             ConvCheckpoint::PromptPlan partial_plan;   ///< --prefill-pipe: the segment it stopped in, read on in its chunks
         };
         std::vector<BSlot> bs((size_t) std::max(o.batch, 0));
@@ -13663,6 +13688,26 @@ int main(int argc, char** argv) {
         int admit_slot = -1;               ///< the slot the request being read will continue in (BGEN)
         long long admit_max_new = 0;
         auto batch_on = [&] { for (const BSlot& b : bs) if (b.active) return true; return false; };
+        // --kv-share: pages that session si does not hold and an admission could free - another batch slot's own pages
+        // (an active slot's when it ends, an idle one's when it is parked).  The main session's are left out: they are
+        // the admission's own, and the slot it fed shares the keyed ones
+        auto kvsh_others_hold = [&](size_t si) -> bool {
+            for (size_t j = 1; j < kvshs.sess.size(); ++j)
+                if (j != si && !kvshs.sess[j].own.empty()) return true;
+            return false;
+        };
+        // a slot whose next window has no page: the leg ends (preempt) when another slot holds pages that a wait or a
+        // park frees - the server then admits the request again, and that admission waits for room - and only when
+        // none does is it the pool's whole capacity: the answer ends there, as at the end of the context
+        auto kvsh_no_page = [&](BSlot& sl, size_t si) {
+            // (the window still makes one token: a preempt only when the answer has more to make after it)
+            sl.preempt = sl.produced + 1 < sl.max_new && kvsh_others_hold(si);
+            sl.max_new = sl.produced;
+            std::fprintf(stderr, "strata serve: --kv-share: no page for slot %d's next window: %s\n", (int) si - 1,
+                         sl.preempt ? "this leg of its answer ends (preempt) and the server admits it again, which waits "
+                                      "for room"
+                                    : "no other slot holds pages, so its answer ends here (the pool's whole capacity)");
+        };
         auto try_next_line = [&](std::string& out) -> bool {
             std::lock_guard<std::mutex> lk(in_mu);
             if (in_lines.empty()) return false;
@@ -13728,7 +13773,11 @@ int main(int argc, char** argv) {
             }
             if (kvsh) {   // the receiving session takes the conversation's mapping before anything moves: the
                           // copy writes its cells, so nothing of the receiver's old mapping is valid (0), and the
-                          // pages below `upto` the cache holds (the giver's keyed ones) are shared, not copied
+                          // pages below `upto` the cache holds (the giver's keyed ones) are shared, not copied.
+                          // The giver's pages are keyed first: what it decoded is not yet (only a read keys its
+                          // pages), and a hand-over then needed a fresh page for every page of the answer - which a
+                          // full pool does not have when a preempted answer comes back
+                kvsh_register(into_slot ? 0 : (size_t) b + 1, ids, upto);
                 if (into_slot) {
                     if (!kvsh_admit((size_t) b + 1, nullptr, &ids, 0, upto, upto + growth)) { e = "batch slot copy: the K/V pool is full"; return false; }
                 } else {
@@ -13792,7 +13841,8 @@ int main(int argc, char** argv) {
                 // own), so the stages do not queue behind each other.
                 say_shuttle();
                 if (kvsh) {   // the slot takes the conversation's mapping (once: the stage bodies run in parallel);
-                              // the shared pages move nowhere
+                              // the shared pages move nowhere (main's keyed first, as in direct_slot_copy)
+                    kvsh_register(0, ids, upto);
                     if (!kvsh_admit((size_t) b + 1, nullptr, &ids, 0, upto, upto + growth)) { e = "batch admission: the K/V pool is full"; return false; }
                 }
                 auto stage_copy = [&](size_t k, std::string& se) -> bool {
@@ -13867,6 +13917,7 @@ int main(int argc, char** argv) {
                               // they may run in parallel).  A checkpoint give-back leaves the slot its mapping (it
                               // goes on past the checkpoint, or stays a longer source); a whole-conversation
                               // give-back's slot is dropped by the caller, and its pages return then
+                    kvsh_register((size_t) b + 1, bs[(size_t) b].ids, upto);   // (the slot's keyed first, as in direct_slot_copy)
                     if (!kvsh_admit(0, nullptr, &bs[(size_t) b].ids, 0, upto, upto)) { e = "batch slot restore: the K/V pool is full"; return false; }
                 }
                 auto stage_copy = [&](size_t k, std::string& se) -> bool {
@@ -14003,7 +14054,7 @@ int main(int argc, char** argv) {
                         const int64_t want = sl.p + 2 + 8;
                         if (kvshs.sess[(size_t) b + 1].mapped() * kvsh_ps < want &&
                             !kvsh_extend((size_t) b + 1, want + 4096) && !kvsh_extend((size_t) b + 1, want))
-                            sl.max_new = sl.produced;
+                            kvsh_no_page(sl, (size_t) b + 1);
                     }
                     first[A] = S;
                     active[A++] = b;
@@ -14139,11 +14190,12 @@ int main(int argc, char** argv) {
                     ++sl.produced;
                     ++stats.tg;
                     const bool eos = !sl.no_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
-                    const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                    const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? (sl.preempt ? "preempt" : "length")
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", b, (long long) sl.produced, fin, ms);
+                        if (sl.preempt) kvsh_register((size_t) b + 1, sl.ids, (int64_t) sl.ids.size());
                         kvsh_idle_t0 = std::chrono::steady_clock::now();
                         sl.active = false;
                         sl.cached = o.prompt_cache > 0 && !sl.img && !sl.tainted;
@@ -14310,6 +14362,21 @@ int main(int argc, char** argv) {
                 }
         }
         // the chain of slot b has landed: its proposals are the slot's next drafts (1), still drafting (0), or an error (-1)
+        // STRATA_PIPE_TRACE=1: where a pipelined group-step's wall goes - per step, summed over the groups: each
+        // stage's in-flight time, the hand-off between stages, the verdict and emit, the wait for the slots' draft
+        // chains, and the time a group sat ready before stage 0 took it - with the pump period and why starts were
+        // skipped.  One line per 400 group-steps.  Unset: nothing is timed.
+        static const bool pt_on = std::getenv("STRATA_PIPE_TRACE") != nullptr;
+        struct PtGroup { Clock::time_point launch[8]{}, done[8]{}, verdict{}; bool cycled = false; };
+        std::vector<PtGroup> ptg(pg.size());
+        std::vector<Clock::time_point> pt_draft_done((size_t) std::max(o.batch, 1));
+        double pt_stage[8] = {}, pt_hand = 0, pt_verdict = 0, pt_draft = 0, pt_period = 0, pt_period_max = 0;
+        // the pump periods of pure decoding (no read, no drain): how much of them each stage held a group, and what
+        // a group not in flight was doing (ready for stage 0, its draft chains running, no active slot)
+        double pt_dec = 0, pt_nondec = 0, pt_busy[8] = {}, pt_g_ready = 0, pt_g_draft = 0, pt_g_inactive = 0;
+        int64_t pt_steps = 0, pt_pumps = 0, pt_skip_quiet = 0, pt_skip_adapt = 0, pt_skip_notready = 0, pt_skip_inactive = 0;
+        Clock::time_point pt_prev{}, pt_win0{};
+        auto pt_ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
         auto pmtp_poll_draft = [&](int b, bool wait) -> int {
             if (!pm_drafting[(size_t) b]) return 1;
             for (;;) {
@@ -14319,6 +14386,7 @@ int main(int argc, char** argv) {
                 if (!wait) return 0;
             }
             pm_drafting[(size_t) b] = 0;
+            if (pt_on) pt_draft_done[(size_t) b] = Clock::now();
             // the first proposal always; another while the draft layer was at least --spec-min-p sure of the one before
             // (the solo path's rule, MtpDrafter::draft)
             BSlot& sl = bs[(size_t) b];
@@ -14393,12 +14461,13 @@ int main(int argc, char** argv) {
                     ++stats.tg;
                     ++bt_rows;
                     ++pipe_rows;
-                    const char* fin = is_eos(y, sl) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                    const char* fin = is_eos(y, sl) ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? (sl.preempt ? "preempt" : "length")
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     sl.ids.push_back(G.tok[blk.f + j]);
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", blk.b, (long long) sl.produced, fin, ms);
+                        if (sl.preempt) kvsh_register((size_t) blk.b + 1, sl.ids, (int64_t) sl.ids.size());
                         sl.active = false;
                         sl.draft_ready = false;
                         // a cache again (#857), as on the pipelined path without drafts: final once its commits have run
@@ -14537,6 +14606,27 @@ int main(int argc, char** argv) {
         };
         auto pump = [&](bool may_start) -> bool {
             ++pipe_tick;
+            if (pt_on) {
+                const Clock::time_point now = Clock::now();
+                if (pt_prev != Clock::time_point{}) {
+                    const double d = pt_ms(pt_prev, now);
+                    pt_period += d; pt_period_max = std::max(pt_period_max, d); ++pt_pumps;
+                    // (a period over 100 ms is a read or a drain the pump sat out, whatever this pump's state is)
+                    if (may_start && !in_prompt_read && d < 100.0) {
+                        pt_dec += d;
+                        for (int q = 0; q < n_pipe && q < 8; ++q) if (stage_group[(size_t) q] >= 0) pt_busy[q] += d;
+                        for (int gi = 0; gi < (int) pg.size(); ++gi) {
+                            if (pg[(size_t) gi].inflight) continue;
+                            if (!group_active(gi)) { pt_g_inactive += d; continue; }
+                            bool drafting = false;
+                            if (pmtp) for (int t = 0; t < GS; ++t) if (pm_drafting[(size_t) (gi * GS + t)]) drafting = true;
+                            if (drafting) pt_g_draft += d; else pt_g_ready += d;
+                        }
+                    } else pt_nondec += d;
+                }
+                pt_prev = now;
+                if (pt_win0 == Clock::time_point{}) pt_win0 = now;
+            }
             stats_refresh();
             { std::string se; if (!refill_settle(false, se)) { std::printf("ERR %s\n", se.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", se.c_str()); return false; } }
             if (kvsh_need_quiet && !pipe_inflight()) {   // the pipeline emptied for a slot's growth: the reserve refills
@@ -14561,6 +14651,7 @@ int main(int argc, char** argv) {
                 if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
                 stage_group[(size_t) k] = -1;
                 PGroup& G = pg[(size_t) gi];
+                if (pt_on && k < 8) { ptg[(size_t) gi].done[k] = Clock::now(); pt_stage[k] += pt_ms(ptg[(size_t) gi].launch[k], ptg[(size_t) gi].done[k]); }
                 if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
                 // the last stage: the group's picks
                 const int32_t* outb = vk.batch_out();
@@ -14587,12 +14678,13 @@ int main(int argc, char** argv) {
                     ++bt_rows;
                     ++pipe_rows;
                     const bool eos = !sl.no_eos && std::find(o.eos_ids.begin(), o.eos_ids.end(), (int64_t) y) != o.eos_ids.end();
-                    const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? "length"
+                    const char* fin = eos ? "stop" : sl.stop ? "cancel" : sl.produced >= sl.max_new ? (sl.preempt ? "preempt" : "length")
                                     : sl.p + 2 > o.max_context ? "length" : nullptr;
                     sl.ids.push_back(sl.x);
                     if (fin != nullptr) {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - sl.t0).count();
                         std::printf("BDONE %d %lld %s %.1f\n", gi * GS + t, (long long) sl.produced, fin, ms);
+                        if (sl.preempt) kvsh_register((size_t) (gi * GS + t) + 1, sl.ids, (int64_t) sl.ids.size());
                         sl.active = false;
                         // a pipelined slot is a cache again (#857: a request left alone in its slot goes back to the solo path with its
                         // drafts): its state is final once its last window has left the last stage.  A later group window whose pad
@@ -14608,6 +14700,30 @@ int main(int argc, char** argv) {
                     std::fprintf(stderr, "strata trace: first rows %.1f ms after %s\n",
                                  std::chrono::duration<double, std::milli>(Clock::now() - rows_wait_t).count(), rows_wait);
                     rows_wait = nullptr;
+                }
+                if (pt_on && k < 8) {
+                    PtGroup& P = ptg[(size_t) gi];
+                    P.verdict = Clock::now();
+                    pt_verdict += pt_ms(P.done[k], P.verdict);
+                    P.cycled = true;
+                    if (++pt_steps % 400 == 0) {
+                        const Clock::time_point now = Clock::now();
+                        std::string st;
+                        for (int q = 0; q < n_pipe && q < 8; ++q) { char b[48]; std::snprintf(b, sizeof b, " stage%d %.1f", q, pt_stage[q] / 400); st += b; pt_stage[q] = 0; }
+                        std::string bu;
+                        for (int q = 0; q < n_pipe && q < 8; ++q) { char b[48]; std::snprintf(b, sizeof b, " stage%d %.0f%%", q, 100.0 * pt_busy[q] / std::max(pt_dec, 1e-9)); bu += b; pt_busy[q] = 0; }
+                        std::fprintf(stderr, "strata pipe trace: 400 group-steps in %.0f ms (%.1f per step): per step%s, hand-off %.1f, verdict+emit %.1f, "
+                                             "draft wait %.1f ms; pure decoding %.0f ms (%.0f in reads or drains): a group held%s; a group not in flight was "
+                                             "ready %.0f, drafting %.0f, inactive %.0f ms; pump period mean %.3f max %.1f ms over %lld pumps; "
+                                             "starts skipped: pages quiet %lld, drain %lld, drafts not ready %lld, no active group %lld\n",
+                                     pt_ms(pt_win0, now), pt_ms(pt_win0, now) / 400, st.c_str(), pt_hand / 400, pt_verdict / 400, pt_draft / 400,
+                                     pt_dec, pt_nondec, bu.c_str(), pt_g_ready, pt_g_draft, pt_g_inactive,
+                                     pt_pumps > 0 ? pt_period / (double) pt_pumps : 0.0, pt_period_max, (long long) pt_pumps,
+                                     (long long) pt_skip_quiet, (long long) pt_skip_adapt, (long long) pt_skip_notready, (long long) pt_skip_inactive);
+                        pt_hand = pt_verdict = pt_draft = pt_period = pt_period_max = pt_dec = pt_nondec = pt_g_ready = pt_g_draft = pt_g_inactive = 0;
+                        pt_pumps = pt_skip_quiet = pt_skip_adapt = pt_skip_notready = pt_skip_inactive = 0;
+                        pt_win0 = now;
+                    }
                 }
                 ++bt_windows;
                 ++pa_windows;
@@ -14625,11 +14741,11 @@ int main(int argc, char** argv) {
                             pick = gi;
                     if (pick < 0) continue;
                 } else {
-                    if (!may_start || pa_due()) continue;   // STRATA_PIPE_ADAPT_EVERY: a round is due, the pipeline empties first
-                    if (kvsh_need_quiet) continue;          // a slot's growth waits for an empty pipeline (the reserve refills there)
+                    if (!may_start || pa_due()) { if (pt_on && !may_start) ++pt_skip_adapt; continue; }   // STRATA_PIPE_ADAPT_EVERY: a round is due, the pipeline empties first
+                    if (kvsh_need_quiet) { if (pt_on) ++pt_skip_quiet; continue; }          // a slot's growth waits for an empty pipeline (the reserve refills there)
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
-                        if (pg[(size_t) gi].inflight || !group_active(gi)) continue;
+                        if (pg[(size_t) gi].inflight || !group_active(gi)) { if (pt_on && !pg[(size_t) gi].inflight) ++pt_skip_inactive; continue; }
                         if (pmtp) {   // its slots' proposal chains still running: another group goes first
                             bool ready = true;
                             for (int t = 0; t < GS; ++t) {
@@ -14637,7 +14753,7 @@ int main(int argc, char** argv) {
                                 if (dr < 0) return false;
                                 if (dr == 0) { ready = false; break; }
                             }
-                            if (!ready) continue;
+                            if (!ready) { if (pt_on) ++pt_skip_notready; continue; }
                         }
                         pick = gi;
                     }
@@ -14675,7 +14791,7 @@ int main(int argc, char** argv) {
                                         kvsh_need_quiet = true;
                                     if (!kvsh_extend(si, want)) {
                                         if (pipe_inflight()) continue;
-                                        bs[(size_t) b].max_new = bs[(size_t) b].produced;
+                                        kvsh_no_page(bs[(size_t) b], si);
                                     }
                                 }
                                 kv_room = kvshs.sess[si].mapped() * kvsh_ps - 1 - sl.p;
@@ -14709,7 +14825,7 @@ int main(int argc, char** argv) {
                                 const int64_t want = sl.p + 2 + 8;
                                 if (kvshs.sess[si].mapped() * kvsh_ps < want &&
                                     !kvsh_extend(si, want + 4096) && !kvsh_extend(si, want))
-                                    sl.max_new = sl.produced;
+                                    kvsh_no_page(sl, si);
                             }
                             G.tok[t] = sl.active ? sl.x : 0;
                             G.pos[t] = sl.active ? sl.p : 0;
@@ -14731,6 +14847,20 @@ int main(int argc, char** argv) {
                 PGroup& G = pg[(size_t) pick];
                 strata::core::progress().busy.store(true);
                 if (batch_telemetry_enabled) stage_in_flight.launch(k, Clock::now());
+                if (pt_on && k < 8) {
+                    PtGroup& P = ptg[(size_t) pick];
+                    const Clock::time_point now = Clock::now();
+                    P.launch[k] = now;
+                    if (k > 0) pt_hand += pt_ms(P.done[k - 1], now);
+                    else if (P.cycled) {   // the group's step after its last verdict: the draft chains, then the wait for stage 0
+                        Clock::time_point ready = P.verdict;
+                        for (int t = 0; t < GS; ++t) {
+                            const Clock::time_point d = pt_draft_done[(size_t) (pick * GS + t)];
+                            if (d > ready && d <= now) ready = d;
+                        }
+                        pt_draft += pt_ms(P.verdict, ready);
+                    }
+                }
                 if (!(prows ? stage_verifier(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err)
                            : stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err))) {
                     std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());
@@ -14783,6 +14913,11 @@ int main(int argc, char** argv) {
                 if (pmtp)
                     std::fprintf(stderr, " (%lld of %lld MTP proposals kept)", (long long) bt_accepted, (long long) bt_tokens);
                 std::fprintf(stderr, "\n");
+                for (int st = 0; st < split_drive.n; ++st)   // STRATA_PCIE_BALANCE: each stage's fits (ms)
+                    if (const strata::core::PcieModel* pm = split_drive.pm[st]; pm != nullptr && pm->ready())
+                        std::fprintf(stderr, "strata batch PCIe balance, stage %d: CPU %.3f + %.3f per expert (+%.3f per PCIe one), "
+                                             "GPU %.3f + %.3f per PCIe expert (%d / %d samples)\n",
+                                     st + 1, pm->a, pm->c, pm->d, pm->g0, pm->g, pm->ncpu, pm->ngpu);
                 pa_rounds = pa_swaps = 0;
                 pa_ms = 0;
                 for (int k = 0; k < n_pipe; ++k) {
@@ -15069,13 +15204,100 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "strata serve: conversation cache: the parked image carried no draft K/V: the drafter's ring "
                                  "starts empty at %lld\n", (long long) at);
         };
+        // --kv-share: an admission the pool cannot hold yet WAITS here while slots decode - it is never refused for a
+        // full pool.  One at a time: the server sends the next admission only after this one's BADM.  It is read again
+        // when a slot's answer has ended since (its pages return, or the admission's park frees them), and at once when
+        // no slot decodes any more; a STOP cancels it and a BYIELD gives way, with the lines the server reads for those.
+        struct KvshWait {
+            bool on = false;
+            std::string line;          ///< the admission as the server sent it (BGEN ...)
+            int slot = -1;
+            uint64_t ends = 0;         ///< kvsh_ends when it was put back
+            Clock::time_point since;   ///< its first refusal
+            int tries = 0;
+        } kvsh_wait;
+        uint64_t kvsh_ends = 0;        ///< slots' answers that ended while an admission waited
+        std::vector<char> kvsh_was_active(bs.size(), 0);
+        // the waiting admission ends without a read (cancelled, or giving way): the end of an admission that made
+        // nothing, as the server reads it - DONE, then BADM <slot> 0
+        auto kvsh_wait_end = [&](const char* finish) {
+            std::printf("DONE 0 0 0.0 0.0 %s 0 0 0 0 0 0 0 0.0 0 0\n", finish);
+            std::printf("BADM %d 0\n", kvsh_wait.slot);
+            std::fflush(stdout);
+            kvsh_wait = KvshWait{};
+        };
+        // what idle batch slots hold, freed until `again()` admits: a slot whose conversation ended returns its pages,
+        // a cached one is parked to the host cache (`park`; else dropped - it reads again when it returns), one that
+        // cannot be parked (pictures) is dropped.  Active slots and a read that gave way keep theirs.
+        auto kvsh_free_idle = [&](const std::function<bool()>& again, const char* why, bool park) -> bool {
+            for (int b = 0; b < o.batch; ++b) {
+                BSlot& sb = bs[(size_t) b];
+                const size_t held = kvshs.sess[(size_t) b + 1].cached.size() + kvshs.sess[(size_t) b + 1].own.size();
+                if (held == 0 || sb.active || sb.partial) continue;
+                if (park && sb.cached && !sb.img && sb.ids.size() >= 2) {
+                    (void) park_slot_conversation(b, why);
+                } else {
+                    std::fprintf(stderr, "strata serve: --kv-share: %s: freed the %zu pages of idle slot %d (%s)\n", why,
+                                 held, b, !sb.cached ? "its conversation had ended"
+                                          : sb.img ? "its conversation has pictures; it reads again when it returns"
+                                                   : "it reads again when it returns");
+                    kvsh_release((size_t) b + 1);
+                    sb.cached = false;
+                    sb.ids.clear();
+                    sb.checks.clear();
+                }
+                if (again()) return true;
+            }
+            return false;
+        };
         for (;;) {
             line_drain_ms = 0.0;
             stats.main_gen = 0;   // between requests: the non-batch path is not decoding
             stats_refresh();
             { std::string se; if (!refill_settle(false, se)) { std::fprintf(stderr, "strata serve: the serve loop ends: %s\n", se.c_str()); return 1; } }
+            bool from_wait = false;   // this line is the admission that waited for room (kvsh_wait)
+            std::string adm_line;     // a batch admission's line as the server sent it (before it is read as a GEN 1)
+            // --kv-share: the pool cannot hold this admission now: while a slot decodes it waits (kvsh_wait) and is
+            // read again once a slot's answer ends; false when nothing decodes (no answer will end to free pages)
+            auto kvsh_defer = [&](const char* what) -> bool {
+                if (admit_slot < 0 || adm_line.empty() || !batch_on()) return false;
+                if (!from_wait) { kvsh_wait.since = Clock::now(); kvsh_wait.tries = 0; }
+                kvsh_wait.on = true;
+                kvsh_wait.line = std::move(adm_line);
+                kvsh_wait.slot = admit_slot;
+                kvsh_wait.ends = kvsh_ends;
+                ++kvsh_wait.tries;
+                for (size_t b = 0; b < bs.size(); ++b) kvsh_was_active[b] = bs[b].active;
+                int decoding = 0;
+                for (const BSlot& b : bs) decoding += b.active ? 1 : 0;
+                std::fprintf(stderr, "strata serve: --kv-share: no room in the K/V pool for %s of slot %d's admission "
+                                     "(%lld of %lld pages free, %d slot%s decoding): it waits for an answer to end "
+                                     "(wait %d, %.1f s so far)\n", what, admit_slot, (long long) kv_pages.free_count(),
+                             (long long) kv_pages.total(), decoding, decoding == 1 ? "" : "s", kvsh_wait.tries,
+                             std::chrono::duration<double>(Clock::now() - kvsh_wait.since).count());
+                return true;
+            };
+            if (kvsh_wait.on) {
+                for (size_t b = 0; b < bs.size(); ++b) {
+                    if (kvsh_was_active[b] && !bs[b].active) ++kvsh_ends;
+                    kvsh_was_active[b] = bs[b].active;
+                }
+                if (stop_req.load()) {   // its client left: the STOP was for it (the server holds no other admission)
+                    stop_req.store(false);
+                    std::fprintf(stderr, "strata serve: --kv-share: the admission into slot %d that waited %.1f s for "
+                                         "room was cancelled\n", kvsh_wait.slot,
+                                 std::chrono::duration<double>(Clock::now() - kvsh_wait.since).count());
+                    kvsh_wait_end("cancel");
+                    continue;
+                }
+                if (kvsh_ends != kvsh_wait.ends || !batch_on()) {
+                    line = std::move(kvsh_wait.line);
+                    kvsh_wait.on = false;   // (its slot, start and tries stay for the log if it waits again)
+                    from_wait = true;
+                }
+            }
             if (batch_on() || (piped && pipe_inflight())) {
-                if (!try_next_line(line)) {
+                if (!from_wait && !try_next_line(line)) {
                     if (!(piped ? pump(true) : batch_step())) return 1;
                     continue;
                 }
@@ -15105,7 +15327,7 @@ int main(int argc, char** argv) {
                 stats_refresh_t = Clock::time_point{};
                 stats_refresh();
                 if (pmtp && !pmtp_settle()) { std::fprintf(stderr, "strata serve: the serve loop ends: the pipelined drafts did not settle (see the ERR above)\n"); return 1; }
-                if (!next_line(line))
+                if (!from_wait && !next_line(line))
                     break;
                 stats.read_mark_us = stats_us();   // the wait for the line is not reading time
             }
@@ -15114,6 +15336,15 @@ int main(int argc, char** argv) {
             if (line.rfind("BSTOP ", 0) == 0) {
                 const int b = std::atoi(line.c_str() + 6);
                 if (b >= 0 && b < (int) bs.size()) bs[(size_t) b].stop = true;
+                continue;
+            }
+            if (line.rfind("BYIELD", 0) == 0 && kvsh_wait.on && std::atoi(line.c_str() + 6) == kvsh_wait.slot) {
+                // the admission waiting for room gives way to the shorter request (which may fit): nothing was read,
+                // so the server sends it again after that one
+                std::fprintf(stderr, "strata serve: --kv-share: the admission into slot %d that waits for room gives "
+                                     "way (BYIELD)\n", kvsh_wait.slot);
+                std::printf("YIELDED %d 0\n", kvsh_wait.slot);
+                kvsh_wait_end("cancel");
                 continue;
             }
             if (line.rfind("BYIELD", 0) == 0) {   // for a prompt read that has ended meanwhile
@@ -15151,6 +15382,7 @@ int main(int argc, char** argv) {
                 admit_slot = (int) b;
                 admit_max_new = mn;
                 adm_drain_ms = line_drain_ms;
+                if (kvsh) adm_line = line;   // (kept for a wait for room: kvsh_defer)
                 line = std::string(bimg ? "GENI 1" : "GEN 1") + e2;
             }
             // #477: every --expert-profile-save-every minutes, before the next request (at QUIT: after the loop)
@@ -15189,7 +15421,8 @@ int main(int argc, char** argv) {
                     }
                 }
             }
-            stop_req.store(false);   // a STOP that arrived between requests is stale
+            if (!from_wait) stop_req.store(false);   // a STOP that arrived between requests is stale (not one for the
+                                                     // admission that waited: it ends that one at its first chunk)
             err.clear();
             // Disk sessions: SAVE <path> | RESTORE <path>, between requests (the path runs to the end of the line,
             // UTF-8).  The file holds what a parked conversation holds (conversation_file.hpp).  Answers: SAVED /
@@ -16160,11 +16393,16 @@ int main(int argc, char** argv) {
                 // --kv-share: the mapping this REQUEST's conversation will carry, decided once here - the
                 // restores below and the read that follows must never disagree about it (a donor prefix that
                 // tokenizes differently at its boundary is read privately, correctly)
-                if (!kvsh_decide_main(ids, parked.tokens, n)) {
-                    std::printf("ERR the K/V pool has no room for this conversation (%lld of %lld pages free)\n",
+                // (the wait first, then idle slots dropped, not parked: `donor` points into the conversation cache,
+                // which a park can evict)
+                if (!kvsh_decide_main(ids, parked.tokens, n) && !kvsh_defer("the borrowed prefix") &&
+                    !kvsh_free_idle([&] { return kvsh_decide_main(ids, parked.tokens, n); }, "pool full", false)) {
+                    std::printf("ERR the K/V pool cannot hold this conversation (%lld of %lld pages free): no agent is "
+                                "decoding and the idle ones were freed, so it is longer than the pool can hold\n",
                                 (long long) kv_pages.free_count(), (long long) kv_pages.total());
                     continue;
                 }
+                if (kvsh_wait.on) continue;   // it waits for room (kvsh_defer)
                 // the image left its keyed pages out (pool_skip): the ones this request needs (below its resume
                 // point) must be held - cached from the pool or the swap, or the private copy of the partial page;
                 // the rest of the skipped pages are rewritten by the read.  The restore skips at least pool_skip
@@ -16208,9 +16446,18 @@ int main(int argc, char** argv) {
             }
             if (incoming) {
                 const auto t0 = Clock::now();
-                if (!kvsh_decide_main(ids, parked.tokens, n)) {
-                    std::printf("ERR the K/V pool has no room for this conversation (%lld of %lld pages free)\n",
+                // (idle slots parked first: `incoming` is this request's own, out of the cache; then the wait)
+                if (!kvsh_decide_main(ids, parked.tokens, n) &&
+                    !kvsh_free_idle([&] { return kvsh_decide_main(ids, parked.tokens, n); }, "pool full", true) &&
+                    !kvsh_defer("the parked conversation")) {
+                    std::printf("ERR the K/V pool cannot hold this conversation (%lld of %lld pages free): the idle "
+                                "agents were parked and none is decoding, so it is longer than the pool can hold\n",
                                 (long long) kv_pages.free_count(), (long long) kv_pages.total());
+                    (void) conversations.put(std::move(*incoming));   // it stays parked
+                    continue;
+                }
+                if (kvsh_wait.on) {   // it waits for room (kvsh_defer): the conversation goes back to the host cache
+                    (void) conversations.put(std::move(*incoming));
                     continue;
                 }
                 const int64_t kvsh_held = (int64_t) kvshs.sess[0].cached.size() + (kvshs.sess[0].cow_partial ? 1 : 0);
@@ -17467,13 +17714,14 @@ int main(int argc, char** argv) {
             // --kv-share: admit this conversation into the main session's mapping - its whole need, the
             // generation included (a page the decode would write must exist before it writes: the table's
             // -1 past the allocation would drop the write).  The leading pages the prefix cache already
-            // holds are mapped (no read, no copy); a pool that cannot hold the whole thing even after
-            // eviction refuses the request.
+            // holds are mapped (no read, no copy).  A pool that cannot hold it parks the idle slots' conversations
+            // to the host cache first; while a slot decodes, the admission then WAITS for an answer to end
+            // (kvsh_defer) - it is never refused for a full pool.  Only with nothing decoding and every idle slot
+            // freed is it longer than the whole pool, and refused.
             if (kvsh) {
-                if (!kvsh_admit(0, &ids, nullptr, read_from, read_from, n + kvsh_headroom(max_new))) {
-                    // what pins the pool, session by session (main first, then batch slots): the number a
-                    // preemption would free.  Slots' conversations cannot simply be dropped - their K/V must
-                    // go to the host cache first (park-from-slot), which is the designed follow-up.
+                auto admit_main = [&] { return kvsh_admit(0, &ids, nullptr, read_from, read_from, n + kvsh_headroom(max_new)); };
+                if (!admit_main()) {
+                    // what pins the pool, session by session (main first, then batch slots), for the log lines
                     std::string pins;
                     for (size_t si = 0; si < kvshs.sess.size(); ++si) {
                         const size_t held = kvshs.sess[si].cached.size() + kvshs.sess[si].own.size();
@@ -17481,31 +17729,14 @@ int main(int argc, char** argv) {
                             pins += si == 0 ? " main:" + std::to_string(held)
                                             : " slot" + std::to_string(si - 1) + ":" + std::to_string(held);
                     }
-                    // PREEMPT-BY-PARK: an idle slot's conversation is parked to the host cache (best
-                    // effort) and its pages freed, until this conversation fits.  Active or yielded slots,
-                    // and picture conversations (their image identity cannot be rebuilt here), are left.
-                    bool admitted = false;
-                    for (int b = 0; b < o.batch && !admitted; ++b) {
-                        const auto& sb = bs[(size_t) b];
-                        const size_t held = kvshs.sess[(size_t) b + 1].cached.size() +
-                                            kvshs.sess[(size_t) b + 1].own.size();
-                        if (held == 0) continue;
-                        if (!sb.cached && !sb.active && !sb.partial) {
-                            // a slot whose conversation was dropped keeps its pages until its next admission:
-                            // nothing to park, the pages simply return
-                            kvsh_release((size_t) b + 1);
-                            std::fprintf(stderr, "strata serve: --kv-share: pool full; freed the %zu pages of idle "
-                                                 "slot %d (its conversation had ended)\n", held, b);
-                            admitted = kvsh_admit(0, &ids, nullptr, read_from, read_from, n + kvsh_headroom(max_new));
-                            continue;
-                        }
-                        if (!sb.cached || sb.img || sb.partial || sb.ids.size() < 2) continue;
-                        (void) park_slot_conversation(b, "pool full");
-                        admitted = kvsh_admit(0, &ids, nullptr, read_from, read_from, n + kvsh_headroom(max_new));
-                    }
-                    if (!admitted) {
-                        std::printf("ERR the K/V pool has no room for this conversation: %lld of %lld pages free, "
-                                    "pages held:%s (shorten it, raise --kv-share, or free an agent)\n",
+                    // PREEMPT-BY-PARK: an idle slot's conversation is parked to the host cache (best effort) and its
+                    // pages freed, until this conversation fits; one with pictures (its image identity cannot be
+                    // rebuilt here) is dropped.  Active slots and a read that gave way keep theirs
+                    if (!kvsh_free_idle(admit_main, "pool full", true)) {
+                        if (kvsh_defer("the prompt")) continue;
+                        std::printf("ERR the K/V pool cannot hold this conversation: %lld of %lld pages free, pages "
+                                    "held:%s; the idle agents were parked and none is decoding, so it is longer than "
+                                    "the pool can hold (shorten it, or give the pool more VRAM)\n",
                                     (long long) kv_pages.free_count(), (long long) kv_pages.total(), pins.c_str());
                         continue;   // this request only, as the context-window refusal above
                     }
@@ -18266,8 +18497,13 @@ int main(int argc, char** argv) {
                         if (st == 0 && kvsh && kvshs.sess[0].mapped() * kvsh_ps < A.p + A.T + 8 &&   // --kv-share: pages
                             !kvsh_extend(0, A.p + A.T + 8 + 4096) && !kvsh_extend(0, A.p + A.T + 8) &&
                             kvshs.sess[0].mapped() * kvsh_ps < A.p + A.T) {
-                            std::fprintf(stderr, "strata serve: --kv-share: the pool has no page for the next window; "
-                                                 "the answer ends here\n");
+                            // a batch slot holds pages an admission can free: this leg ends (preempt) and the server
+                            // admits the request again, which makes room; else it is the pool's whole capacity
+                            const bool pre = kvsh_others_hold(0);
+                            std::fprintf(stderr, "strata serve: --kv-share: the pool has no page for the next window; %s\n",
+                                         pre ? "this leg of the answer ends (preempt) and the server admits it again"
+                                             : "the answer ends here (the pool's whole capacity)");
+                            if (pre) finish = "preempt";
                             ending = true;
                             continue;
                         }
@@ -18563,8 +18799,11 @@ int main(int argc, char** argv) {
                 if (kvsh && kvshs.sess[0].mapped() * kvsh_ps < p + T + 8 &&   // --kv-share: pages for the window's rows
                     !kvsh_extend(0, p + T + 8 + 4096) && !kvsh_extend(0, p + T + 8)) {
                     if (kvshs.sess[0].mapped() * kvsh_ps < p + T) {
-                        std::fprintf(stderr, "strata serve: --kv-share: the pool has no page for the next window; "
-                                             "the answer ends here\n");
+                        const bool pre = kvsh_others_hold(0);   // (as on the pipelined path above)
+                        std::fprintf(stderr, "strata serve: --kv-share: the pool has no page for the next window; %s\n",
+                                     pre ? "this leg of the answer ends (preempt) and the server admits it again"
+                                         : "the answer ends here (the pool's whole capacity)");
+                        if (pre) finish = "preempt";
                         break;
                     }
                 }

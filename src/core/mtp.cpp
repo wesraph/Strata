@@ -402,6 +402,7 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
     qsa_state_zero(st_, g, nullptr);
     strata::core::st_device_sync(STRATA_ST_HERE);
     vram_ += sb;
+    state_bytes_ = sb;
 
     // ---- buffers
     window_ = (window > 0 && window < max_cells) ? window : 0;
@@ -528,8 +529,8 @@ bool MtpDrafter::load(const std::string& rt_dir, const ModelGeometry& g, Session
 #endif
     const double files_s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t_files).count();
     if (shared != nullptr) {
-        std::fprintf(stderr, "strata mtp: shared draft weights, %.0f MiB of private state and buffers\n",
-                     (double) vram_ / 1048576.0);
+        std::fprintf(stderr, "strata mtp: shared draft weights, %.0f MiB of private state and buffers (K/V state %.0f, buffers %.0f)\n",
+                     (double) vram_ / 1048576.0, (double) state_bytes_ / 1048576.0, (double) (vram_ - state_bytes_) / 1048576.0);
     } else {
         std::fprintf(stderr, "strata mtp: draft layer loaded, %.0f MiB of VRAM (experts %.0f, dense %.0f), files read in %.2f s (%.0f MiB/s)\n",
                      (double) vram_ / 1048576.0, (double) g.n_expert * strata::kernels::cpu::BLOB / 1048576.0,

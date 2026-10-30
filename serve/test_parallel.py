@@ -62,6 +62,9 @@ stopped = set()      # BSTOPped slots: they end "cancel"
 # #879: a prompt with NFSOLO / NFADMIT ends its first GEN / BGEN with DONE ... nonfinite (nothing emitted); one with
 # NFSLOT ends its slot with BDONE ... nonfinite after its second token
 fired, nf_slots = set(), set()
+# --kv-share: a prompt with PREEMPTME ends its slot's leg with BDONE ... preempt after its third token (once): the K/V
+# pool had no page for its next window, and the server admits the request again with what it generated
+pre_slots = set()
 def window():        # one batch window: every active slot one token
     if fail and len(active) >= 2:     # as the engine: the reason on stdout, then exit code 1
         print("ERR verify batch: layer 34 never rang (graph finished)", flush=True)
@@ -77,6 +80,13 @@ def window():        # one batch window: every active slot one token
         t = left.pop(0) if left else 257
         produced += 1
         print(f"BT {b} {t}", flush=True)
+        if b in pre_slots and produced >= 3 and t != 257 and produced < max_new:
+            pre_slots.discard(b)
+            print(f"BDONE {b} {produced} preempt 1.0", flush=True)
+            if log:
+                log.write(f"PREEMPT {b}\n"); log.flush()
+            del active[b]
+            continue
         if t == 257 or produced >= max_new:
             fin = 'stop' if t == 257 else 'cancel' if b in stopped else 'length'
             stopped.discard(b)
@@ -137,6 +147,9 @@ while True:
             continue
         if slot is not None and b"NFSLOT" in pb:
             nf_slots.add(slot)
+        if slot is not None and b"PREEMPTME" in pb and "preempt" not in fired:
+            fired.add("preempt")
+            pre_slots.add(slot)
         toks = reply(ids)
         stop.clear()
         # the prompt read: CH tokens a chunk, a PP line each; a BYIELD <s> gives way at a chunk boundary
@@ -743,6 +756,36 @@ class ParallelService(FakeEngineCase):
             c = json.loads(r.read().decode())["choices"][0]
         self.assertEqual((c["message"]["content"], c["finish_reason"]), ("ok, ", "stop"))
         self.assertEqual(self.chat("again")["choices"][0]["message"]["content"], "ok, done.")
+
+    def test_a_preempted_slot_is_admitted_again_and_its_answer_goes_on(self):
+        """--kv-share: the engine ends a slot's leg with BDONE ... preempt (no page for its next window while another
+        slot held pages): the server admits the same request again with what it generated, and the client gets the whole
+        answer - never a cut one."""
+        self.start(2)
+        texts = ["first PREEMPTME LONGREPLY", "second LONGREPLY"]
+        out, errors = {}, []
+
+        def go(t):
+            try:
+                out[t] = self.chat(t)
+            except Exception as e:   # noqa: BLE001 - reported below
+                errors.append(e)
+
+        threads = [threading.Thread(target=go, args=(t,)) for t in texts]
+        for th in threads:
+            th.start()
+            time.sleep(0.05)
+        for th in threads:
+            th.join(60)
+        self.assertEqual(errors, [])
+        for t in texts:
+            self.assertEqual(out[t]["choices"][0]["message"]["content"], "ok, " + "la " * 15 + "done.")
+            self.assertEqual(out[t]["choices"][0]["finish_reason"], "stop")
+        # the preempted request was admitted twice: its first prompt, then that prompt and its first three tokens
+        logged = self.log.read_text().splitlines()
+        self.assertEqual(sum(ln.startswith("PREEMPT") for ln in logged), 1, logged)
+        firsts = [ln for ln in logged if ln.startswith(("BGEN", "GEN"))]
+        self.assertGreaterEqual(len(firsts), 3, firsts)
 
     def test_engine_turns_batching_off(self):
         self.start(4, fit=0)

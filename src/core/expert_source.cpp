@@ -4981,8 +4981,9 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             }
         }
         // STRATA_PCIE_BALANCE (opt-in, #1548): the count comes from the measured CPU and GPU costs instead of the share
-        const bool pcie_ok = (d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(d.layers);
-        int m = pcie_ok ? d.pcie_model.pick(nmiss, (nmiss * d.pcie_num) >> 8) : 0;
+        PcieModel& pm = d.pcie_cur != nullptr ? *d.pcie_cur : d.pcie_model;   // a split: this layer's stage's model
+        const bool pcie_ok = (d.pcie_num > 0 || pm.on) && d.src->pcie_layer(d.layers);
+        int m = pcie_ok ? pm.pick(nmiss, (nmiss * d.pcie_num) >> 8) : 0;
         // STRATA_PCIE_MIN1 (opt-in): the share rounds to 0 for 1-2 misses per layer, so the PCIe lane idles on the typical
         // decode step; with >= 2 misses give it at least one (the last in routing order).  It only flies if its blob is
         // pinned (the fetch below checks), else it stays a CPU miss exactly as before.  Read once.
