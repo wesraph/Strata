@@ -10431,12 +10431,14 @@ int main(int argc, char** argv) {
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
         strata::core::Verifier ver_same;
         SplitDrive split_drive;
-        // STRATA_PCIE_BALANCE=1 on a layer split (the batch slots included): each stage picks, per layer, how many of its
-        // missed experts its GPU reads over PCIe and how many the CPU computes, from that stage's measured costs
-        // (PcieModel: the CPU's time per expert, the GPU's per PCIe expert), instead of --pcie-frac's fixed share - which
-        // stays the start, until the stage's fits have samples.  Unset: the fixed share, as before.
+        // A layer split (the batch slots included): each stage picks, per layer, how many of its missed experts its GPU
+        // reads over PCIe and how many the CPU computes, from that stage's measured costs (PcieModel: the CPU's time per
+        // expert, the GPU's per PCIe expert), instead of --pcie-frac's fixed share - which stays the start, until the
+        // stage's fits have samples.  The right share depends on the link, the CPU and the pack; this finds it.
+        // 2x RTX 3090 (x8 links, Ryzen 9 5900X), three slots at 41K: equal to the best fixed share on IQ4_XS and
+        // Q4_K_XL, never below it (docs/DETAILS.md).  STRATA_PCIE_BALANCE=0: the fixed share, as before.
         std::array<strata::core::PcieModel, SplitDrive::kMax> stage_pm{};
-        const bool split_balance = [] { const char* e = std::getenv("STRATA_PCIE_BALANCE"); return e != nullptr && std::strcmp(e, "1") == 0; }() &&
+        const bool split_balance = [] { const char* e = std::getenv("STRATA_PCIE_BALANCE"); return e == nullptr || std::strcmp(e, "0") != 0; }() &&
                                    native_pack;
         auto stage_ver = [&](int st) -> strata::core::Verifier& {
             return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
@@ -10534,8 +10536,8 @@ int main(int argc, char** argv) {
                 }
             }
             if (split_balance)
-                std::fprintf(stderr, "strata serve: STRATA_PCIE_BALANCE: each of the %d stages picks its PCIe experts per layer "
-                                     "from its measured CPU and PCIe costs (--pcie-frac %.2f until its fits have samples)\n",
+                std::fprintf(stderr, "strata serve: PCIe balance: each of the %d stages picks its PCIe experts per layer from its "
+                                     "measured CPU and PCIe costs (--pcie-frac %.2f until its fits have samples; STRATA_PCIE_BALANCE=0: fixed)\n",
                              n_stages, o.pcie_frac);
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
