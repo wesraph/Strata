@@ -5448,13 +5448,13 @@ int main(int argc, char** argv) {
     };
     // --layer-split auto's measured stage speeds (SplitSpeedEntry): STRATA_SPLIT_SPEED_FILE names the file (0: none -
     // the SMs x clock estimate alone, nothing written); by default it sits next to the expert profile
-    // OPT-IN (STRATA_SPLIT_MEASURED=1, or a file named): on a 3090 held to 1 GHz the measured split chose 29 from runs at
-    // 25 and at 34 alike, where 25 measured best (5% faster steps) and the SMs x clock estimate - blind to the held
-    // clock - chose 27; so it is not the default until it beats the estimate
+    // ON BY DEFAULT on this fork (STRATA_SPLIT_MEASURED=0 turns it off: the estimate alone, nothing written).  On a 3090
+    // held to 1 GHz the measured split chose 29 from runs at 25 and at 34 alike, where 25 measured best (5% faster
+    // steps) and the SMs x clock estimate - blind to the held clock - chose 27: a choice from real times, not yet the best
     const std::string split_speed_path = [&]() -> std::string {
         if (const char* e = std::getenv("STRATA_SPLIT_SPEED_FILE"); e != nullptr)
             return std::strcmp(e, "0") == 0 ? std::string() : std::string(e);
-        if (const char* e = std::getenv("STRATA_SPLIT_MEASURED"); e == nullptr || std::strcmp(e, "1") != 0) return {};
+        if (const char* e = std::getenv("STRATA_SPLIT_MEASURED"); e != nullptr && std::strcmp(e, "0") == 0) return {};
         if (o.expert_profile.empty()) return {};
         const std::filesystem::path dir = std::filesystem::path(o.expert_profile).parent_path();
         return (dir.empty() ? std::filesystem::path("split-speed.txt") : dir / "split-speed.txt").string();
