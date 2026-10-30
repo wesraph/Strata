@@ -1304,6 +1304,7 @@ struct SplitDrive {
     const uint8_t* cache_base[kMax] = {};
     const uint64_t* cache_slot_off[kMax] = {};
     int pcie_num[kMax] = {};
+    strata::core::PcieModel* pm[kMax] = {};   ///< STRATA_PCIE_BALANCE on a split: stage i's cost model (null: off)
 };
 void drive_pool_split_impl(void* user, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k, float* out,
                            int64_t layer, strata::kernels::cpu::NativeArithmetic arithmetic) {
@@ -1315,6 +1316,7 @@ void drive_pool_split_impl(void* user, const float* x_f, const int32_t* ids, int
     d.d.cache_base = s->cache_base[st];
     d.d.cache_slot_off = s->cache_slot_off[st];
     d.d.pcie_num = s->pcie_num[st];
+    d.d.pcie_cur = s->pm[st];
     drive_pool_multi_impl(s->base, x_f, ids, n_tok, k, out, layer, arithmetic);
 }
 void drive_pool_split(void* u, const float* x, const int32_t* ids, int64_t n, int64_t k, float* out, int64_t l) {
@@ -10429,6 +10431,13 @@ int main(int argc, char** argv) {
         // (--split-device 0: the second stage on this GPU, sharing its weights, session and cache - the A/B.)
         strata::core::Verifier ver_same;
         SplitDrive split_drive;
+        // STRATA_PCIE_BALANCE=1 on a layer split (the batch slots included): each stage picks, per layer, how many of its
+        // missed experts its GPU reads over PCIe and how many the CPU computes, from that stage's measured costs
+        // (PcieModel: the CPU's time per expert, the GPU's per PCIe expert), instead of --pcie-frac's fixed share - which
+        // stays the start, until the stage's fits have samples.  Unset: the fixed share, as before.
+        std::array<strata::core::PcieModel, SplitDrive::kMax> stage_pm{};
+        const bool split_balance = [] { const char* e = std::getenv("STRATA_PCIE_BALANCE"); return e != nullptr && std::strcmp(e, "1") == 0; }() &&
+                                   native_pack;
         auto stage_ver = [&](int st) -> strata::core::Verifier& {
             return st == 0 ? ver : split_same ? ver_same : stages[(size_t) st - 1]->ver;
         };
@@ -10519,7 +10528,15 @@ int main(int argc, char** argv) {
                 split_drive.cache_base[st] = drive.d.cache_base;
                 split_drive.cache_slot_off[st] = drive.d.cache_slot_off;
                 split_drive.pcie_num[st] = pcie_num_of(o.pcie_frac);
+                if (split_balance) {
+                    split_drive.pm[st] = &stage_pm[(size_t) st];
+                    stage_ver(st).set_pcie_balance(split_drive.pm[st]);
+                }
             }
+            if (split_balance)
+                std::fprintf(stderr, "strata serve: STRATA_PCIE_BALANCE: each of the %d stages picks its PCIe experts per layer "
+                                     "from its measured CPU and PCIe costs (--pcie-frac %.2f until its fits have samples)\n",
+                             n_stages, o.pcie_frac);
             for (int st = 1; st < n_stages; ++st) {
                 bool ok_s = false;
                 if (split_same) {
@@ -10588,6 +10605,7 @@ int main(int argc, char** argv) {
                 vs.blob = thits.blob;
                 vs.slot_off = gs.cache.slot_offsets();
                 vs.n_slots = gs.cache.slots();
+                if (split_drive.pm[st] != nullptr) gs.ver_b.set_pcie_balance(split_drive.pm[st]);
                 if (!gs.ver_b.init(gs.wt, g, gs.ss, vs, gs.head.loaded() ? &gs.head : nullptr, o.spec, err)) {
                     std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA%d (stage %d): %s "
                                          "(raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n",
@@ -10608,6 +10626,7 @@ int main(int argc, char** argv) {
                     return 1;
                 }
             }
+            if (split_drive.pm[0] != nullptr) ver_b.set_pcie_balance(split_drive.pm[0]);
             if (!ver_b.init(wt, g, ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err)) {
                 std::fprintf(stderr, "strata serve: --pipeline-windows: the second verifier on CUDA0 (the first card): "
                                      "%s (raise --vram-reserve-mib by ~200, or --pipeline-windows 0)\n", err.c_str());
@@ -14859,6 +14878,11 @@ int main(int argc, char** argv) {
                 if (pmtp)
                     std::fprintf(stderr, " (%lld of %lld MTP proposals kept)", (long long) bt_accepted, (long long) bt_tokens);
                 std::fprintf(stderr, "\n");
+                for (int st = 0; st < split_drive.n; ++st)   // STRATA_PCIE_BALANCE: each stage's fits (ms)
+                    if (const strata::core::PcieModel* pm = split_drive.pm[st]; pm != nullptr && pm->ready())
+                        std::fprintf(stderr, "strata batch PCIe balance, stage %d: CPU %.3f + %.3f per expert (+%.3f per PCIe one), "
+                                             "GPU %.3f + %.3f per PCIe expert (%d / %d samples)\n",
+                                     st + 1, pm->a, pm->c, pm->d, pm->g0, pm->g, pm->ncpu, pm->ngpu);
                 pa_rounds = pa_swaps = 0;
                 pa_ms = 0;
                 for (int k = 0; k < n_pipe; ++k) {
