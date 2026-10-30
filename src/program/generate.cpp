@@ -14310,6 +14310,21 @@ int main(int argc, char** argv) {
                 }
         }
         // the chain of slot b has landed: its proposals are the slot's next drafts (1), still drafting (0), or an error (-1)
+        // STRATA_PIPE_TRACE=1: where a pipelined group-step's wall goes - per step, summed over the groups: each
+        // stage's in-flight time, the hand-off between stages, the verdict and emit, the wait for the slots' draft
+        // chains, and the time a group sat ready before stage 0 took it - with the pump period and why starts were
+        // skipped.  One line per 400 group-steps.  Unset: nothing is timed.
+        static const bool pt_on = std::getenv("STRATA_PIPE_TRACE") != nullptr;
+        struct PtGroup { Clock::time_point launch[8]{}, done[8]{}, verdict{}; bool cycled = false; };
+        std::vector<PtGroup> ptg(pg.size());
+        std::vector<Clock::time_point> pt_draft_done((size_t) std::max(o.batch, 1));
+        double pt_stage[8] = {}, pt_hand = 0, pt_verdict = 0, pt_draft = 0, pt_period = 0, pt_period_max = 0;
+        // the pump periods of pure decoding (no read, no drain): how much of them each stage held a group, and what
+        // a group not in flight was doing (ready for stage 0, its draft chains running, no active slot)
+        double pt_dec = 0, pt_nondec = 0, pt_busy[8] = {}, pt_g_ready = 0, pt_g_draft = 0, pt_g_inactive = 0;
+        int64_t pt_steps = 0, pt_pumps = 0, pt_skip_quiet = 0, pt_skip_adapt = 0, pt_skip_notready = 0, pt_skip_inactive = 0;
+        Clock::time_point pt_prev{}, pt_win0{};
+        auto pt_ms = [](Clock::time_point a, Clock::time_point b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
         auto pmtp_poll_draft = [&](int b, bool wait) -> int {
             if (!pm_drafting[(size_t) b]) return 1;
             for (;;) {
@@ -14319,6 +14334,7 @@ int main(int argc, char** argv) {
                 if (!wait) return 0;
             }
             pm_drafting[(size_t) b] = 0;
+            if (pt_on) pt_draft_done[(size_t) b] = Clock::now();
             // the first proposal always; another while the draft layer was at least --spec-min-p sure of the one before
             // (the solo path's rule, MtpDrafter::draft)
             BSlot& sl = bs[(size_t) b];
@@ -14537,6 +14553,27 @@ int main(int argc, char** argv) {
         };
         auto pump = [&](bool may_start) -> bool {
             ++pipe_tick;
+            if (pt_on) {
+                const Clock::time_point now = Clock::now();
+                if (pt_prev != Clock::time_point{}) {
+                    const double d = pt_ms(pt_prev, now);
+                    pt_period += d; pt_period_max = std::max(pt_period_max, d); ++pt_pumps;
+                    // (a period over 100 ms is a read or a drain the pump sat out, whatever this pump's state is)
+                    if (may_start && !in_prompt_read && d < 100.0) {
+                        pt_dec += d;
+                        for (int q = 0; q < n_pipe && q < 8; ++q) if (stage_group[(size_t) q] >= 0) pt_busy[q] += d;
+                        for (int gi = 0; gi < (int) pg.size(); ++gi) {
+                            if (pg[(size_t) gi].inflight) continue;
+                            if (!group_active(gi)) { pt_g_inactive += d; continue; }
+                            bool drafting = false;
+                            if (pmtp) for (int t = 0; t < GS; ++t) if (pm_drafting[(size_t) (gi * GS + t)]) drafting = true;
+                            if (drafting) pt_g_draft += d; else pt_g_ready += d;
+                        }
+                    } else pt_nondec += d;
+                }
+                pt_prev = now;
+                if (pt_win0 == Clock::time_point{}) pt_win0 = now;
+            }
             stats_refresh();
             { std::string se; if (!refill_settle(false, se)) { std::printf("ERR %s\n", se.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", se.c_str()); return false; } }
             if (kvsh_need_quiet && !pipe_inflight()) {   // the pipeline emptied for a slot's growth: the reserve refills
@@ -14561,6 +14598,7 @@ int main(int argc, char** argv) {
                 if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
                 stage_group[(size_t) k] = -1;
                 PGroup& G = pg[(size_t) gi];
+                if (pt_on && k < 8) { ptg[(size_t) gi].done[k] = Clock::now(); pt_stage[k] += pt_ms(ptg[(size_t) gi].launch[k], ptg[(size_t) gi].done[k]); }
                 if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
                 // the last stage: the group's picks
                 const int32_t* outb = vk.batch_out();
@@ -14609,6 +14647,30 @@ int main(int argc, char** argv) {
                                  std::chrono::duration<double, std::milli>(Clock::now() - rows_wait_t).count(), rows_wait);
                     rows_wait = nullptr;
                 }
+                if (pt_on && k < 8) {
+                    PtGroup& P = ptg[(size_t) gi];
+                    P.verdict = Clock::now();
+                    pt_verdict += pt_ms(P.done[k], P.verdict);
+                    P.cycled = true;
+                    if (++pt_steps % 400 == 0) {
+                        const Clock::time_point now = Clock::now();
+                        std::string st;
+                        for (int q = 0; q < n_pipe && q < 8; ++q) { char b[48]; std::snprintf(b, sizeof b, " stage%d %.1f", q, pt_stage[q] / 400); st += b; pt_stage[q] = 0; }
+                        std::string bu;
+                        for (int q = 0; q < n_pipe && q < 8; ++q) { char b[48]; std::snprintf(b, sizeof b, " stage%d %.0f%%", q, 100.0 * pt_busy[q] / std::max(pt_dec, 1e-9)); bu += b; pt_busy[q] = 0; }
+                        std::fprintf(stderr, "strata pipe trace: 400 group-steps in %.0f ms (%.1f per step): per step%s, hand-off %.1f, verdict+emit %.1f, "
+                                             "draft wait %.1f ms; pure decoding %.0f ms (%.0f in reads or drains): a group held%s; a group not in flight was "
+                                             "ready %.0f, drafting %.0f, inactive %.0f ms; pump period mean %.3f max %.1f ms over %lld pumps; "
+                                             "starts skipped: pages quiet %lld, drain %lld, drafts not ready %lld, no active group %lld\n",
+                                     pt_ms(pt_win0, now), pt_ms(pt_win0, now) / 400, st.c_str(), pt_hand / 400, pt_verdict / 400, pt_draft / 400,
+                                     pt_dec, pt_nondec, bu.c_str(), pt_g_ready, pt_g_draft, pt_g_inactive,
+                                     pt_pumps > 0 ? pt_period / (double) pt_pumps : 0.0, pt_period_max, (long long) pt_pumps,
+                                     (long long) pt_skip_quiet, (long long) pt_skip_adapt, (long long) pt_skip_notready, (long long) pt_skip_inactive);
+                        pt_hand = pt_verdict = pt_draft = pt_period = pt_period_max = pt_dec = pt_nondec = pt_g_ready = pt_g_draft = pt_g_inactive = 0;
+                        pt_pumps = pt_skip_quiet = pt_skip_adapt = pt_skip_notready = pt_skip_inactive = 0;
+                        pt_win0 = now;
+                    }
+                }
                 ++bt_windows;
                 ++pa_windows;
                 G.inflight = false;
@@ -14625,11 +14687,11 @@ int main(int argc, char** argv) {
                             pick = gi;
                     if (pick < 0) continue;
                 } else {
-                    if (!may_start || pa_due()) continue;   // STRATA_PIPE_ADAPT_EVERY: a round is due, the pipeline empties first
-                    if (kvsh_need_quiet) continue;          // a slot's growth waits for an empty pipeline (the reserve refills there)
+                    if (!may_start || pa_due()) { if (pt_on && !may_start) ++pt_skip_adapt; continue; }   // STRATA_PIPE_ADAPT_EVERY: a round is due, the pipeline empties first
+                    if (kvsh_need_quiet) { if (pt_on) ++pt_skip_quiet; continue; }          // a slot's growth waits for an empty pipeline (the reserve refills there)
                     for (int j = 0; j < (int) pg.size() && pick < 0; ++j) {
                         const int gi = (int) ((rr + j) % (int64_t) pg.size());
-                        if (pg[(size_t) gi].inflight || !group_active(gi)) continue;
+                        if (pg[(size_t) gi].inflight || !group_active(gi)) { if (pt_on && !pg[(size_t) gi].inflight) ++pt_skip_inactive; continue; }
                         if (pmtp) {   // its slots' proposal chains still running: another group goes first
                             bool ready = true;
                             for (int t = 0; t < GS; ++t) {
@@ -14637,7 +14699,7 @@ int main(int argc, char** argv) {
                                 if (dr < 0) return false;
                                 if (dr == 0) { ready = false; break; }
                             }
-                            if (!ready) continue;
+                            if (!ready) { if (pt_on) ++pt_skip_notready; continue; }
                         }
                         pick = gi;
                     }
@@ -14731,6 +14793,20 @@ int main(int argc, char** argv) {
                 PGroup& G = pg[(size_t) pick];
                 strata::core::progress().busy.store(true);
                 if (batch_telemetry_enabled) stage_in_flight.launch(k, Clock::now());
+                if (pt_on && k < 8) {
+                    PtGroup& P = ptg[(size_t) pick];
+                    const Clock::time_point now = Clock::now();
+                    P.launch[k] = now;
+                    if (k > 0) pt_hand += pt_ms(P.done[k - 1], now);
+                    else if (P.cycled) {   // the group's step after its last verdict: the draft chains, then the wait for stage 0
+                        Clock::time_point ready = P.verdict;
+                        for (int t = 0; t < GS; ++t) {
+                            const Clock::time_point d = pt_draft_done[(size_t) (pick * GS + t)];
+                            if (d > ready && d <= now) ready = d;
+                        }
+                        pt_draft += pt_ms(P.verdict, ready);
+                    }
+                }
                 if (!(prows ? stage_verifier(k).batch_launch_rows(G.rows, G.S, G.hbase, G.tok, G.pos, err)
                            : stage_verifier(k).batch_launch(pick * GS, G.S, G.tok, G.pos, err))) {
                     std::printf("ERR %s\n", err.c_str()); std::fprintf(stderr, "strata serve: ERR %s\n", err.c_str());

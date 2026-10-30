@@ -302,7 +302,14 @@ new token shows no number.
 
 Profiling: start the server with `STRATA_DECODE_TIMING=1` (and `STRATA_VERIFY_PROFILE=1` for the GPU side). After each request
 the engine log has a `strata decode timing:` line and a `strata decode GPU stages (ms/window):` line. The GPU profile slows
-decoding a little: use it to compare, not to measure speed. `STRATA_LOOKAHEAD_STATS=1` scores the next-layer expert
+decoding a little: use it to compare, not to measure speed. The pipelined batch (`--batch-groups` on a layer split) has no
+decode timing line; its GPU side prints `strata batch GPU stages, stage N (ms/window):` with `STRATA_VERIFY_PROFILE=1`, and
+`STRATA_PIPE_TRACE=1` prints one `strata pipe trace:` line per 400 group-steps with the host's view: per step, each stage's
+in-flight time, the hand-off between stages, the verdict and emit, and the wait for the slots' draft chains; then, over the
+pure decoding of that span (no read, no drain), how much of the time each stage held a group and what a group not in flight
+was doing (ready for stage 0, drafting, or without an active slot). Measured on 2x RTX 3090 (IQ4_XS, three agents at 70-90K
+of context, 2 groups of 2 slots): stage 0 14-15 ms and stage 1 15-17 ms per step, hand-off 2 ms, draft wait 2.5 ms, and the
+stages held a group 75% and 81-83% of pure decoding; the window's own time is the cost, not the pipeline's scheduling. `STRATA_LOOKAHEAD_STATS=1` scores the next-layer expert
 prediction every 100 windows and costs CPU. `tools/replay_cache_policy.py` replays a `--dump-routing` trace through the
 adaptive tier's swap policy offline.
 
