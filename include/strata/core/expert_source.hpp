@@ -395,6 +395,35 @@ struct GpuPlanSink {
 /// layer then reads over PCIe the m of its nmiss misses that minimizes max(GPU, CPU). Measured: an RTX 5090 + 9950X3D
 /// pool is DRAM-bound (moving experts to PCIe left the pool's time where it was, d ~ c: few move), one worker on
 /// ggml-cpu's dot is not (d ~ 0: most move). Until both fits have data, and while `on` is off, pcie_num's share.
+/// --layer-split auto's measured speed of one stage's GPU, from the balance stamps (set_pcie_balance): its own time per
+/// layer step - the combine, the attention, the dense part, the router and its experts, every wait for the host left
+/// out - fitted as d + m x the experts it computed in that step, on the steps without PCIe experts.  Plain sums, no
+/// forgetting: what a run saves is its average (the next start's split reads it, generate.cpp).
+struct StageSpeed {
+    double s = 0, sx = 0, sxx = 0, sy = 0, sxy = 0;   ///< the fit's sums
+    double se = 0;                                    ///< every expert the steps routed (GPU + CPU + PCIe): the load
+    int64_t n = 0;
+    void sample(double gpu_experts, double all_experts, double ms) {
+        s += 1; sx += gpu_experts; sxx += gpu_experts * gpu_experts; sy += ms; sxy += gpu_experts * ms;
+        se += all_experts; ++n;
+    }
+    StageSpeed& operator+=(const StageSpeed& o) {
+        s += o.s; sx += o.sx; sxx += o.sxx; sy += o.sy; sxy += o.sxy; se += o.se; n += o.n;
+        return *this;
+    }
+    /// d (ms per step) and m (ms per expert the GPU computes); false below 256 samples
+    bool fit(double& d, double& m) const {
+        if (n < 256) return false;
+        const double det = s * sxx - sx * sx;
+        m = det > 1e-9 * s * s ? (s * sxy - sx * sy) / det : 0.0;
+        d = (sy - m * sx) / s;
+        if (m < 0.0) { m = 0.0; d = sy / s; }        // (a slope the noise turned over: the mean alone)
+        if (d < 0.0) { d = 0.0; m = sx > 0.0 ? sy / sx : 0.0; }
+        return true;
+    }
+    double mean_experts() const { return n > 0 ? se / (double) n : 0.0; }
+};
+
 struct PcieModel {
     bool on = false;
     double a = 0, c = 0, d = 0, p0 = 0, g0 = 0, g = 0;   ///< the fits (read by `pick`)

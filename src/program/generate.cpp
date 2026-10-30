@@ -2702,6 +2702,57 @@ std::string nibble_refusal(const Options& o) {
 #endif
 }
 
+// --layer-split auto's measured stage speeds (StageSpeed, the balance stamps): one line per (model, card), kept next
+// to the expert profile.  A run writes its cards' fits when the batch goes idle; the next start's split search reads
+// them in place of the SMs x clock estimate - on unequal cards the clock says little (a 3060's 28 SMs at a higher clock
+// against a 3090's 82, its 360 GB/s against 936), and the driver's clock is the rated one, not what the card runs at.
+struct SplitSpeedEntry {
+    std::string model, card;   ///< the pack and the GGUF it runs; the card's name and PCI address (no spaces)
+    double d = 0, m = 0, experts = 0;
+    long long n = 0;
+    double a = 0, c = 0;       ///< the CPU's ms per step and per expert it computes (the PCIe balance's fit; 0 = none)
+    long long lb = 0, le = 0;  ///< the layers the stage ran when it was measured
+    double fly = 0;            ///< its window's whole time per group step there (ms; launch to done, every wait in it)
+};
+std::string split_speed_card(int dev) {
+    cudaDeviceProp p{};
+    if (cudaGetDeviceProperties(&p, dev) != cudaSuccess) { cudaGetLastError(); return {}; }
+    std::string c = p.name;
+    for (char& ch : c) if (ch == ' ' || ch == '\t') ch = '_';
+    char pci[48];
+    std::snprintf(pci, sizeof pci, "@%04x:%02x:%02x", (unsigned) p.pciDomainID, (unsigned) p.pciBusID, (unsigned) p.pciDeviceID);
+    return c + pci;
+}
+std::string split_speed_model(const std::string& pack, const std::string& native) {
+    std::string k = pack + "|" + native;
+    for (char& ch : k) if (ch == ' ' || ch == '\t') ch = '_';
+    return k;
+}
+std::vector<SplitSpeedEntry> split_speed_read(const std::string& path) {
+    std::vector<SplitSpeedEntry> out;
+    std::FILE* f = path.empty() ? nullptr : std::fopen(path.c_str(), "r");
+    if (f == nullptr) return out;
+    char model[4096], card[512];
+    SplitSpeedEntry e;
+    while (std::fscanf(f, " v3 %4095s %511s %lf %lf %lf %lld %lf %lf %lld %lld %lf", model, card, &e.d, &e.m, &e.experts,
+                       &e.n, &e.a, &e.c, &e.lb, &e.le, &e.fly) == 11) {
+        e.model = model;
+        e.card = card;
+        out.push_back(e);
+    }
+    std::fclose(f);
+    return out;
+}
+bool split_speed_write(const std::string& path, const std::vector<SplitSpeedEntry>& all) {
+    const std::string tmp = path + ".tmp";
+    std::FILE* f = std::fopen(tmp.c_str(), "w");
+    if (f == nullptr) return false;
+    for (const SplitSpeedEntry& e : all)
+        std::fprintf(f, "v3 %s %s %.6f %.6f %.3f %lld %.6f %.6f %lld %lld %.4f\n", e.model.c_str(), e.card.c_str(), e.d,
+                     e.m, e.experts, e.n, e.a, e.c, e.lb, e.le, e.fly);
+    const bool ok = std::fclose(f) == 0;
+    return ok && std::rename(tmp.c_str(), path.c_str()) == 0;
+}
 }  // namespace
 
 // #1425 #1549 #1629: --ple-io direct (the default) does unbuffered random reads of the n-gram table; on some drives
@@ -5376,6 +5427,39 @@ int main(int argc, char** argv) {
         rin.pipe_snap_mib = kPipeSnapMib;
         return strata::program::stage_reserve::room_bytes((int64_t) fb, rin);
     };
+    auto batch_groups_for = [&](bool mtp_on) {
+        strata::program::batch_groups::Input bin;
+        bin.set = o.batch_groups_set;
+        bin.auto_given = o.batch_groups_auto;
+        bin.given = o.batch_groups;
+        bin.batch = o.batch;
+        bin.later_stages = (int) stages.size();
+        bin.batch_mtp = mtp_on;
+        bin.adapt_async = o.adapt_async != 0;
+        { const char* ms = std::getenv("STRATA_BATCH_MTP_SERIAL"); bin.mtp_serial = ms != nullptr && ms[0] != '\0' && ms[0] != '0'; }
+#if !defined(STRATA_USE_HIP)
+        // NVIDIA, 2 cards: the pipelined groups by default (0.2.7); one serial group, the 0.2.1-0.2.6 default, with
+        // STRATA_BATCH_GROUPS_NV_SERIAL=1 or STRATA_DEFAULTS=026 (batch_groups.hpp nv_serial_wanted)
+        bin.nv_serial_faster = strata::program::batch_groups::nv_serial_wanted(std::getenv("STRATA_BATCH_GROUPS_NV_SERIAL"),
+                                                                              strata::qwen_defaults_026());
+#endif
+        { const char* mp = std::getenv("STRATA_PIPED_MTP"); bin.mtp_piped = mp != nullptr && mp[0] != '\0' && mp[0] != '0'; }
+        return strata::program::batch_groups::resolve(bin);
+    };
+    // --layer-split auto's measured stage speeds (SplitSpeedEntry): STRATA_SPLIT_SPEED_FILE names the file (0: none -
+    // the SMs x clock estimate alone, nothing written); by default it sits next to the expert profile
+    // ON BY DEFAULT on this fork (STRATA_SPLIT_MEASURED=0 turns it off: the estimate alone, nothing written).  On a 3090
+    // held to 1 GHz the measured split chose 29 from runs at 25 and at 34 alike, where 25 measured best (5% faster
+    // steps) and the SMs x clock estimate - blind to the held clock - chose 27: a choice from real times, not yet the best
+    const std::string split_speed_path = [&]() -> std::string {
+        if (const char* e = std::getenv("STRATA_SPLIT_SPEED_FILE"); e != nullptr)
+            return std::strcmp(e, "0") == 0 ? std::string() : std::string(e);
+        if (const char* e = std::getenv("STRATA_SPLIT_MEASURED"); e != nullptr && std::strcmp(e, "0") == 0) return {};
+        if (o.expert_profile.empty()) return {};
+        const std::filesystem::path dir = std::filesystem::path(o.expert_profile).parent_path();
+        return (dir.empty() ? std::filesystem::path("split-speed.txt") : dir / "split-speed.txt").string();
+    }();
+    const std::string split_speed_key = split_speed_model(o.pack, o.native_preset);
     if (multi_gpu && split_auto) {
         const auto& lay = strata::kernels::cpu::expert_layout();
         const int ns = (int) stages.size() + 1;
@@ -5429,6 +5513,43 @@ int main(int argc, char** argv) {
             else if (link_abs) link_scale[(size_t) i] = bw > 0.0 ? std::clamp(20.0 / bw, 1.0, 64.0) : 1.0;
             std::fprintf(stderr, "strata generate: layer split auto: CUDA%d link %.1f GB/s -> miss cost x%.2f\n",
                          i == 0 ? 0 : stages[(size_t) i - 1]->dev, bw, link_scale[(size_t) i]);
+        }
+        // MEASURED COSTS IN PLACE OF THE CLOCK.  A previous run on these cards with this model measured, per stage,
+        // its GPU's time per layer step (StageSpeed: d + m per expert it computes, every wait for the host left out)
+        // and its CPU pool's (the PCIe balance: a + c per expert the CPU computes).  With them a placement is priced
+        // as it runs: in a layer step the GPU's experts and the CPU's run at the same time, so a step costs
+        // d + max(m x GPU experts, a + c x CPU experts) - a slow GPU hides CPU work, a fast one waits for it - and
+        // the stages add for one conversation but overlap in the pipelined batch groups, where the slowest stage
+        // sets the pace.  (The clock-ratio form of this measured 9% slower than the estimate on a 3090 held to
+        // 1 GHz: it summed GPU time and ignored the CPU.)  Every stage needs both fits, or the estimate stands.
+        std::vector<SplitSpeedEntry> split_meas;
+        std::vector<double> split_raw, split_cal((size_t) ns, 1.0);   // predict's per-stage price; its calibration
+        double split_load = 0;   // experts a layer step routes (the measured mean): the load every placement is priced at
+        const bool split_piped = o.batch >= 2 && batch_groups_for(o.batch_mtp).groups > 1;
+        if (!split_speed_path.empty() && std::getenv("STRATA_SPLIT_SPEED_SCALE") == nullptr) {
+            const std::vector<SplitSpeedEntry> known = split_speed_read(split_speed_path);
+            std::string txt;
+            for (int i = 0; i < ns; ++i) {
+                const std::string card = split_speed_card(i == 0 ? 0 : stages[(size_t) i - 1]->dev);
+                const SplitSpeedEntry* hit = nullptr;
+                for (const SplitSpeedEntry& e : known)
+                    if (e.model == split_speed_key && e.card == card && e.c > 0.0) hit = &e;
+                if (hit == nullptr) { split_meas.clear(); break; }
+                split_meas.push_back(*hit);
+                split_load += hit->experts / ns;
+                char t[200];
+                std::snprintf(t, sizeof t, "%s CUDA%d GPU %.3f + %.4f per expert, CPU %.3f + %.4f", i == 0 ? "" : ",",
+                              i == 0 ? 0 : stages[(size_t) i - 1]->dev, hit->d, hit->m, hit->a, hit->c);
+                txt += t;
+            }
+            if (!split_meas.empty())
+                std::fprintf(stderr, "strata generate: layer split auto: the costs a run measured on these cards (%s, ms "
+                                     "per layer step at %.1f experts):%s; the stages %s\n", split_speed_path.c_str(),
+                             split_load, txt.c_str(), split_piped ? "overlap (pipelined groups): the slowest one counts"
+                                                                  : "add up");
+            else
+                std::fprintf(stderr, "strata generate: layer split auto: no measured costs for every card yet (%s): the "
+                                     "SMs x clock estimate; this run measures them\n", split_speed_path.c_str());
         }
         const double miss_ms = std::getenv("STRATA_SPLIT_MISS_MS") ? std::atof(std::getenv("STRATA_SPLIT_MISS_MS")) : 190.0;
         // ---- THE COVERAGE CURVE: HOW MUCH ROUTED MASS A CACHE HOLDS, AND WHY IT IS NO LONGER A POWER LAW.
@@ -5498,21 +5619,42 @@ int main(int argc, char** argv) {
             held_mass = 0;
             held = 0;
             std::vector<double> mass_i((size_t) ns, 0.0), held_i((size_t) ns, 0.0);
+            std::vector<double> mass_l(split_meas.empty() ? 0 : (size_t) g.n_layers, 0.0), held_l(mass_l.size(), 0.0);
             std::vector<bool> full((size_t) ns, false);
             for (size_t r = 0; r < profile.size(); ++r) {
                 const int64_t l = profile[r].first;
                 int st = 0;
                 while (st + 1 < ns && l >= at[(size_t) st]) ++st;
                 mass_i[(size_t) st] += mass[r];
+                if (!mass_l.empty() && l >= 0 && l < g.n_layers) mass_l[(size_t) l] += mass[r];
                 if (full[(size_t) st]) continue;
                 if (used[(size_t) st] + cost(l) > capr[(size_t) st]) { full[(size_t) st] = true; continue; }   // as the fill
                 used[(size_t) st] += cost(l);
                 held_mass += mass[r];
                 held_i[(size_t) st] += mass[r];
+                if (!mass_l.empty() && l >= 0 && l < g.n_layers) held_l[(size_t) l] += mass[r];
                 ++held;
                 ++held_cnt[(size_t) st];
             }
             held_mass /= std::max(total_mass, 1e-9);
+            if (!split_meas.empty()) {   // the measured costs (above): each layer step at the share of its experts held
+                double sum = 0, slowest = 0;
+                split_raw.assign((size_t) ns, 0.0);
+                for (int i = 0; i < ns; ++i) {
+                    const SplitSpeedEntry& e = split_meas[(size_t) i];
+                    const int64_t lb = i == 0 ? 0 : at[(size_t) i - 1], le = i + 1 < ns ? at[(size_t) i] : g.n_layers;
+                    double t = 0;
+                    for (int64_t l = lb; l < le; ++l) {
+                        const double h = mass_l[(size_t) l] > 0.0 ? held_l[(size_t) l] / mass_l[(size_t) l] : 1.0;
+                        t += e.d + std::max(e.m * split_load * h, e.a + e.c * split_load * (1.0 - h));
+                    }
+                    split_raw[(size_t) i] = t;
+                    t *= split_cal[(size_t) i];   // what the stage's window really took there, over this model's price
+                    sum += t;
+                    slowest = std::max(slowest, t);
+                }
+                return split_piped ? slowest : sum;
+            }
             // Each stage's misses on its own link (link_scale; 1.0 everywhere = the fitted single-constant formula).
             double ms = 0.0;
             for (int i = 0; i < ns; ++i)
@@ -5524,6 +5666,36 @@ int main(int argc, char** argv) {
             }
             return ms;
         };
+        // THE CALIBRATION.  The per-layer price leaves out what the stages share and wait for - the CPU pool both
+        // stages call at once in the pipelined groups, the hand-offs, the drafts - and on a 3090 held to 1 GHz it
+        // put the best split at 30 where 25-29 measured best.  Each stage's window was also timed whole where the run
+        // had its split (SplitSpeedEntry::fly): the price there is scaled to that time, stage by stage, so the search
+        // balances what the stages really take and the per-layer model only says how that moves with the split.
+        if (!split_meas.empty()) {
+            std::vector<int64_t> at_meas((size_t) ns - 1);
+            bool same = split_meas.back().le == g.n_layers && split_meas.front().lb == 0;
+            for (int i = 0; i + 1 < ns && same; ++i) {
+                same = split_meas[(size_t) i].le == split_meas[(size_t) i + 1].lb && split_meas[(size_t) i].fly > 0.0 &&
+                       split_meas[(size_t) i + 1].fly > 0.0;
+                at_meas[(size_t) i] = split_meas[(size_t) i].le;
+            }
+            if (same) {
+                double hm0 = 0;
+                int64_t held0 = 0;
+                (void) predict(at_meas, hm0, held0);
+                std::string txt;
+                for (int i = 0; i < ns; ++i) {
+                    split_cal[(size_t) i] = split_raw[(size_t) i] > 0.0 ? split_meas[(size_t) i].fly / split_raw[(size_t) i] : 1.0;
+                    char t[120];
+                    std::snprintf(t, sizeof t, "%s CUDA%d %.1f ms measured / %.1f priced = x%.2f", i == 0 ? "" : ",",
+                                  i == 0 ? 0 : stages[(size_t) i - 1]->dev, split_meas[(size_t) i].fly, split_raw[(size_t) i],
+                                  split_cal[(size_t) i]);
+                    txt += t;
+                }
+                std::fprintf(stderr, "strata generate: layer split auto: calibrated at the split the costs were measured "
+                                     "with (K=%lld):%s\n", (long long) at_meas[0], txt.c_str());
+            }
+        }
         std::vector<int64_t> best, at((size_t) ns - 1);
         double best_ms = 1e30, best_mass = 0;
         int64_t best_held = 0, tried = 0;
@@ -5674,6 +5846,13 @@ int main(int argc, char** argv) {
             double hm = 0;
             int64_t held = 0;
             const double ms = predict(at, hm, held);
+            static const bool split_trace = std::getenv("STRATA_SPLIT_TRACE") != nullptr;
+            if (split_trace) {   // every placement's predicted window (ms) and the routed mass its caches hold
+                std::string cuts;
+                for (const int64_t c : at) cuts += (cuts.empty() ? "" : ",") + std::to_string(c);
+                std::fprintf(stderr, "strata generate: layer split trace: K=%s %.3f ms, %.2f%% held\n", cuts.c_str(), ms,
+                             100.0 * hm);
+            }
             ++tried;
             if (ns <= 3) priced.emplace_back(ms, at);
             const double mx = stage_max(at);
@@ -6362,25 +6541,6 @@ int main(int argc, char** argv) {
     // pipelined slot groups run neither --batch-mtp's drafts nor the batch adaptive tier (--adapt-async 1), so when one of
     // them is asked for and the groups were not given, the default is one group (batch_groups.hpp).  Evaluated again
     // once the slots that fit are known, and BEFORE the --batch-mtp gate below, which must see the resolved number.
-    auto batch_groups_for = [&](bool mtp_on) {
-        strata::program::batch_groups::Input bin;
-        bin.set = o.batch_groups_set;
-        bin.auto_given = o.batch_groups_auto;
-        bin.given = o.batch_groups;
-        bin.batch = o.batch;
-        bin.later_stages = (int) stages.size();
-        bin.batch_mtp = mtp_on;
-        bin.adapt_async = o.adapt_async != 0;
-        { const char* ms = std::getenv("STRATA_BATCH_MTP_SERIAL"); bin.mtp_serial = ms != nullptr && ms[0] != '\0' && ms[0] != '0'; }
-#if !defined(STRATA_USE_HIP)
-        // NVIDIA, 2 cards: the pipelined groups by default (0.2.7); one serial group, the 0.2.1-0.2.6 default, with
-        // STRATA_BATCH_GROUPS_NV_SERIAL=1 or STRATA_DEFAULTS=026 (batch_groups.hpp nv_serial_wanted)
-        bin.nv_serial_faster = strata::program::batch_groups::nv_serial_wanted(std::getenv("STRATA_BATCH_GROUPS_NV_SERIAL"),
-                                                                              strata::qwen_defaults_026());
-#endif
-        { const char* mp = std::getenv("STRATA_PIPED_MTP"); bin.mtp_piped = mp != nullptr && mp[0] != '\0' && mp[0] != '0'; }
-        return strata::program::batch_groups::resolve(bin);
-    };
     const char* batch_mtp_env = std::getenv("STRATA_BATCH_MTP");
     bool batch_mtp = o.batch_mtp || (batch_mtp_env != nullptr && batch_mtp_env[0] != '\0' && batch_mtp_env[0] != '0');
     if (batch_mtp) {
@@ -13984,6 +14144,54 @@ int main(int argc, char** argv) {
             return true;
         };
         auto stage_verifier = [&](int k) -> strata::core::Verifier& { return k == 0 ? ver : stages[(size_t) k - 1]->ver; };
+        // the stages' measured speeds (StageSpeed) to the speed file, when the batch goes idle: the next start's
+        // `--layer-split auto` reads them.  Every stage needs a fit; the run's lines replace the old ones of these cards
+        bool split_speed_said = false;
+        // each stage's window in the pipelined groups, launch to done (every wait in it): what the split's model is
+        // calibrated with at the next start
+        std::array<double, 8> stage_fly_ms{};
+        std::array<int64_t, 8> stage_fly_n{};
+        auto split_speed_save = [&]() {
+            if (split_speed_path.empty() || stages.empty()) return;
+            std::vector<SplitSpeedEntry> mine;
+            std::string txt;
+            for (size_t k = 0; k <= stages.size(); ++k) {
+                const strata::core::StageSpeed& sp = stage_verifier((int) k).stage_speed();
+                SplitSpeedEntry e;
+                if (!sp.fit(e.d, e.m)) return;
+                e.model = split_speed_key;
+                e.card = split_speed_card(k == 0 ? 0 : stages[k - 1]->dev);
+                e.experts = sp.mean_experts();
+                e.n = (long long) sp.n;
+                if (e.card.empty()) return;
+                if (k < (size_t) SplitDrive::kMax && split_drive.pm[k] != nullptr && split_drive.pm[k]->ready()) {
+                    e.a = split_drive.pm[k]->a;
+                    e.c = split_drive.pm[k]->c;
+                }
+                e.lb = k == 0 ? 0 : (long long) split_at[k - 1];
+                e.le = k < split_at.size() ? (long long) split_at[k] : (long long) g.n_layers;
+                if (k < stage_fly_n.size() && stage_fly_n[k] >= 200) e.fly = stage_fly_ms[k] / (double) stage_fly_n[k];
+                char t[160];
+                std::snprintf(t, sizeof t, "%s CUDA%d GPU %.3f + %.4f per expert, CPU %.3f + %.4f (%.1f experts a step, "
+                              "%lld steps)", k == 0 ? "" : ",", k == 0 ? 0 : stages[k - 1]->dev, e.d, e.m, e.a, e.c,
+                              e.experts, e.n);
+                txt += t;
+                mine.push_back(e);
+            }
+            std::vector<SplitSpeedEntry> all = split_speed_read(split_speed_path);
+            all.erase(std::remove_if(all.begin(), all.end(), [&](const SplitSpeedEntry& e) {
+                          return std::any_of(mine.begin(), mine.end(), [&](const SplitSpeedEntry& m) {
+                              return m.model == e.model && m.card == e.card; });
+                      }), all.end());
+            all.insert(all.end(), mine.begin(), mine.end());
+            const bool ok = split_speed_write(split_speed_path, all);
+            if (!split_speed_said || !ok) {
+                split_speed_said = true;
+                std::fprintf(stderr, "strata batch: stage speeds measured (ms per layer step, the waits for the host "
+                                     "left out):%s; %s %s for the next --layer-split auto\n", txt.c_str(),
+                             ok ? "saved to" : "could not write", split_speed_path.c_str());
+            }
+        };
         // What an idle slot holds (the conversation it decoded last: its sessions, its draft K/V and its checkpoints)
         // goes to the parked conversations before an admission overwrites it.  The main session was parked with that
         // conversation's prompt only (the admission's copy), so the reply the slot decoded lives nowhere else: without
@@ -14239,6 +14447,7 @@ int main(int argc, char** argv) {
             strata::core::progress().busy.store(was_busy);
             report_batch_window(S, A, !batch_on(), w0);
             if (!batch_on() && bt_windows > 0) {
+                split_speed_save();
                 const double w = (double) bt_windows, wall = msd(bt_start, Clock::now());
                 const double L = (double) g.n_layers;
                 const double e_vram = (double) (drive.d.cache_hits - bt_hits0), e_pcie = (double) (drive.d.offload_entries - bt_off_ent0),
@@ -14321,6 +14530,7 @@ int main(int argc, char** argv) {
             int S = 0;                      ///< slots in its window: up to its last active one (idle ones cost rows)
             int active = 0;                  ///< live slots at launch; S can also include idle padding rows
             Clock::time_point started;       ///< the group window's first stage launch
+            Clock::time_point fly0;          ///< its launch on the stage it runs on (stage_fly_ms)
             // STRATA_PIPED_MTP (pmtp): S counts ROWS - each of the group's slots' token, then that slot's proposals - at
             // hand-off rows [hbase, hbase + S)
             int rows[strata::kernels::kVerifyMaxT] = {};
@@ -14651,6 +14861,10 @@ int main(int argc, char** argv) {
                 if (batch_telemetry_enabled) stage_in_flight.complete(k, Clock::now());
                 stage_group[(size_t) k] = -1;
                 PGroup& G = pg[(size_t) gi];
+                if (k < (int) stage_fly_ms.size() && !in_prompt_read) {
+                    stage_fly_ms[(size_t) k] += std::chrono::duration<double, std::milli>(Clock::now() - G.fly0).count();
+                    ++stage_fly_n[(size_t) k];
+                }
                 if (pt_on && k < 8) { ptg[(size_t) gi].done[k] = Clock::now(); pt_stage[k] += pt_ms(ptg[(size_t) gi].launch[k], ptg[(size_t) gi].done[k]); }
                 if (k + 1 < n_pipe) { G.stage = k + 1; G.since = pipe_tick; continue; }
                 // the last stage: the group's picks
@@ -14846,6 +15060,7 @@ int main(int argc, char** argv) {
                 }
                 PGroup& G = pg[(size_t) pick];
                 strata::core::progress().busy.store(true);
+                G.fly0 = Clock::now();
                 if (batch_telemetry_enabled) stage_in_flight.launch(k, Clock::now());
                 if (pt_on && k < 8) {
                     PtGroup& P = ptg[(size_t) pick];
@@ -14913,6 +15128,7 @@ int main(int argc, char** argv) {
                 if (pmtp)
                     std::fprintf(stderr, " (%lld of %lld MTP proposals kept)", (long long) bt_accepted, (long long) bt_tokens);
                 std::fprintf(stderr, "\n");
+                split_speed_save();
                 for (int st = 0; st < split_drive.n; ++st)   // STRATA_PCIE_BALANCE: each stage's fits (ms)
                     if (const strata::core::PcieModel* pm = split_drive.pm[st]; pm != nullptr && pm->ready())
                         std::fprintf(stderr, "strata batch PCIe balance, stage %d: CPU %.3f + %.3f per expert (+%.3f per PCIe one), "

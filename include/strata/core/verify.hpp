@@ -381,6 +381,8 @@ public:
     /// times its pool, and after each window *model (the dispatch's) takes the costs. One GPU, no batch slots. Set
     /// before `init` (the stamps are captured). `paused`: a request's own --pcie-frac holds meanwhile.
     void set_pcie_balance(PcieModel* model) { bal_ = model; }
+    /// the GPU's measured speed so far (set_pcie_balance's stamps; empty without them)
+    const StageSpeed& stage_speed() const { return speed_; }
     void pause_pcie_balance(bool paused) {
         bal_paused_ = paused;
         if (bal_ != nullptr && m_bal_ != nullptr) bal_->on = !paused;
@@ -648,11 +650,14 @@ private:
     uint32_t* h_flagA_ = nullptr; uint32_t* m_flagA_ = nullptr;  // the GPU plan is in place
     uint32_t* h_flagB_ = nullptr; uint32_t* m_flagB_ = nullptr;  // the PCIe share's DMA copies have landed
     // set_pcie_balance: per step (layer x group, stride 2 groups) the GPU's clock as the plan arrives, as the PCIe
-    // part starts and as it waits for the CPU rows (4 words a step); the pool's ms, its experts, the PCIe ones, and
-    // whether the step had a plan
+    // part starts and as it waits for the CPU rows, then as it starts waiting for the plan, as the PCIe wait returns
+    // and as the CPU-rows wait returns (8 words a step, kBalWords); the pool's ms, its experts, the PCIe ones, the
+    // GPU's own (VRAM) ones, and whether the step had a plan
+    static constexpr int kBalWords = 8;
     unsigned long long* h_bal_ = nullptr; unsigned long long* m_bal_ = nullptr;
     std::vector<double> bal_p_;
-    std::vector<int32_t> bal_nc_, bal_np_;
+    std::vector<int32_t> bal_nc_, bal_np_, bal_nv_;
+    StageSpeed speed_;   ///< this verifier's GPU speed (the waits left out): --layer-split auto at the next start
     std::vector<char> bal_ok_;
     PcieModel* bal_ = nullptr;
     bool bal_paused_ = false;
