@@ -6682,13 +6682,17 @@ int main(int argc, char** argv) {
             const int64_t lo = k == 0 ? 0 : stages[k - 1]->lb;
             const int64_t hi = k == 0 ? (multi_gpu ? split_at[0] : -1) : stages[k - 1]->le;
             const strata::core::OnDevice on_k(dev);
-            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi, kvsh);
+            // the slots borrow the RoPE table of this device's main session (one per card, not one per session)
+            const strata::core::SessionState& main_k = k == 0 ? ss : stages[k - 1]->ss;
+            const strata::core::QsaState* rope_k = kvsh && main_k.qsa_states != nullptr && main_k.qsa_alloc > 0
+                                                       ? &main_k.qsa_states[main_k.qsa_ord0] : nullptr;
+            const uint64_t bytes = strata::core::session_bytes(g, o.max_context, K, lo, hi, kvsh, rope_k != nullptr);
             if (k == 0) bytes0 = bytes;
             for (int b = 0; b < fit; ++b) {
                 auto u = std::make_unique<strata::core::SessionState>();
                 void* buf = nullptr;
                 strata::core::QsaShareArena kvsh_slot{kvsh ? kvsh_base[k] : nullptr, kvsh ? kvsh_pool_pages : 0,
-                                                 kvsh ? kvsh_align : 256};
+                                                 kvsh ? kvsh_align : 256, rope_k};
                 if (cudaMalloc(&buf, bytes) != cudaSuccess || strata::core::session_init(g, o.max_context, K, buf, *u, lo, hi, kvsh ? &kvsh_slot : nullptr) == 0) {
                     cudaGetLastError();
                     if (buf != nullptr) cudaFree(buf);
@@ -6760,10 +6764,21 @@ int main(int argc, char** argv) {
         } else if (sc != nullptr && sc[0] != '\0' && sc[0] != '0') {
             why = "it does not combine with STRATA_BATCH_SELF_COMMIT (the window would keep its rows itself)";
         } else if ((o.batch / o.batch_groups) * (1 + pm_drafts) > (int) strata::kernels::kVerifyMaxT) {
-            std::snprintf(buf, sizeof buf, "a group's window would hold %d rows (%d slots x %d), more than %d",
-                          (o.batch / o.batch_groups) * (1 + pm_drafts), o.batch / o.batch_groups, 1 + pm_drafts,
-                          (int) strata::kernels::kVerifyMaxT);
-            why = buf;
+            // fewer proposals per slot until a group's window fits; off only when not even one fits.  (Turned off at
+            // 3 slots a group, 5 agents on 6 slots replayed 4,295 s against 1,207 s for 4 slots with 2 proposals:
+            // the slot drafters stayed loaded, every window went the serial way.)
+            const int slots = o.batch / o.batch_groups;
+            const int fit = (int) strata::kernels::kVerifyMaxT / std::max(slots, 1) - 1;
+            if (fit >= 1) {
+                std::fprintf(stderr, "strata generate: STRATA_PIPED_MTP: %d proposal%s per slot, not %d: a group of %d slots "
+                                     "holds %d rows at most\n", fit, fit > 1 ? "s" : "", pm_drafts, slots,
+                             (int) strata::kernels::kVerifyMaxT);
+                pm_drafts = fit;
+            } else {
+                std::snprintf(buf, sizeof buf, "a group's window would hold %d rows (%d slots x 2), more than %d",
+                              slots * 2, slots, (int) strata::kernels::kVerifyMaxT);
+                why = buf;
+            }
         }
         if (why != nullptr) {
             std::fprintf(stderr, "strata generate: WARNING: STRATA_PIPED_MTP is off: %s\n", why);

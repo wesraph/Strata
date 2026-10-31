@@ -294,6 +294,9 @@ struct QsaShareArena {
     void* base = nullptr;        ///< the arena (device memory), `pool_pages` per layer, 256-byte aligned each
     int64_t pool_pages = 0;      ///< the layer's whole pool in pages (every session draws from it)
     uint64_t pool_align = 256;   ///< the arrays' stride alignment inside a layer (the VMM granularity when elastic)
+    /// another session's primary state on the same device whose RoPE table this session borrows (it keeps none):
+    /// the table is the positions' cos/sin, the same for every session - 64 MiB each at 262K cells
+    const QsaState* rope = nullptr;
 };
 
 /// The shared prefix's capacity in pages (0: --kv-share off).  Kept for sizing and diagnostics; the pool

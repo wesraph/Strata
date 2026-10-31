@@ -50,7 +50,7 @@ static uint64_t ple_hist_bytes() {
 }
 
 uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int64_t layer_lo, int64_t layer_hi,
-                        bool share_pools) {
+                        bool share_pools, bool rope_borrowed) {
     if (layer_hi < 0 || layer_hi > g.n_layers) layer_hi = g.n_layers;
     if (layer_lo < 0) layer_lo = 0;
     // QSA layers are `l % interval == interval-1`, so exactly `bound / interval` of them live below `bound`
@@ -63,7 +63,7 @@ uint64_t session_bytes(const ModelGeometry& g, int64_t max_cells, int64_t k, int
     n += (uint64_t) gdn_n * gdn_state_floats(g) * 4;
     // One QSA state carries the RoPE table; the others borrow it (P7: 64 MiB per layer at 262K).
     if (g.n_qsa_layers() > 0)
-        n += qsa_state_bytes(g, max_cells, true, 0, share_pools) +
+        n += qsa_state_bytes(g, max_cells, !rope_borrowed, 0, share_pools) +
              (uint64_t) (q_n - 1) * qsa_state_bytes(g, max_cells, false, 0, share_pools);
     n += qsa_buffers_bytes(g, max_cells);
     n += moe_buffers_bytes(g, k);
@@ -103,7 +103,9 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
     // same way, which is a coupling with nothing to gain.  Only the range's ordinals are initialized; the
     // rest stay value-initialized nulls.  The FIRST ALLOCATED one (the session's primary, ordinal qsa_ord0)
     // owns the RoPE table that the others - and the prefill staging identity, and the MTP drafter - borrow.
-    const uint64_t first = qsa_state_bytes(g, max_cells, true, 0, share != nullptr),
+    // (QsaShareArena::rope: the primary borrows another session's table too, and carves none)
+    const bool rope_borrowed = share != nullptr && share->rope != nullptr;
+    const uint64_t first = qsa_state_bytes(g, max_cells, !rope_borrowed, 0, share != nullptr),
                      rest = qsa_state_bytes(g, max_cells, false, 0, share != nullptr);
     s.qsa_state_arena = take(g.n_qsa_layers() > 0 ? first + (uint64_t) (s.qsa_alloc - 1) * rest : 0);
     s.qsa_states = new QsaState[(size_t) g.n_qsa_layers()]();
@@ -126,7 +128,8 @@ uint64_t session_init(const ModelGeometry& g, int64_t max_cells, int64_t k, void
                                                      // unmapped chunks on a split
         }
         if (qsa_state_init(g, max_cells, qp + (j == 0 ? 0 : first + (uint64_t) (j - 1) * rest),
-                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? nullptr : &s.qsa_states[s.qsa_ord0], 0,
+                           s.qsa_states[s.qsa_ord0 + j], j == 0 ? (rope_borrowed ? share->rope : nullptr)
+                                                                 : &s.qsa_states[s.qsa_ord0], 0,
                            share != nullptr ? &layer : nullptr) == 0)
             return 0;
     }
