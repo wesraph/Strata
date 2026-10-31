@@ -134,6 +134,34 @@ the short reads is on by default beside the slots on this fork, its fraction mea
 applies up to measured per size band (`STRATA_PREFILL_CPU_SHARE=0` turns it off). Give the engine headroom: the pool shares the card's free VRAM with everything else, and
 `--vram-reserve-mib 1536` is what keeps three or more long contexts from paging on 24 GB cards.
 
+**More agents: what finishes the work fastest.** Measured 2026-10-31 on the rig above with the Q4_K_XL pack, on a
+recorded load of five agents (322 turns, 44,371 generated tokens, contexts up to 125K tokens) replayed the same way as
+the three-agent one. With the default config, the 322 prompt reads took 754 s of the 1,207 s: most of them are short
+(171 new tokens median) but cost about 1.5 s each, and every slot waits while one runs.
+
+| five agents, Q4_K_XL, `--max-context 262144` | wall | aggregate | first token, later turns, median |
+|---|---|---|---|
+| default config (`--batch 4`) | 1,207 / 1,162 s | 36.8 / 38.2 tok/s | 5.2 / 4.6 s |
+| `--batch 6` (one draft proposal a slot) | 1,333 s | 33.3 tok/s | 2.5 s |
+| `--batch 8` (one draft proposal a slot) | 1,434 s | 30.9 tok/s | 2.6 s |
+| + the concurrent read | 1,046 / 1,093 s | 42.4 / 40.6 tok/s | 8.0 / 8.4 s |
+| + the concurrent read and the drafters' ring | **1,003 / 1,015 s** | **44.2 / 43.7 tok/s** | 7.8 / 8.0 s |
+
+The same config on the three-agent replay above: 503 s (58.0 tok/s), against 533 and 558 s with the default config
+and 852 s for upstream 0.2.7 (the table above, 2026-10-29); the first token of the later turns waits 6.3 s median
+(p90 12.8 s) instead of about 2.7 s. More slots answer sooner but finish later: a window holds 8 rows, so a slot gets
+one draft proposal instead of two, and each slot takes VRAM from the experts.
+
+To run it, add to the config's `env`: `STRATA_PIPED_CONCURRENT=1` and `STRATA_PIPED_CONCURRENT_STAGED=1` (the prompt is
+read on a thread of its own while the slots decode; without the second the read never runs beside the slots on this
+setup) and `STRATA_KV_MAIN_OFF=1`, and to its `args`: `--kv-resident 20480` (the slot drafters keep a ring of the
+recent K/V instead of the whole context: 296 to 50 MiB each, at a few points of draft acceptance). They are not the
+defaults because the first token waits about twice as long. Neither changes what the model computes for a token (the
+drafts are checked by the model; the concurrent read uses the GPU path upstream uses, without the CPU share), but no
+side-by-side quality run has been made. The engine also shares one RoPE table per card between its sessions now
+(64 MiB each at 262K) and caps the draft proposals so a window fits: `--batch 6` used to turn the drafts off and run in
+4,295 s.
+
 **Two cards of different sizes or speeds** (a 3090 with a 3080 Ti or a 3060). Use `--layer-split auto`, not a fixed
 number: a fixed `--layer-split 24` gives the smaller card half the layers, and with them half the K/V, while it has the
 least room for experts. Measured on our two 3090s with one held to 12 GB as a 3080 Ti stand-in (three-agent replay):
