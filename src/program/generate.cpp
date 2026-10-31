@@ -165,6 +165,7 @@ namespace strata::metal_engine { void set_model_shard(const char* shard1); }   /
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <unordered_set>
 #include <fstream>
 #include <sstream>
 #include <exception>
@@ -4725,7 +4726,26 @@ int main(int argc, char** argv) {
             if (it == held.end()) return nullptr;
             return it->second.data();
         }
+        // THE MIRROR (STRATA_KV_SWAP_MIRROR, on by default): a page copied back into the pool keeps its host copy - a
+        // keyed page is never written, so the copy stays right - and when the pool evicts it again it is only freed,
+        // not copied out a second time.  The mirrors are the first bytes the budget gives up: the pool holds them.
+        bool mirror_on = true;
+        std::unordered_set<uint64_t> mirror;   ///< held keys whose page is in the pool too
+        uint64_t mirror_hits = 0;              ///< evictions that needed no copy
+        bool evict_mirror(uint64_t key) {      // the pool lets the page go: the host copy is the only one now
+            if (mirror.erase(key) == 0) return false;
+            ++mirror_hits;
+            return true;
+        }
+        void drop_mirrors(uint64_t need) {     // room for `need` more bytes, from the mirrors alone
+            for (auto it = mirror.begin(); it != mirror.end() && bytes + need > budget;) {
+                auto h = held.find(*it);
+                if (h != held.end()) { bytes -= h->second.size(); held.erase(h); }
+                it = mirror.erase(it);
+            }
+        }
         void take_owned(uint64_t key, std::vector<uint8_t>&& buf) {
+            mirror.erase(key);
             auto it = held.find(key);
             if (it != held.end()) { bytes -= it->second.size(); it->second = std::move(buf); }
             else held.emplace(key, std::move(buf));
@@ -4733,6 +4753,7 @@ int main(int argc, char** argv) {
             ++out_count;
         }
         void drop(uint64_t key) {
+            mirror.erase(key);
             auto it = held.find(key);
             if (it != held.end()) { bytes -= it->second.size(); held.erase(it); }
         }
@@ -11175,6 +11196,7 @@ int main(int argc, char** argv) {
             std::vector<uint8_t>& stage = kvsh_swap_stage;
             stage.resize((size_t) (page_bytes * 64 * kvsh_range.size()));   // 64 pages staged at a time
             kvsh_swap.budget = (uint64_t) std::max<int64_t>(o.kv_swap_mib, 0) << 20;
+            if (const char* mv = std::getenv("STRATA_KV_SWAP_MIRROR"); mv != nullptr && mv[0] == '0') kvsh_swap.mirror_on = false;
             std::fprintf(stderr, "kvshare-swap: installed, %lld MiB budget, %lld bytes/page-layer, cpl=%lld chunks=%lld ranges=%zu\n",
                          (long long) (kvsh_swap.budget >> 20), (long long) page_bytes,
                          (long long) kvsh_lay.chunks_per_layer,
@@ -11197,8 +11219,19 @@ int main(int argc, char** argv) {
             // (page_total, page_bytes and the two prefix helpers are this block's: by value, the swap runs long
             // after the block - by reference they were garbage, and every store was refused "over budget")
             kv_pages.set_swap_many(
-                [&, page_total, page_bytes, arr_prefix, range_prefix](const std::vector<std::pair<int32_t, uint64_t>>& victims) {
+                [&, page_total, page_bytes, arr_prefix, range_prefix](const std::vector<std::pair<int32_t, uint64_t>>& victims_in) {
+                    // the mirrored ones are in host memory already: freed, not copied (the mirror, KvShareSwap)
+                    std::vector<std::pair<int32_t, uint64_t>> fresh;
+                    fresh.reserve(victims_in.size());
+                    int64_t mirrored = 0;
+                    for (const auto& v : victims_in) {
+                        if (kvsh_swap.evict_mirror(v.second)) ++mirrored;
+                        else fresh.push_back(v);
+                    }
+                    if (mirrored > 0) kv_pages.count_swapped_out(mirrored);
+                    const std::vector<std::pair<int32_t, uint64_t>>& victims = fresh;
                     if (kvsh_swap.budget == 0 || victims.empty() || page_total <= 0) return;
+                    kvsh_swap.drop_mirrors((uint64_t) victims.size() * (uint64_t) page_total);
                     // what the budget still holds (the oldest victims first: they are the LRU order)
                     size_t k = 0;
                     while (k < victims.size() && kvsh_swap.bytes + (uint64_t) (k + 1) * (uint64_t) page_total <= kvsh_swap.budget) ++k;
@@ -11259,9 +11292,9 @@ int main(int argc, char** argv) {
                     {   // the move's own time: the copies and the host packing (the working-set line adds the extent drops)
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_out).count();
                         const double mib = (double) k * (double) page_total / 1048576.0;
-                        std::fprintf(stderr, "strata serve: --kv-share: swap out: %zu pages (%.0f MiB, %lld tokens) to the host in %.1f ms (%.2f GB/s); the swap holds %llu MiB\n",
+                        std::fprintf(stderr, "strata serve: --kv-share: swap out: %zu pages (%.0f MiB, %lld tokens) to the host in %.1f ms (%.2f GB/s), %lld more already there (no copy); the swap holds %llu MiB\n",
                                      k, mib, (long long) ((int64_t) k * kvsh_ps), ms, ms > 0.0 ? mib / 1024.0 / (ms / 1000.0) : 0.0,
-                                     (unsigned long long) (kvsh_swap.bytes >> 20));
+                                     (long long) mirrored, (unsigned long long) (kvsh_swap.bytes >> 20));
                     }
                 },
                 [&, page_total, page_bytes, arr_prefix, range_prefix](const std::vector<std::pair<uint64_t, int32_t>>& pairs) -> bool {
@@ -11309,7 +11342,10 @@ int main(int argc, char** argv) {
                         std::fprintf(stderr, "kvshare-swap: the batched copy in failed\n");
                         return false;
                     }
-                    for (size_t i = 0; i < k; ++i) kvsh_swap.drop(pairs[i].first);   // the pages hold them now
+                    for (size_t i = 0; i < k; ++i) {   // the pages hold them now: the host copy stays as their mirror
+                        if (kvsh_swap.mirror_on) kvsh_swap.mirror.insert(pairs[i].first);
+                        else kvsh_swap.drop(pairs[i].first);
+                    }
                     kvsh_swap.in_count += k;
                     {
                         const double ms = std::chrono::duration<double, std::milli>(Clock::now() - t_in).count();
@@ -15321,11 +15357,13 @@ int main(int argc, char** argv) {
             kv_pages.drop_free_extents(target_ext);   // the extents nothing lives in, past the reserve
             if (ext0 == kv_pages.mapped_extents() && evicted == 0) return;
             std::fprintf(stderr, "strata serve: --kv-share: idle: %lld cached pages to the host swap, %lld of %lld extents "
-                                 "(%.2f GiB per card) to the expert caches in %.0f ms (%lld pages pinned, %lld kept)\n",
+                                 "(%.2f GiB per card) to the expert caches in %.0f ms (%lld pages pinned, %lld kept; %llu evictions "
+                                 "so far found their pages in host memory already)\n",
                          (long long) evicted, (long long) (ext0 - kv_pages.mapped_extents()), (long long) ext0,
                          (double) (ext0 - kv_pages.mapped_extents()) * (double) kvsh_pages_per_extent * (double) kvsh_swap_page_bytes *
                              (double) (kvsh_q_n.empty() ? 0 : kvsh_q_n[0]) / 1073741824.0,
-                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), (long long) pinned, (long long) keep);
+                         std::chrono::duration<double, std::milli>(Clock::now() - t0).count(), (long long) pinned, (long long) keep,
+                         (unsigned long long) kvsh_swap.mirror_hits);
         };
         // THE WORKING-SET TRIM (no share): at the reserve's quiet moments, the cached pages nothing touched for the
         // trim window (STRATA_KV_TRIM_WINDOW_S, 600 s) go to the host swap - as many as it has room for, up to
